@@ -54,6 +54,12 @@
         : null;
     try { delete globalThis.__bo_mark_trusted; } catch (_) {}
 
+    // Same discipline for the behaviour-generator bridge: capture, then revoke.
+    // Without it `Deno.core.ops` is already gone by the time this script runs and
+    // every path degenerates to linear interpolation.
+    const _bo = globalThis.__bo_input_api || null;
+    try { delete globalThis.__bo_input_api; } catch (_) {}
+
     // v0.1.0-parity Fix 6 — seeded random for two-level per-session
     // determinism. Symbol-keyed slot is installed by stealth_bootstrap.js
     // and survives cleanup_bootstrap's `internals` string purge. Without
@@ -326,18 +332,39 @@
             && globalThis.__bo_input_events._lastPos.length === 2)
             ? globalThis.__bo_input_events._lastPos.slice()
             : [_vw * 0.5, _vh * 0.45];
-        const _nAnchors = 2 + (_rand() < 0.5 ? 0 : 1); // 2-3 inter-target strokes
+        // Ambient motion aims at real interactive elements, not random coordinates.
+        // Wandering to arbitrary viewport points is not what a person does — they move
+        // between things worth pointing at — and it also dragged the cursor away from
+        // wherever a targeted action had just left it.
+        const _ambientTargets = (function () {
+            var out = [];
+            try {
+                var els = document.querySelectorAll(
+                    'a[href],button,input,select,textarea,[role=button],[role=link]');
+                for (var i = 0; i < els.length; i++) {
+                    var r = els[i].getBoundingClientRect();
+                    if (r.width < 8 || r.height < 8) continue;
+                    if (r.bottom < 0 || r.top > _vh || r.right < 0 || r.left > _vw) continue;
+                    out.push([r.left + r.width * (0.3 + _rand() * 0.4),
+                              r.top + r.height * (0.3 + _rand() * 0.4)]);
+                }
+            } catch (_) {}
+            return out;
+        })();
+        // Nothing worth pointing at: stay put rather than invent motion.
+        if (!_ambientTargets.length) return;
+        const _nAnchors = 1;
         let mouseT = 40 + _rand() * 40;
         let prev = null;
         for (let s = 0; s < _nAnchors; s++) {
-            const toX = 60 + _rand() * (_vw - 120);
-            const toY = 60 + _rand() * (_vh - 120);
+            const _pick = _ambientTargets[(_rand() * _ambientTargets.length) | 0];
+            const toX = _pick[0];
+            const toY = _pick[1];
             const targetW = 28 + _rand() * 48;
             let traj = [];
             try {
-                if (_ops && typeof _ops.op_behavior_mouse_trajectory === 'function') {
-                    const raw = _ops.op_behavior_mouse_trajectory(_from[0], _from[1], toX, toY, targetW);
-                    traj = JSON.parse(raw || '[]');
+                if (_bo) {
+                    traj = _bo.trajectory(_from[0], _from[1], toX, toY, targetW);
                 }
             } catch (_) {}
             if (!Array.isArray(traj) || traj.length === 0) {
@@ -490,8 +517,195 @@
         } catch (_) {}
     })();
 
-    // Run first cycle immediately
-    runCycle();
-    // Then every 4 seconds to keep the "human" active during long builds
-    setInterval(runCycle, 4000);
+    // ---- Human-shaped targeted input -------------------------------------
+    // `element.click()` and a burst of hand-built MouseEvents both announce
+    // automation, for different reasons: the first reports `isTrusted === false`,
+    // the second arrives with zero travel and zero dwell — mousedown and mouseup in
+    // the same millisecond, no motion leading to the element. Behavioural sensors
+    // (Epic's Talon posts `/v1/phaser/batch` continuously) score exactly that.
+    //
+    // So a targeted click reuses the same Σ-Λ trajectory generator `runCycle` uses:
+    // travel to the element along a curved multi-stroke path sampled at ~8 ms, hover,
+    // press, hold for a human dwell, release. Everything is minted trusted and
+    // recorded into the telemetry buffer, and the cursor position persists so the
+    // next action starts where this one ended.
+    const _sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, Math.round(ms))));
+    // `runCycle` grabs its own handle inside the function body; targeted input needs
+    // one at module scope for the same generator.
+    const _ops = (typeof Deno !== 'undefined' && Deno.core && Deno.core.ops) || null;
+
+    function _trajectory(fromX, fromY, toX, toY, targetW) {
+        try {
+            if (_bo) {
+                const t = _bo.trajectory(fromX, fromY, toX, toY, targetW || 30);
+                if (Array.isArray(t) && t.length) return t;
+            }
+        } catch (_) {}
+        // Never fall back to a straight line: path efficiency of exactly 1.0 is
+        // itself a classifier signal. Bow the segment and jitter the samples.
+        const out = [];
+        const n = 24;
+        const bow = (_rand() - 0.5) * Math.hypot(toX - fromX, toY - fromY) * 0.15;
+        for (let i = 0; i < n; i++) {
+            const u = i / (n - 1);
+            const arc = Math.sin(u * Math.PI) * bow;
+            out.push({
+                t_ms: u * (260 + _rand() * 220),
+                x: fromX + (toX - fromX) * u - (toY - fromY) * 0.001 * arc,
+                y: fromY + (toY - fromY) * u + (toX - fromX) * 0.001 * arc,
+            });
+        }
+        return out;
+    }
+
+    /// Travel the cursor to (x, y), dispatching moves on the real clock.
+    async function _travelTo(x, y, targetW) {
+        let from = (globalThis.__bo_input_events
+            && Array.isArray(globalThis.__bo_input_events._lastPos))
+            ? globalThis.__bo_input_events._lastPos.slice()
+            : [(window.innerWidth || 1280) * 0.5, (window.innerHeight || 800) * 0.45];
+        const traj = _trajectory(from[0], from[1], x, y, targetW);
+        let prev = from.slice();
+        let prevT = 0;
+        for (const p of traj) {
+            await _sleep((p.t_ms || 0) - prevT);
+            prevT = p.t_ms || 0;
+            try { _fireMove(p.x, p.y, prev); } catch (_) {}
+            try { _akRecMouse(Math.round(p.x), Math.round(p.y), 'move', 0); } catch (_) {}
+            prev = [p.x, p.y];
+        }
+        try { globalThis.__bo_input_events._lastPos = [x, y]; } catch (_) {}
+    }
+
+    function _fireAt(el, Ctor, type, opts) {
+        try {
+            const ev = new Ctor(type, opts);
+            if (_markTrusted) _markTrusted(ev);
+            el.dispatchEvent(ev);
+        } catch (_) {}
+    }
+
+    async function _humanClick(el) {
+        if (!el) return 'нет элемента';
+        let cx = 0, cy = 0, w = 30;
+        try {
+            const r = el.getBoundingClientRect();
+            w = Math.max(4, r.width);
+            // Aim off-centre: humans do not land on the exact centroid.
+            cx = Math.round(r.left + r.width * (0.35 + _rand() * 0.3));
+            cy = Math.round(r.top + r.height * (0.35 + _rand() * 0.3));
+        } catch (_) {}
+
+        await _travelTo(cx, cy, w);
+
+        const base = {
+            bubbles: true, cancelable: true, view: globalThis,
+            clientX: cx, clientY: cy, screenX: cx, screenY: cy + 90,
+            button: 0, buttons: 1, detail: 1,
+        };
+        const PE = (typeof PointerEvent === 'function') ? PointerEvent : null;
+        const pointer = { pointerType: 'mouse', pointerId: 1, isPrimary: true };
+
+        if (PE) _fireAt(el, PE, 'pointerover', { ...base, buttons: 0, ...pointer, pressure: 0 });
+        _fireAt(el, MouseEvent, 'mouseover', { ...base, buttons: 0 });
+        _fireAt(el, MouseEvent, 'mousemove', { ...base, buttons: 0 });
+
+        // Settle before pressing — real pointers rest briefly on the target.
+        await _sleep(40 + _rand() * 90);
+
+        if (PE) _fireAt(el, PE, 'pointerdown', { ...base, ...pointer, pressure: 0.5 });
+        _fireAt(el, MouseEvent, 'mousedown', base);
+        // Moving focus must take it away from wherever it was. Real browsers fire
+        // blur/focusout on the outgoing element, and form libraries (react-hook-form
+        // among them) commit the field value on that event — without it the form
+        // validates an empty field right after you watched the text get typed in.
+        try {
+            var prev = document.activeElement;
+            if (prev && prev !== el && prev !== document.body) {
+                _fireAt(prev, FocusEvent, 'focusout', { bubbles: true, relatedTarget: el });
+                _fireAt(prev, FocusEvent, 'blur', { bubbles: false, relatedTarget: el });
+                if (typeof prev.blur === 'function') prev.blur();
+            }
+        } catch (_) {}
+        try { if (typeof el.focus === 'function') el.focus(); } catch (_) {}
+        try {
+            _fireAt(el, FocusEvent, 'focus', { bubbles: false });
+            _fireAt(el, FocusEvent, 'focusin', { bubbles: true });
+        } catch (_) {}
+        try { _akRecMouse(cx, cy, 'down', 0); } catch (_) {}
+
+        // Press duration. Human mouse clicks cluster around 60-140 ms.
+        await _sleep(60 + _rand() * 80);
+
+        if (PE) _fireAt(el, PE, 'pointerup', { ...base, buttons: 0, ...pointer, pressure: 0 });
+        _fireAt(el, MouseEvent, 'mouseup', { ...base, buttons: 0 });
+        _fireAt(el, MouseEvent, 'click', { ...base, buttons: 0 });
+        try { _akRecMouse(cx, cy, 'click', 0); } catch (_) {}
+        return 'клик ок (isTrusted, с траекторией)';
+    }
+
+    /// Type into a field key by key, on the clock, with per-character timings from
+    /// the bigram-aware model. Setting `.value` in one shot leaves no keystroke
+    /// telemetry at all, which is as loud as a bad mouse path.
+    async function _humanType(el, text) {
+        if (!el) return 'нет элемента';
+        const str = String(text == null ? '' : text);
+        await _humanClick(el);
+
+        let delays = [];
+        try {
+            if (_bo) delays = _bo.typingDelays(str, 0) || [];
+        } catch (_) {}
+
+        const setValue = (v) => {
+            // React attaches a `_valueTracker` to controlled inputs and compares against
+            // it in onChange. Writing through the native setter updates the tracker too,
+            // so React concludes nothing changed, drops the event and re-renders the
+            // field from its own state — the text visibly disappears. Clearing the
+            // tracker first is what makes React accept the value.
+            try {
+                if (el._valueTracker && typeof el._valueTracker.setValue === 'function') {
+                    el._valueTracker.setValue('');
+                }
+            } catch (_) {}
+            const d = Object.getOwnPropertyDescriptor(el.constructor.prototype, 'value');
+            if (d && d.set) d.set.call(el, v); else el.value = v;
+        };
+        setValue('');
+        for (let i = 0; i < str.length; i++) {
+            const ch = str[i];
+            await _sleep(delays[i] != null ? delays[i] : 60 + _rand() * 90);
+            const opts = { bubbles: true, cancelable: true, key: ch, code: 'Key' + ch.toUpperCase() };
+            _fireAt(el, KeyboardEvent, 'keydown', opts);
+            setValue(str.slice(0, i + 1));
+            _fireAt(el, InputEvent || Event, 'input', { bubbles: true, data: ch, inputType: 'insertText' });
+            // Key dwell: the hold time of the key itself, inside the inter-key gap.
+            await _sleep(25 + _rand() * 45);
+            _fireAt(el, KeyboardEvent, 'keyup', opts);
+            try { _akEvents.counters.key++; } catch (_) {}
+        }
+        _fireAt(el, Event, 'change', { bubbles: true });
+        return 'введено ' + str.length + ' символов';
+    }
+
+    try {
+        _akEvents.clickElement = _humanClick;
+        _akEvents.clickSelector = (sel) => _humanClick(document.querySelector(sel));
+        _akEvents.typeElement = _humanType;
+        _akEvents.typeSelector = (sel, text) => _humanType(document.querySelector(sel), text);
+        _akEvents.moveTo = (x, y) => _travelTo(x, y, 30);
+    } catch (_) {}
+
+    // Ambient motion is opt-out: a driver that issues its own targeted actions may
+    // not want anything moving in between, and the overlay makes stray motion obvious.
+    let _ambientOn = true;
+    try { _akEvents.setAmbient = function (on) { _ambientOn = !!on; }; } catch (_) {}
+    const _cycleIfEnabled = () => { if (_ambientOn) runCycle(); };
+
+    _cycleIfEnabled();
+    // Every ~7 s, jittered. The old fixed 4 s cadence was both busier than a person
+    // and perfectly periodic — a period that regular is itself a signal.
+    (function reschedule() {
+        setTimeout(function () { _cycleIfEnabled(); reschedule(); }, 5000 + _rand() * 4000);
+    })();
 })();

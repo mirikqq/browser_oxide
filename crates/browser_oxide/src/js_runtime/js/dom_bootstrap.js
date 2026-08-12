@@ -1059,6 +1059,66 @@
     class HTMLParagraphElement extends HTMLElement {}
     class HTMLHeadingElement extends HTMLElement {}
     class HTMLAnchorElement extends HTMLElement {}
+    // HTMLHyperlinkElementUtils — the URL decomposition IDL attributes. Without these,
+    // the `document.createElement('a')` + `.pathname` idiom (axios's isURLSameOrigin,
+    // and a long tail of older libraries) reads `undefined` and throws at module-eval
+    // time, taking the whole bundle down and leaving a modern SPA as a bare shell.
+    // Spec puts them on <a> and <area> only, so they must NOT land on Element.
+    const _hyperlinkURL = (el) => {
+        const raw = el.getAttribute("href");
+        if (!raw) return null;
+        try {
+            const base = (globalThis.location && globalThis.location.href)
+                || (globalThis.__browser_oxide && globalThis.__browser_oxide._baseUrl)
+                || undefined;
+            return new URL(raw, base);
+        } catch (_) {
+            return null;
+        }
+    };
+    // Chrome returns "" for every member when href is absent or unparseable — except
+    // `origin`, which is "null", and `protocol`, which is ":".
+    const _hyperlinkMembers = {
+        href: { get: (u, el) => (u ? u.href : (el.getAttribute("href") || "")), set: true },
+        origin: { get: (u) => (u ? u.origin : "null") },
+        protocol: { get: (u) => (u ? u.protocol : ":"), set: true },
+        username: { get: (u) => (u ? u.username : ""), set: true },
+        password: { get: (u) => (u ? u.password : ""), set: true },
+        host: { get: (u) => (u ? u.host : ""), set: true },
+        hostname: { get: (u) => (u ? u.hostname : ""), set: true },
+        port: { get: (u) => (u ? u.port : ""), set: true },
+        pathname: { get: (u) => (u ? u.pathname : ""), set: true },
+        search: { get: (u) => (u ? u.search : ""), set: true },
+        hash: { get: (u) => (u ? u.hash : ""), set: true },
+    };
+    const _defineHyperlinkUtils = (ctor) => {
+        for (const [name, spec] of Object.entries(_hyperlinkMembers)) {
+            const desc = {
+                get() { return spec.get(_hyperlinkURL(this), this); },
+                enumerable: true,
+                configurable: true,
+            };
+            if (spec.set) {
+                // Setting a component re-serializes the whole URL back into the
+                // attribute, which is what Chrome does.
+                desc.set = function (val) {
+                    if (name === "href") { this.setAttribute("href", String(val)); return; }
+                    const u = _hyperlinkURL(this);
+                    if (!u) return;
+                    try {
+                        u[name] = String(val);
+                        this.setAttribute("href", u.href);
+                    } catch (_) { /* invalid component value: Chrome ignores it */ }
+                };
+            }
+            Object.defineProperty(ctor.prototype, name, desc);
+        }
+        Object.defineProperty(ctor.prototype, "toString", {
+            value: function () { return this.href; },
+            writable: true, enumerable: false, configurable: true,
+        });
+    };
+    _defineHyperlinkUtils(HTMLAnchorElement);
     class HTMLImageElement extends HTMLElement {}
     Object.defineProperty(HTMLImageElement.prototype, "width", {
         get() {
@@ -1269,6 +1329,23 @@
     };
     class HTMLScriptElement extends HTMLElement {}
     class HTMLStyleElement extends HTMLElement {}
+    // CSSOM for <style>. Emotion, styled-components and MUI ship ALL of their CSS
+    // through `sheet.insertRule` in production ("speedy" mode) — with no `sheet`
+    // property that path threw, and every rule those libraries generate was lost, so
+    // a modern app rendered as an unstyled DOM with garbage geometry.
+    //
+    // Rules are mirrored into the element's text content rather than kept in a
+    // side table: the cascade already re-reads <style> text, it makes injected CSS
+    // survive serialisation (outerHTML), and it keeps one source of truth.
+    const _sheets = new WeakMap();
+    Object.defineProperty(HTMLStyleElement.prototype, "sheet", {
+        get() {
+            let s = _sheets.get(this);
+            if (!s) { s = new CSSStyleSheet(this); _sheets.set(this, s); }
+            return s;
+        },
+        enumerable: true, configurable: true,
+    });
     class HTMLLinkElement extends HTMLElement {}
     class HTMLMetaElement extends HTMLElement {}
     class HTMLTableElement extends HTMLElement {}
@@ -1680,21 +1757,87 @@
 
     // --- CSSOM ---
     class CSSStyleSheet {
-        constructor(index) { this._index = index; }
+        // Two flavours: index-based (document.styleSheets) and owner-based
+        // (styleElement.sheet). Only the owner-based one can be mutated, because the
+        // rule text lives in that element — see the `sheet` getter above.
+        constructor(indexOrOwner) {
+            if (indexOrOwner && typeof indexOrOwner === "object") {
+                this._owner = indexOrOwner;
+                this._index = -1;
+            } else {
+                this._owner = null;
+                this._index = indexOrOwner;
+            }
+        }
         get type() { return "text/css"; }
         get disabled() { return false; }
-        get ownerNode() { return null; }
+        get ownerNode() { return this._owner; }
         get parentStyleSheet() { return null; }
         get title() { return null; }
         get media() { return { length: 0, mediaText: "" }; }
+        /// Rule texts of an owner-backed sheet, split on top-level `}`.
+        _ownerRuleTexts() {
+            const text = (this._owner && this._owner.textContent) || "";
+            const out = [];
+            let depth = 0, start = 0;
+            for (let i = 0; i < text.length; i++) {
+                if (text[i] === "{") depth++;
+                else if (text[i] === "}") {
+                    depth--;
+                    if (depth === 0) {
+                        const chunk = text.slice(start, i + 1).trim();
+                        if (chunk) out.push(chunk);
+                        start = i + 1;
+                    }
+                }
+            }
+            return out;
+        }
         get cssRules() {
+            if (this._owner) {
+                return this._ownerRuleTexts().map((t) => new CSSStyleRule({
+                    selector_text: t.slice(0, t.indexOf("{")).trim(),
+                    css_text: t,
+                    rule_type: t.startsWith("@") ? 4 : 1,
+                }));
+            }
             const raw = ops.op_dom_get_stylesheet_rules(this._index);
             return raw.map(r => new CSSStyleRule(r));
         }
         get rules() { return this.cssRules; }
-        insertRule(_rule, _index) { return 0; }
-        deleteRule(_index) {}
+        // insertRule used to be a no-op returning 0. Emotion/MUI push every rule they
+        // generate through it, so the whole design system silently evaporated. Rules
+        // are written back into the owner <style> element's text, which is the same
+        // source the Rust cascade re-reads.
+        insertRule(rule, index) {
+            if (!this._owner) return 0;
+            const texts = this._ownerRuleTexts();
+            const at = index === undefined ? texts.length : Number(index);
+            if (at < 0 || at > texts.length) {
+                throw new DOMException(
+                    "Failed to execute 'insertRule' on 'CSSStyleSheet': the index provided is larger than the maximum size of the rule list.",
+                    "IndexSizeError");
+            }
+            texts.splice(at, 0, String(rule));
+            this._owner.textContent = texts.join("\n");
+            return at;
+        }
+        deleteRule(index) {
+            if (!this._owner) return;
+            const texts = this._ownerRuleTexts();
+            const at = Number(index);
+            if (at < 0 || at >= texts.length) {
+                throw new DOMException(
+                    "Failed to execute 'deleteRule' on 'CSSStyleSheet': the index provided is larger than the maximum size of the rule list.",
+                    "IndexSizeError");
+            }
+            texts.splice(at, 1);
+            this._owner.textContent = texts.join("\n");
+        }
+        replaceSync(text) { if (this._owner) this._owner.textContent = String(text); }
+        replace(text) { this.replaceSync(text); return Promise.resolve(this); }
     }
+    globalThis.CSSStyleSheet = CSSStyleSheet;
 
     class CSSStyleRule {
         constructor({ selector_text, css_text, rule_type }) {
@@ -2458,6 +2601,57 @@
         return m ? m[1].toLowerCase() : "null";
     };
 
+    // Cross-origin windows are not fully opaque: the HTML spec keeps a small
+    // surface reachable, and `postMessage` is the whole point of it — every
+    // third-party widget (hCaptcha, Turnstile, payment frames, OAuth) talks home
+    // through it. Throwing SecurityError on `postMessage` too, as this proxy used
+    // to, makes those widgets hang forever waiting for a handshake that can never
+    // start. Delivery is queued for Rust because the child is a separate isolate.
+    function _xoWindowProxy(el, message) {
+        const allowed = {
+            postMessage(data, targetOrigin, transfer) {
+                let json;
+                try {
+                    json = JSON.stringify({
+                        data: data,
+                        origin: (globalThis.location && globalThis.location.origin) || '',
+                        targetOrigin: String(targetOrigin == null ? '*' : targetOrigin),
+                    });
+                } catch (_) {
+                    // Structured-clone-able but not JSON-able (functions, cycles):
+                    // real postMessage would clone it; we degrade to a string.
+                    json = JSON.stringify({ data: String(data), origin: '', targetOrigin: '*' });
+                }
+                try { ops.op_iframe_post_to_child(_getNodeId(el), json); } catch (_) {}
+            },
+            closed: false,
+            length: 0,
+            opener: null,
+            // Self-referential window handles stay readable cross-origin.
+            get frames() { return allowed; },
+            get self() { return allowed; },
+            get window() { return allowed; },
+            get top() { return globalThis.top; },
+            get parent() { return globalThis; },
+            blur() {},
+            focus() {},
+            close() {},
+        };
+        return new Proxy(allowed, {
+            get(t, p) {
+                if (typeof p === 'symbol') return undefined;
+                if (p in t) return t[p];
+                throw new DOMException(message, 'SecurityError');
+            },
+            set(t, p, v) {
+                // `location` is write-only cross-origin; everything else throws.
+                if (p === 'location') return true;
+                throw new DOMException(message, 'SecurityError');
+            },
+            has(t, p) { return p in t; },
+        });
+    }
+
     function _getIframeWindow(el) {
         let state = _iframeState.get(el);
         if (state) {
@@ -2474,11 +2668,7 @@
                     const _sOrig = _xOrigin(_cSrc);
                     if (_sOrig !== _pOrig) {
                         const _xM = 'Blocked a frame with origin "' + _pOrig + '" from accessing a cross-origin frame.';
-                        const _xo2 = new Proxy({}, {
-                            get(t, p) { if (typeof p === 'symbol') return undefined; throw new DOMException(_xM, 'SecurityError'); },
-                            set() { throw new DOMException(_xM, 'SecurityError'); },
-                            has() { return false; },
-                        });
+                        const _xo2 = _xoWindowProxy(el, _xM);
                         const _xoS2 = { contentWindow: _xo2, contentDocument: null, _realmId: undefined, _processedSrcdoc: '' };
                         _iframeState.set(el, _xoS2);
                         return _xo2;
@@ -2522,14 +2712,7 @@
                 const _srcOrigin = _xOrigin(_iSrc);
                 if (_srcOrigin !== _pOrigin) {
                     const _xMsg = 'Blocked a frame with origin "' + _pOrigin + '" from accessing a cross-origin frame.';
-                    const _xo = new Proxy({}, {
-                        get(t, p) {
-                            if (typeof p === 'symbol') return undefined;
-                            throw new DOMException(_xMsg, 'SecurityError');
-                        },
-                        set() { throw new DOMException(_xMsg, 'SecurityError'); },
-                        has() { return false; },
-                    });
+                    const _xo = _xoWindowProxy(el, _xMsg);
                     const _xoState = { contentWindow: _xo, contentDocument: null, _realmId: undefined, _processedSrcdoc: '' };
                     _iframeState.set(el, _xoState);
                     _registerFrame(_xo, el);
@@ -3385,4 +3568,34 @@
         configurable: true,
         enumerable: false,
     });
+
+    // Cross-realm messaging handle, captured here because this file runs while
+    // `Deno` still exists. Everything that drives iframe postMessage runs later —
+    // the parent bridge is injected by `iframe.rs` after the runtime is built, and
+    // the host pumps queues through `Page::pump_iframe_messages` — by which point
+    // `cleanup_bootstrap.js` has removed `Deno` and a `Deno.core.ops` lookup yields
+    // null. That failure is silent: `postMessage` becomes a no-op and a widget
+    // waiting on its embedder simply hangs forever. Non-enumerable, same discipline
+    // as `__bo_input_api` and `__bo_mark_trusted`.
+    try {
+        Object.defineProperty(globalThis, "__bo_frames", {
+            value: {
+                postToParent(json) {
+                    try { ops.op_iframe_post_to_parent(json); } catch (_) { /* no host */ }
+                },
+                postToChild(nodeId, json) {
+                    try { ops.op_iframe_post_to_child(nodeId, json); } catch (_) { /* no host */ }
+                },
+                takeParentMessages() {
+                    try { return ops.op_iframe_take_parent_messages(); } catch (_) { return []; }
+                },
+                takeChildMessages() {
+                    try { return ops.op_iframe_take_child_messages(); } catch (_) { return []; }
+                },
+            },
+            writable: false,
+            configurable: true,
+            enumerable: false,
+        });
+    } catch (_) { /* ignore */ }
 })(globalThis);

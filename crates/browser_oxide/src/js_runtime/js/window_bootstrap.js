@@ -1459,9 +1459,8 @@
         globalThis.location = _locationInstance;
     }
 
-    // Frame-tree globals: top/parent/frames/self all point to this window
-    // window / self / frames / top / parent — self-references.
-    for (const key of ['window', 'self', 'frames', 'top', 'parent']) {
+    // Frame-tree globals. `window`/`self`/`frames` are always this window.
+    for (const key of ['window', 'self', 'frames']) {
         Object.defineProperty(globalThis, key, {
             value: globalThis,
             writable: false,
@@ -1469,6 +1468,27 @@
             enumerable: true
         });
     }
+    // `parent`/`top` are accessors (as in Chrome, where they live on Window as
+    // getters) so a child realm can be pointed at a bridge to its real parent.
+    // As plain self-referential data properties, a child's `parent.postMessage`
+    // just talked to itself and no widget could ever reach the embedder.
+    const _frameLinks = { parent: globalThis, top: globalThis };
+    for (const key of ['parent', 'top']) {
+        Object.defineProperty(globalThis, key, {
+            get() { return _frameLinks[key]; },
+            configurable: false,
+            enumerable: true
+        });
+    }
+    // Privileged setter, published non-enumerably and revoked by the child-frame
+    // installer right after use (same discipline as __bo_mark_trusted).
+    Object.defineProperty(globalThis, '__bo_set_frame_links', {
+        value: (parent, top) => {
+            if (parent) _frameLinks.parent = parent;
+            if (top) _frameLinks.top = top;
+        },
+        configurable: true, enumerable: false, writable: false,
+    });
     globalThis.opener = null;
     // window.length = number of child frames. Starts at 0; dom_bootstrap.js
     // updates it when iframes are appended to the document.
@@ -3690,7 +3710,14 @@
         : (() => 0);
     globalThis.getComputedStyle = ({
         getComputedStyle(element, pseudoElt) {
-            if (!element) return null;
+            // Chrome throws here; returning null instead turns a catchable call-site
+            // error into a `null.fontSize` TypeError deep inside the caller (this is
+            // what killed Epic's login render inside a CSS unit converter).
+            if (element === null || element === undefined) {
+                throw new TypeError(
+                    "Failed to execute 'getComputedStyle' on 'Window': parameter 1 is not of type 'Element'."
+                );
+            }
             let styleProxy = _compStyleCache.get(element);
             if (styleProxy) return styleProxy;
 
@@ -4437,9 +4464,26 @@
             constructor(message, name) {
                 super(message);
                 this.name = name || "Error";
-                this.code = 0;
             }
         };
+        // See shared_apis_bootstrap.js: `code` must be a prototype getter, otherwise a
+        // page polyfill that redefines it getter-only makes the constructor throw.
+        Object.defineProperty(globalThis.DOMException.prototype, "code", {
+            get() {
+                const codes = {
+                    IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4,
+                    InvalidCharacterError: 5, NoModificationAllowedError: 7, NotFoundError: 8,
+                    NotSupportedError: 9, InUseAttributeError: 10, InvalidStateError: 11,
+                    SyntaxError: 12, InvalidModificationError: 13, NamespaceError: 14,
+                    InvalidAccessError: 15, TypeMismatchError: 17, SecurityError: 18,
+                    NetworkError: 19, AbortError: 20, URLMismatchError: 21,
+                    QuotaExceededError: 22, TimeoutError: 23, InvalidNodeTypeError: 24,
+                    DataCloneError: 25,
+                };
+                return codes[this.name] || 0;
+            },
+            enumerable: true, configurable: true,
+        });
     }
 
     // --- URLSearchParams ---
@@ -6253,6 +6297,40 @@
 
     // CSS.supports()
     if (!globalThis.CSS) globalThis.CSS = {};
+    if (!globalThis.CSS.escape) {
+        // CSSOM `CSS.escape` — serialise a string as a CSS identifier. Widely used by
+        // component libraries and by anything that builds selectors from ids/names;
+        // its absence is a plain TypeError at the call site.
+        globalThis.CSS.escape = function escape(value) {
+            const s = String(value);
+            let out = "";
+            for (let i = 0; i < s.length; i++) {
+                const c = s.charCodeAt(i);
+                const ch = s[i];
+                if (c === 0x0000) {
+                    out += "�";
+                } else if (
+                    (c >= 0x0001 && c <= 0x001f) || c === 0x007f ||
+                    (i === 0 && c >= 0x0030 && c <= 0x0039) ||
+                    (i === 1 && c >= 0x0030 && c <= 0x0039 && s.charCodeAt(0) === 0x002d)
+                ) {
+                    out += "\\" + c.toString(16) + " ";
+                } else if (i === 0 && c === 0x002d && s.length === 1) {
+                    out += "\\" + ch;
+                } else if (
+                    c >= 0x0080 || c === 0x002d || c === 0x005f ||
+                    (c >= 0x0030 && c <= 0x0039) ||
+                    (c >= 0x0041 && c <= 0x005a) ||
+                    (c >= 0x0061 && c <= 0x007a)
+                ) {
+                    out += ch;
+                } else {
+                    out += "\\" + ch;
+                }
+            }
+            return out;
+        };
+    }
     if (!globalThis.CSS.supports) {
         const _cssSupported = new Set([
             "display:grid", "display:flex", "display:block", "display:inline",

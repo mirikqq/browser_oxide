@@ -99,6 +99,13 @@ impl PagePool {
         let mut page = self.acquire(Some(profile.clone())).await?;
         page.navigate_warm(url).await?;
 
+        // The warm path skips the cold path's init scripts, so a pooled page ran with
+        // no humanized input at all: no ambient pointer activity, and — the part that
+        // matters — no trusted-event minter, leaving `element.click()` as the only way
+        // to drive it. That reports `isTrusted === false`, which vendor sensors read
+        // directly, so the first interaction announces automation.
+        let _ = page.evaluate(include_str!("js/humanize.js"));
+
         // Warm-path challenge caveat. The warm path skips the cold iteration
         // loop (pending-nav follow + cookie-diff retry), so a JS interstitial —
         // e.g. reddit's "Please wait for verification" inline-script form-submit

@@ -563,6 +563,33 @@ use crate::css_values::types::length::CalcContext;
 /// This matches Chrome's getComputedStyle behaviour: math functions are
 /// resolved to their used pixel value at access time, not echoed back
 /// as the original calc tree.
+/// Resolve a bare `<number><unit>` length to pixels.
+///
+/// `resolve_computed_value` only handles math functions, so a plain `60vw` was
+/// returned to `getComputedStyle` verbatim while Chrome answers the used pixel
+/// value. Percentages are deliberately left alone: resolving those needs the
+/// containing block, which this layer does not have.
+pub fn resolve_length_to_px(value: &str, ctx: &CalcContext) -> Option<String> {
+    let v = value.trim();
+    if v.is_empty() || v.ends_with('%') {
+        return None;
+    }
+    let split = v.find(|c: char| c.is_ascii_alphabetic())?;
+    let (num, unit) = v.split_at(split);
+    let n: f64 = num.parse().ok()?;
+    let unit = parse_length_unit(unit)?;
+    if matches!(unit, LengthUnit::Px) {
+        return None; // already px, keep the original text
+    }
+    let px = n * unit.to_px_factor(ctx);
+    // Chrome prints computed lengths with up to 4 decimals, trimming zeros.
+    let mut s = format!("{px:.4}");
+    while s.contains('.') && (s.ends_with('0') || s.ends_with('.')) {
+        s.pop();
+    }
+    Some(format!("{s}px"))
+}
+
 pub fn resolve_computed_value(value: &str, ctx: &CalcContext) -> String {
     let trimmed = value.trim();
     // Cheap rejection — if it doesn't look like a math fn, skip.

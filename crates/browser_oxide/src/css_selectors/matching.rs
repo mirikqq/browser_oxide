@@ -140,8 +140,16 @@ fn matches_simple<E: Element>(element: &E, simple: &SimpleSelector) -> bool {
         } => match_attribute(element, name, operator, value, case_sensitivity),
         SimpleSelector::PseudoClass(pc) => matches_pseudo_class(element, pc),
         SimpleSelector::PseudoElement(_) => {
-            // Pseudo-elements don't affect element matching in querySelectorAll
-            true
+            // A selector carrying a pseudo-element never matches a real element:
+            // `el.matches('::before')` is false in Chrome, and a `::-webkit-scrollbar`
+            // rule must not style the elements themselves.
+            //
+            // This returned `true` — so any rule the parser reduced to a bare
+            // pseudo-element matched EVERY element in the document. Epic's
+            // `::-webkit-scrollbar{width:10px}` was landing on all 204 nodes, which is
+            // why form containers computed a 10px width and the inputs came out 46px
+            // wide instead of full-width.
+            false
         }
         SimpleSelector::Nesting => {
             // `&` in matching context: depends on outer context.

@@ -36,14 +36,31 @@
     // ================================================================
     // DOMException — Chrome-shaped.
     // ================================================================
+    // Legacy code table from the DOM spec; names not listed map to 0.
+    const _DOM_EXCEPTION_LEGACY_CODES = {
+        IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4,
+        InvalidCharacterError: 5, NoModificationAllowedError: 7, NotFoundError: 8,
+        NotSupportedError: 9, InUseAttributeError: 10, InvalidStateError: 11,
+        SyntaxError: 12, InvalidModificationError: 13, NamespaceError: 14,
+        InvalidAccessError: 15, TypeMismatchError: 17, SecurityError: 18,
+        NetworkError: 19, AbortError: 20, URLMismatchError: 21,
+        QuotaExceededError: 22, TimeoutError: 23, InvalidNodeTypeError: 24,
+        DataCloneError: 25,
+    };
     if (!globalThis.DOMException) {
         globalThis.DOMException = class DOMException extends Error {
             constructor(message = "", name = "Error") {
                 super(message);
                 this.name = name;
-                this.code = 0;
             }
         };
+        // `code` is a prototype getter in Chrome, not an own data property. Assigning
+        // `this.code` in the constructor throws once a page-supplied polyfill (core-js
+        // ships one) redefines `code` as getter-only — which killed the whole module.
+        Object.defineProperty(globalThis.DOMException.prototype, "code", {
+            get() { return _DOM_EXCEPTION_LEGACY_CODES[this.name] || 0; },
+            enumerable: true, configurable: true,
+        });
         Object.defineProperty(globalThis.DOMException.prototype, Symbol.toStringTag, { value: "DOMException", configurable: true });
         _maskAsNative(globalThis.DOMException);
     }

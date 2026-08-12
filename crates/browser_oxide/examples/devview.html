@@ -1,0 +1,398 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>browser_oxide devview</title>
+<style>
+  :root { color-scheme: dark; --bg:#16171a; --line:#2e3038; --fg:#d8dae0; --dim:#8a8f9a;
+          --acc:#5aa9e6; --warn:#e0a24a; --bad:#e0685a; --ok:#5ac47a; }
+  * { box-sizing: border-box; }
+  body { margin:0; height:100vh; display:grid; grid-template-columns: minmax(0,1fr) clamp(280px,34vw,460px);
+         font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; background:var(--bg); color:var(--fg); }
+  /* Console sits under the mirror rather than behind a tab: engine errors are
+     most useful while watching the action they came from. */
+  #left { display:grid; grid-template-rows: minmax(0,1fr) clamp(120px,26vh,320px); min-width:0; }
+  #stage { position:relative; overflow:hidden; }
+  #console { border-top:1px solid var(--line); display:flex; flex-direction:column; min-height:0; }
+  #chead { display:flex; gap:6px; align-items:center; padding:4px 8px; border-bottom:1px solid var(--line); }
+  #chead b { color:var(--acc); font-weight:600; font-size:12px; }
+  #chead button { background:#1e2026; border:1px solid var(--line); color:var(--dim);
+                  padding:1px 7px; border-radius:10px; cursor:pointer; font:inherit; font-size:11px; }
+  #chead button.on { background:var(--acc); border-color:var(--acc); color:#0b0c0e; font-weight:600; }
+  #cfind { flex:1; min-width:60px; background:#111; border:1px solid var(--line); color:var(--fg);
+           padding:1px 6px; border-radius:4px; font:inherit; font-size:11px; }
+  #cclear { margin-left:auto; }
+  #clist { flex:1; overflow:auto; padding:2px 0; font-size:11px; }
+  .cline { padding:1px 8px; border-bottom:1px solid #202228; white-space:pre-wrap; word-break:break-all; }
+  .cline.error { color:var(--bad); } .cline.warn { color:var(--warn); }
+  .cline.info { color:var(--acc); } .cline .ts { color:var(--dim); margin-right:6px; }
+  #mirror { border:0; width:100%; height:100%; background:#fff; }
+  /* The engine has no cursor; this overlay draws where its behaviour generator
+     believes the pointer is, so the synthesised path is visible while it happens. */
+  #overlay { position:absolute; inset:0; pointer-events:none; }
+  #cursor { position:absolute; width:14px; height:14px; margin:-7px 0 0 -7px; border-radius:50%;
+            border:2px solid var(--acc); background:rgba(90,169,230,.25); transition:none; display:none; }
+  #cursor.press { border-color:var(--warn); background:rgba(224,162,74,.45); transform:scale(.7); }
+  aside { border-left:1px solid var(--line); display:flex; flex-direction:column; min-width:0; }
+  header { padding:7px 10px; border-bottom:1px solid var(--line); display:flex; gap:8px; align-items:center; }
+  header b { color:var(--acc); font-weight:600; }
+  #conn { margin-left:auto; font-size:11px; }
+  #conn.on { color:var(--ok); } #conn.off { color:var(--bad); }
+  nav { display:flex; border-bottom:1px solid var(--line); }
+  nav button { flex:1; background:none; border:0; border-bottom:2px solid transparent; color:var(--dim);
+               padding:7px 4px; cursor:pointer; font:inherit; font-size:12px; }
+  nav button.on { color:var(--fg); border-bottom-color:var(--acc); }
+  section { flex:1; overflow:auto; padding:6px 9px; display:none; }
+  section.on { display:block; }
+  .row { padding:4px 6px; border-bottom:1px solid var(--line); cursor:pointer; word-break:break-all; }
+  .row:hover { background:#24262c; }
+  .t { color:var(--acc); } .dim { color:var(--dim); } .bad { color:var(--bad); }
+  .warn { color:var(--warn); } .ok { color:var(--ok); }
+  /* Network panel ---------------------------------------------------------- */
+  #netbar { display:flex; gap:4px; flex-wrap:wrap; padding:5px 0 7px; position:sticky; top:-6px;
+            background:var(--bg); z-index:2; border-bottom:1px solid var(--line); margin-bottom:4px; }
+  #netbar button { background:#1e2026; border:1px solid var(--line); color:var(--dim);
+                   padding:2px 8px; border-radius:10px; cursor:pointer; font:inherit; font-size:11px; }
+  #netbar button.on { background:var(--acc); border-color:var(--acc); color:#0b0c0e; font-weight:600; }
+  #netfind { flex:1; min-width:80px; background:#111; border:1px solid var(--line); color:var(--fg);
+             padding:2px 6px; border-radius:4px; font:inherit; font-size:11px; }
+  .nrow { display:flex; gap:6px; align-items:baseline; padding:3px 4px; border-bottom:1px solid var(--line);
+          cursor:pointer; font-size:12px; }
+  .nrow:hover { background:#24262c; }
+  .nrow.open { background:#22262e; }
+  .nrow .st { width:30px; flex:none; text-align:right; }
+  .nrow .kd { width:44px; flex:none; font-size:10px; color:var(--dim); text-transform:uppercase; }
+  .nrow .nm { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .nrow .sz { flex:none; color:var(--dim); font-size:11px; }
+  .ndet { background:#101116; border-bottom:1px solid var(--line); padding:6px 8px; }
+  .ndet h4 { margin:6px 0 3px; font-size:11px; color:var(--acc); font-weight:600; }
+  .ndet pre { margin:0; white-space:pre-wrap; word-break:break-all; max-height:280px; overflow:auto;
+              font:inherit; font-size:11px; color:var(--fg); }
+  .ndet .kv { color:var(--dim); }
+  #bar { padding:6px 9px; border-top:1px solid var(--line); display:flex; gap:6px; }
+  #bar input { flex:1; min-width:0; background:#111; border:1px solid var(--line); color:var(--fg);
+               padding:5px 7px; border-radius:4px; font:inherit; }
+  #bar button { background:var(--acc); border:0; color:#0b0c0e; padding:5px 11px; border-radius:4px;
+                cursor:pointer; font:inherit; font-weight:600; }
+  #sel { padding:4px 9px; border-top:1px solid var(--line); color:var(--dim); word-break:break-all; font-size:11px; }
+  #status, #counts { padding:3px 10px; border-bottom:1px solid var(--line); font-size:11px; word-break:break-all; }
+  #chalbadge { font-size:11px; }
+</style>
+
+<div id="left">
+  <div id="stage">
+    <iframe id="mirror" sandbox="allow-same-origin"></iframe>
+    <svg id="overlay"><polyline id="trail" fill="none" stroke="#5aa9e6" stroke-width="1.5" opacity=".55"/></svg>
+    <div id="cursor"></div>
+  </div>
+  <div id="console">
+    <div id="chead">
+      <b>Консоль</b>
+      <button class="cf on" data-l="">все</button>
+      <button class="cf" data-l="error">ошибки</button>
+      <button class="cf" data-l="warn">ворнинги</button>
+      <input id="cfind" placeholder="фильтр…">
+      <span id="ccount" class="dim"></span>
+      <button id="cclear">очистить</button>
+    </div>
+    <div id="clist"></div>
+  </div>
+</div>
+
+<aside>
+  <header><b>devview</b><span id="chalbadge" class="dim"></span><span id="conn" class="off">●&nbsp;нет связи</span></header>
+  <div id="counts" class="dim"></div>
+  <div id="status" class="dim">запуск…</div>
+  <nav>
+    <button class="on" data-tab="acts">Элементы</button>
+    <button data-tab="net">Сеть</button>
+  </nav>
+  <section id="acts" class="on"></section>
+  <section id="net">
+    <div id="netbar">
+      <button class="on" data-k="">Все</button>
+      <button data-k="doc">Doc</button>
+      <button data-k="script">JS</button>
+      <button data-k="css">CSS</button>
+      <button data-k="xhr">XHR</button>
+      <button data-k="img">Img</button>
+      <button data-k="font">Font</button>
+      <button data-k="other">Проч.</button>
+      <input id="netfind" placeholder="фильтр по URL…">
+    </div>
+    <div id="netlist"><div class="dim">нет запросов</div></div>
+  </section>
+  <div id="sel" class="dim">селектор не выбран</div>
+  <div id="bar">
+    <input id="text" placeholder="текст для ввода…">
+    <button id="fill">Ввести</button>
+    <button id="click">Клик</button>
+  </div>
+</aside>
+
+<script>
+  let picked = null, lastHtml = '';
+  let trail = [], t0 = Date.now();
+  const $ = (id) => document.getElementById(id);
+
+  document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+    document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x === b));
+    document.querySelectorAll('section').forEach(s => s.classList.toggle('on', s.id === b.dataset.tab));
+  });
+
+  // ---- socket -----------------------------------------------------------------
+  let ws = null;
+  function connect() {
+    ws = new WebSocket('ws://127.0.0.1:__WS_PORT__');
+    ws.onopen = () => { $('conn').className = 'on'; $('conn').textContent = '● связь'; };
+    ws.onclose = () => {
+      $('conn').className = 'off'; $('conn').textContent = '● нет связи';
+      setTimeout(connect, 1000);
+    };
+    ws.onmessage = (e) => { try { handle(JSON.parse(e.data)); } catch (_) {} };
+  }
+  const send = (o) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
+  connect();
+
+  $('click').onclick = () => picked && send({ action: 'click', sel: picked, text: '' });
+  $('fill').onclick = () => picked && send({ action: 'fill', sel: picked, text: $('text').value });
+
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  function log(text, cls) {
+    const el = $('status');
+    el.className = cls || 'dim';
+    el.textContent = `+${((Date.now() - t0) / 1000).toFixed(1)}с  ${text}`;
+    addConsole([{ level: cls === 'bad' ? 'error' : cls === 'warn' ? 'warn' : 'info', text }]);
+  }
+
+  // ---- console ------------------------------------------------------------------
+  // Engine console output (page realm and every child frame) plus this view's own
+  // driver events, in one stream — a widget's failure and the action that caused it
+  // are only diagnosable next to each other.
+  const conAll = [];
+  let conLevel = '', conStick = true;
+
+  document.querySelectorAll('#chead .cf').forEach(b => b.onclick = () => {
+    document.querySelectorAll('#chead .cf').forEach(x => x.classList.toggle('on', x === b));
+    conLevel = b.dataset.l; renderConsole();
+  });
+  $('cfind').oninput = renderConsole;
+  $('cclear').onclick = () => { conAll.length = 0; renderConsole(); };
+  // Stop auto-scrolling as soon as the user scrolls up to read something.
+  $('clist').onscroll = () => {
+    const el = $('clist');
+    conStick = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+  };
+
+  // The engine tags every console argument with its type. That is useful for
+  // objects and errors and pure noise for strings, which is most of the stream.
+  // Collapse runs of spaces only — newlines carry the stack trace of an Error.
+  const untag = (t) => String(t).replace(/\[string\] /g, '').replace(/[ \t]{2,}/g, ' ').trim();
+
+  function addConsole(items) {
+    if (!items || !items.length) return;
+    const ms = ((Date.now() - t0) / 1000).toFixed(1);
+    for (const it of items) conAll.push({ ts: ms, level: it.level || 'log', text: untag(it.text) });
+    if (conAll.length > 2000) conAll.splice(0, conAll.length - 2000);
+    renderConsole();
+  }
+
+  function renderConsole() {
+    const q = $('cfind').value.trim().toLowerCase();
+    const list = conAll.filter(c =>
+      (!conLevel || c.level === conLevel) && (!q || c.text.toLowerCase().includes(q)));
+    const errs = conAll.filter(c => c.level === 'error').length;
+    const warns = conAll.filter(c => c.level === 'warn').length;
+    $('ccount').textContent = `${conAll.length} · ошибок ${errs} · ворнингов ${warns}`;
+    $('clist').innerHTML = list.map(c =>
+      `<div class="cline ${c.level}"><span class="ts">+${c.ts}с</span>${esc(c.text)}</div>`).join('')
+      || '<div class="cline dim">пусто</div>';
+    if (conStick) $('clist').scrollTop = $('clist').scrollHeight;
+  }
+
+  function handle(msg) {
+    if (msg.kind === 'status') { log(msg.text, 'ok'); return; }
+    if (msg.kind === 'log') { log(msg.text, 'warn'); return; }
+    if (msg.kind === 'action') {
+      const ms = msg.ms != null ? ` (${msg.ms} мс)` : '';
+      log(`${msg.raw} → ${msg.state}${ms}`, msg.state.startsWith('ошибк') ? 'bad' : '');
+      return;
+    }
+    if (msg.kind !== 'snapshot') return;
+    if (msg.net && msg.net.length) addNet(msg.net);
+    if (msg.console && msg.console.length) addConsole(msg.console);
+    paint(msg.data);
+  }
+
+  // ---- network ------------------------------------------------------------------
+  // Records arrive incrementally (each carries a monotonic seq), so the panel owns
+  // the full history — the engine only ever sends what this view has not seen.
+  const netAll = [];
+  let netKind = '', netOpen = null;
+
+  document.querySelectorAll('#netbar button').forEach(b => b.onclick = () => {
+    document.querySelectorAll('#netbar button').forEach(x => x.classList.toggle('on', x === b));
+    netKind = b.dataset.k; renderNet();
+  });
+  $('netfind').oninput = renderNet;
+
+  function addNet(recs) { for (const r of recs) netAll.push(r); renderNet(); }
+
+  const shortName = (u) => {
+    try {
+      const p = new URL(u);
+      const last = p.pathname.split('/').filter(Boolean).pop() || p.hostname;
+      return last + (p.search ? p.search.slice(0, 24) : '');
+    } catch (_) { return u; }
+  };
+  const host = (u) => { try { return new URL(u).hostname; } catch (_) { return ''; } };
+  const kb = (n) => n < 1024 ? n + ' Б' : (n / 1024).toFixed(1) + ' КБ';
+
+  function renderNet() {
+    const q = $('netfind').value.trim().toLowerCase();
+    const list = netAll.filter(r =>
+      (!netKind || r.kind === netKind) && (!q || r.url.toLowerCase().includes(q)));
+    if (!list.length) { $('netlist').innerHTML = '<div class="dim">нет запросов</div>'; return; }
+    $('netlist').innerHTML = list.slice().reverse().map(r => {
+      const cls = r.status === 0 ? 'bad' : r.status >= 400 ? 'bad' : r.status >= 300 ? 'warn' : 'ok';
+      const row = `<div class="nrow ${netOpen === r.seq ? 'open' : ''}" data-seq="${r.seq}">
+          <span class="st ${cls}">${r.status || '—'}</span>
+          <span class="kd">${r.kind}</span>
+          <span class="nm" title="${esc(r.url)}">${esc(shortName(r.url))}
+            <span class="dim">· ${esc(host(r.url))}</span></span>
+          <span class="sz">${kb(r.size)}</span>
+        </div>`;
+      return row + (netOpen === r.seq ? detail(r) : '');
+    }).join('');
+    document.querySelectorAll('#netlist .nrow').forEach(el => el.onclick = () => {
+      const s = Number(el.dataset.seq);
+      netOpen = netOpen === s ? null : s;
+      renderNet();
+    });
+  }
+
+  function detail(r) {
+    const hdrs = (r.headers || []).map(([k, v]) => `${k}: ${v}`).join('\n') || '—';
+    const body = r.body ? esc(r.body) :
+      '<span class="dim">тело не текстовое либо пустое</span>';
+    return `<div class="ndet">
+      <h4>Запрос</h4>
+      <pre class="kv">${r.method} ${esc(r.url)}</pre>
+      <h4>Ответ</h4>
+      <pre class="kv">${r.status} · ${esc(r.mime || 'без Content-Type')} · ${kb(r.size)}</pre>
+      <h4>Заголовки ответа</h4>
+      <pre>${esc(hdrs)}</pre>
+      <h4>Тело ответа</h4>
+      <pre>${body}</pre>
+    </div>`;
+  }
+
+  // ---- cursor overlay ----------------------------------------------------------
+  function drawCursor(samples, lastPos) {
+    const f = $('mirror'), st = $('stage');
+    const scaleX = f.clientWidth / (f.contentWindow?.innerWidth || f.clientWidth || 1);
+    for (const s of samples) trail.push([s.x, s.y]);
+    if (trail.length > 220) trail = trail.slice(-220);
+    const pts = trail.map(([x, y]) => `${Math.round(x * scaleX)},${Math.round(y * scaleX)}`).join(' ');
+    $('trail').setAttribute('points', pts);
+    const at = lastPos || (trail.length ? trail[trail.length - 1] : null);
+    if (at) {
+      const c = $('cursor');
+      c.style.display = 'block';
+      c.style.left = Math.round(at[0] * scaleX) + 'px';
+      c.style.top = Math.round(at[1] * scaleX) + 'px';
+    }
+    if (samples.length) {
+      const c = $('cursor');
+      c.classList.add('press');
+      clearTimeout(drawCursor._t);
+      drawCursor._t = setTimeout(() => c.classList.remove('press'), 120);
+    }
+  }
+
+  function paint(s) {
+    $('counts').textContent = s.counts
+      ? `${s.counts.elements} эл · ${s.counts.inputs} input · ${s.counts.buttons} button` : '';
+
+    if (s.html && s.html !== lastHtml) {
+      lastHtml = s.html;
+      // Author CSS now reaches the mirror, so no cosmetic overrides are needed.
+      // These two compensate for state the engine leaves unfinished: MUI writes
+      // `opacity: 0` inline and animates it from JS that never completes here, and
+      // the app pins body{overflow:hidden} for a scroll container it never wires up.
+      const unfinished = `<style>
+        html,body{overflow:auto!important;}
+        [style*="opacity: 0;"],[style$="opacity: 0"]{opacity:1!important;}
+      </style>`;
+      const html = s.html
+        // The mirror deliberately runs without allow-scripts — re-running the SPA
+        // here would show Chrome's render, not the engine's DOM. Strip what that
+        // makes noisy rather than loosening the sandbox:
+        //  · <noscript> would otherwise cover the real DOM with "enable JavaScript"
+        //  · nested iframes can never run, and each logs a sandbox violation
+        //  · <script> cannot run either, yet Chrome still fetches every one of them —
+        //    module scripts are CORS-fetched regardless of the attribute, so each is
+        //    a console error and a pointless round trip
+        //  · preload hints for assets nothing will consume warn on every load
+        //  · crossorigin on fonts fails CORS from 127.0.0.1
+        .replace(/<noscript[\s\S]*?<\/noscript>/gi, '')
+        .replace(/<iframe[\s\S]*?<\/iframe>/gi, '')
+        .replace(/<iframe[^>]*>/gi, '')
+        .replace(/<script[\s\S]*?<\/script>/gi, '')
+        .replace(/<script[^>]*\/?>/gi, '')
+        .replace(/<link[^>]+rel=["']?(?:module)?preload["']?[^>]*>/gi, '')
+        .replace(/\scrossorigin(=(["'])[^"']*\2|=[^\s>]+)?/gi, '')
+        // Web fonts are always fetched in CORS mode, whatever the attribute says, so
+        // from 127.0.0.1 every @font-face is a console error. Drop them and let the
+        // mirror fall back to system faces — metrics shift slightly, layout does not.
+        .replace(/@font-face\s*\{[^}]*\}/gi, '')
+        .replace(/<head([^>]*)>/i, `<head$1><base href="${s.url}">${unfinished}`);
+      const f = $('mirror');
+      f.srcdoc = html;
+      f.onload = () => {
+        const d = f.contentDocument; if (!d) return;
+        d.addEventListener('click', ev => { ev.preventDefault(); pick(selectorFor(ev.target)); }, true);
+        d.addEventListener('submit', ev => ev.preventDefault(), true);
+      };
+    }
+
+    drawCursor(s.cursor || [], s.lastPos);
+
+    $('acts').innerHTML = (s.actionables || []).map(a =>
+      `<div class="row" data-sel="${a.sel.replace(/"/g, '&quot;')}">
+         <span class="t">${a.tag}${a.type ? '[' + a.type + ']' : ''}</span>
+         ${a.label || '<span class="dim">без метки</span>'}
+         ${a.value ? `<span class="dim"> = ${a.value}</span>` : ''}
+         <span class="dim"> ${a.box ? a.box[2] + '×' + a.box[3] : ''}</span>
+       </div>`).join('') || '<div class="dim">нет интерактивных элементов</div>';
+    document.querySelectorAll('#acts .row').forEach(r => r.onclick = () => pick(r.dataset.sel));
+
+    // Detection read-out, kept as a one-line badge rather than a tab: vendors ship
+    // challenge markup on every page, so the tell is the flip to visible.
+    const shown = (s.challenges || []).filter(c =>
+      c.display !== 'none' && c.visibility !== 'hidden'
+      && /talon_container|talon_challenge_container|h_captcha_challenge/.test(c.id));
+    const badge = $('chalbadge');
+    badge.className = shown.length ? 'bad' : 'ok';
+    badge.textContent = shown.length
+      ? `● челлендж показан (${shown.map(c => c.id).join(', ').slice(0, 60)})`
+      : '● челлендж скрыт';
+  }
+
+  // ---- element picking ----------------------------------------------------------
+  function pick(sel) {
+    picked = sel;
+    $('sel').textContent = sel;
+  }
+
+  function selectorFor(el) {
+    if (el.id) return '#' + CSS.escape(el.id);
+    const parts = [];
+    while (el && el.nodeType === 1 && el.tagName !== 'HTML') {
+      const p = el.parentNode; if (!p) break;
+      const same = [...p.children].filter(c => c.tagName === el.tagName);
+      parts.unshift(el.tagName.toLowerCase() + (same.length > 1 ? `:nth-of-type(${same.indexOf(el) + 1})` : ''));
+      el = p;
+    }
+    return parts.join(' > ');
+  }
+
+</script>

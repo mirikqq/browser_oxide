@@ -18,6 +18,44 @@ pub struct IframeInfo {
     pub src: Option<String>,
 }
 
+/// Point a child realm's `parent`/`top` at a bridge that queues `postMessage`
+/// upward, and revoke the privileged setter.
+///
+/// Without this a child's `parent.postMessage(...)` resolves to its own window
+/// (the frame-tree globals are self-referential), so a widget's handshake with
+/// its embedder never leaves the child isolate.
+const INSTALL_PARENT_BRIDGE: &str = r#"
+(function () {
+    // `__bo_frames`, not `Deno.core.ops`: this runs after cleanup_bootstrap has
+    // removed `Deno`, so the ops lookup would be null and every postMessage from
+    // this frame would silently vanish.
+    var frames = globalThis.__bo_frames || null;
+    var bridge = {
+        postMessage: function (data, targetOrigin) {
+            if (!frames) return;
+            var json;
+            try {
+                json = JSON.stringify({
+                    data: data,
+                    origin: (globalThis.location && globalThis.location.origin) || '',
+                    targetOrigin: String(targetOrigin == null ? '*' : targetOrigin),
+                });
+            } catch (_) {
+                json = JSON.stringify({ data: String(data), origin: '', targetOrigin: '*' });
+            }
+            frames.postToParent(json);
+        },
+        closed: false,
+        get frames() { return bridge; },
+        get self() { return bridge; },
+        get window() { return bridge; },
+        blur: function () {}, focus: function () {}, close: function () {},
+    };
+    try { globalThis.__bo_set_frame_links(bridge, bridge); } catch (_) {}
+    try { delete globalThis.__bo_set_frame_links; } catch (_) {}
+})()
+"#;
+
 /// A child iframe with its own V8 runtime and DOM.
 pub struct ChildIframe {
     pub node_id: NodeId,
@@ -45,6 +83,11 @@ impl ChildIframe {
             },
         );
         let mut event_loop = BrowserEventLoop::new(runtime);
+
+        // Before any page script: a widget that talks to its embedder does so during
+        // its own initial execution, so a bridge installed afterwards is installed
+        // into a document that has already given up. See `from_url`.
+        event_loop.execute_script(INSTALL_PARENT_BRIDGE).ok();
 
         // Execute scripts in the child's own V8 context. W2.7 — Chrome
         // reports `about:srcdoc` for srcdoc iframe stack frames.
@@ -178,6 +221,15 @@ impl ChildIframe {
         event_loop
             .execute_script(&format!("location.href = '{}';", url_js))
             .ok();
+
+        // Install the parent bridge BEFORE page scripts, not after. Third-party
+        // widgets hand off to their embedder during their own initial execution —
+        // hCaptcha's frame bundle ends with `send("checkbox-ready")` — so a bridge
+        // installed after the script loop is installed into a frame that already
+        // posted into the void and is now waiting for a reply that cannot come.
+        // The embedder answers that first message with the config the frame needs
+        // to fetch its proof-of-work worker, so losing it stalls the whole widget.
+        event_loop.execute_script(INSTALL_PARENT_BRIDGE).ok();
 
         // Execute scripts, fetching external ones
         for (i, script) in scripts.iter().enumerate() {

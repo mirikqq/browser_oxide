@@ -13,6 +13,7 @@ pub mod h1_client;
 pub mod h2_client;
 pub mod h3_request;
 pub mod headers;
+pub mod netlog;
 // JA4H is patent-pending under FoxIO License 1.1 (non-commercial). The
 // computer is test-gated so it never reaches a release binary, fitting the
 // "internal testing/evaluation" carve-out. See ja4h.rs and LICENSE-NOTE.md.
@@ -701,7 +702,7 @@ impl HttpClient {
                 }
                 match h2_client::send_get(&mut sender, uri, host, &hdrs).await {
                     Ok((parts, body)) => {
-                        let resp = self.build_response(parts, body, url).await?;
+                        let resp = self.build_response(parts, body, url, "GET").await?;
                         break 'h2 Some(resp);
                     }
                     Err(e) if attempt == 0 && is_stale_conn_error(&e) => {
@@ -742,7 +743,7 @@ impl HttpClient {
                     );
                 }
                 let raw = h1_client::send_get(&mut tls_stream, host, &path, &hdrs).await?;
-                self.build_response_from_raw(raw, url).await?
+                self.build_response_from_raw(raw, url, "GET").await?
             }
         };
         self.learn_alt_svc(url, &response.headers).await;
@@ -833,7 +834,7 @@ impl HttpClient {
                 }
                 match h2_client::send_get(&mut sender, uri, host, &hdrs).await {
                     Ok((parts, body)) => {
-                        let resp = self.build_response(parts, body, url).await?;
+                        let resp = self.build_response(parts, body, url, "GET").await?;
                         break 'h2 Some(resp);
                     }
                     Err(e) if attempt == 0 && is_stale_conn_error(&e) => {
@@ -877,7 +878,7 @@ impl HttpClient {
                     );
                 }
                 let raw = h1_client::send_get(&mut tls_stream, host, &path, &hdrs).await?;
-                self.build_response_from_raw(raw, url).await?
+                self.build_response_from_raw(raw, url, "GET").await?
             }
         };
 
@@ -1094,7 +1095,7 @@ impl HttpClient {
         let mut tls_stream = tls::connect_tls(&connector, &self.profile, host, tcp_stream).await?;
 
         let raw = h1_client::send_post(&mut tls_stream, host, &path, &hdrs, body).await?;
-        self.build_response_from_raw(raw, url).await
+        self.build_response_from_raw(raw, url, "POST").await
     }
 
     /// POST with a raw byte body and ONLY the caller-provided headers plus cookies.
@@ -1186,7 +1187,7 @@ impl HttpClient {
                 }
                 match h2_client::send_post(&mut sender, uri, host, &hdrs, body).await {
                     Ok((parts, resp_body)) => {
-                        let resp = self.build_response(parts, resp_body, url).await?;
+                        let resp = self.build_response(parts, resp_body, url, "POST").await?;
                         break 'h2 Some(resp);
                     }
                     Err(e) if attempt == 0 && is_stale_conn_error(&e) => {
@@ -1231,7 +1232,7 @@ impl HttpClient {
                     );
                 }
                 let raw = h1_client::send_post(&mut tls_stream, host, &path, &hdrs, body).await?;
-                self.build_response_from_raw(raw, url).await?
+                self.build_response_from_raw(raw, url, "POST").await?
             }
         };
 
@@ -1333,7 +1334,7 @@ impl HttpClient {
                 let uri = parsed.as_str();
                 match h2_client::send_post(&mut sender, uri, host, &hdrs, body).await {
                     Ok((parts, resp_body)) => {
-                        let resp = self.build_response(parts, resp_body, url).await?;
+                        let resp = self.build_response(parts, resp_body, url, "POST").await?;
                         break 'h2 Some(resp);
                     }
                     Err(e) if attempt == 0 && is_stale_conn_error(&e) => {
@@ -1364,7 +1365,7 @@ impl HttpClient {
                     None => parsed.path().to_string(),
                 };
                 let raw = h1_client::send_post(&mut tls_stream, host, &path, &hdrs, body).await?;
-                self.build_response_from_raw(raw, url).await?
+                self.build_response_from_raw(raw, url, "POST").await?
             }
         };
 
@@ -1439,6 +1440,7 @@ impl HttpClient {
         parts: http::response::Parts,
         body: Vec<u8>,
         url: &str,
+        method: &str,
     ) -> Result<Response, NetError> {
         let status = parts.status.as_u16();
         let status_text = parts.status.canonical_reason().unwrap_or("").to_string();
@@ -1463,6 +1465,7 @@ impl HttpClient {
             .map(|s| s.as_str())
             .unwrap_or("");
         let decompressed = compression::decompress(&body, encoding)?;
+        netlog::record(method, url, status, &resp_headers, &decompressed);
 
         Ok(Response {
             status,
@@ -1481,6 +1484,7 @@ impl HttpClient {
         &self,
         raw: h1_client::RawResponse,
         url: &str,
+        method: &str,
     ) -> Result<Response, NetError> {
         let mut resp_headers = HashMap::new();
         let mut set_cookies = Vec::new();
@@ -1497,6 +1501,7 @@ impl HttpClient {
             .map(|s| s.as_str())
             .unwrap_or("");
         let decompressed = compression::decompress(&raw.body, encoding)?;
+        netlog::record(method, url, raw.status, &resp_headers, &decompressed);
 
         Ok(Response {
             status: raw.status,

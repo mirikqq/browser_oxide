@@ -181,6 +181,14 @@ pub fn create_runtime_with_signals(
     if let Some(url) = options.base_url {
         state = state.with_base_url(url);
     }
+    // The main document's DomState never carried the profile — only the worker
+    // path did. Everything that resolves against the viewport therefore used the
+    // compiled-in 1920x1080 default while `window.innerWidth` reported the profile's
+    // size: `vw`/`vh` in getComputedStyle, `@media` evaluation, and layout all
+    // disagreed with what the page was told. Assign before the cascade is built so
+    // media queries see the right width.
+    state.stealth_profile = options.stealth_profile.clone();
+    state.sync_viewport_from_profile();
     state.update_cached_rules();
 
     // P2 — ES-module loader for document `<script type="module">`. Resolves
@@ -338,6 +346,9 @@ pub fn create_runtime_with_signals(
             include_str!("js/streams_bootstrap.js"),
             "\n",
             include_str!("js/structured_clone.js"),
+            // Must precede cleanup_bootstrap: it captures `Deno.core.ops` for the
+            // humanized-input init script, which itself runs after Deno is gone.
+            include_str!("js/input_bootstrap.js"),
         );
 
         runtime
@@ -472,6 +483,7 @@ pub fn create_worker_runtime(
     // so op_has_stealth_profile() works in the worker isolate.
     let mut dom_state = DomState::new(crate::dom::Dom::new());
     dom_state.stealth_profile = profile.clone();
+    dom_state.sync_viewport_from_profile();
     runtime.op_state().borrow_mut().put(dom_state);
 
     // StealthState must also carry the profile so op_get_profile_value

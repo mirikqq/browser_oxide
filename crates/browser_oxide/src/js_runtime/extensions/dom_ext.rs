@@ -1,4 +1,4 @@
-use crate::css_values::calc::resolve_computed_value;
+use crate::css_values::calc::{resolve_computed_value, resolve_length_to_px};
 use crate::css_values::types::length::CalcContext;
 use crate::dom::node::NodeId;
 use crate::dom::DomElement;
@@ -27,6 +27,119 @@ fn calc_context_from(state: &DomState) -> CalcContext {
         ctx.font_size_px = 16.0;
     }
     ctx
+}
+
+/// Expand a shorthand into the longhands `getComputedStyle` must also report.
+///
+/// Chrome answers `backgroundColor` even when the sheet only said `background:#eee`,
+/// and `marginTop` when it said `margin:15vh auto`. The engine stored declarations
+/// verbatim, so every such longhand read back empty — which silently breaks any
+/// script (and any diff against a real browser) that asks for the longhand.
+///
+/// Only the mechanical box shorthands are expanded, plus a plain-colour `background`.
+/// `border`, `font` and friends need real value parsing and are left alone rather
+/// than guessed at. The shorthand itself is always kept alongside.
+fn expand_shorthand(name: &str, value: &str) -> Vec<(String, String)> {
+    let lower = name.to_ascii_lowercase();
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    // 1→all, 2→(block, inline), 3→(top, inline, bottom), 4→(top, right, bottom, left)
+    let sides = |p: &[&str]| -> Option<[String; 4]> {
+        let g = |i: usize| p[i].to_string();
+        match p.len() {
+            1 => Some([g(0), g(0), g(0), g(0)]),
+            2 => Some([g(0), g(1), g(0), g(1)]),
+            3 => Some([g(0), g(1), g(2), g(1)]),
+            4 => Some([g(0), g(1), g(2), g(3)]),
+            _ => None,
+        }
+    };
+    let box_longhands = |prefix: &str, suffix: &str| -> Vec<(String, String)> {
+        match sides(&parts) {
+            Some([t, r, b, l]) => vec![
+                (format!("{prefix}top{suffix}"), t),
+                (format!("{prefix}right{suffix}"), r),
+                (format!("{prefix}bottom{suffix}"), b),
+                (format!("{prefix}left{suffix}"), l),
+            ],
+            None => Vec::new(),
+        }
+    };
+
+    let mut out = match lower.as_str() {
+        "margin" => box_longhands("margin-", ""),
+        "padding" => box_longhands("padding-", ""),
+        "inset" => match sides(&parts) {
+            Some([t, r, b, l]) => vec![
+                ("top".into(), t),
+                ("right".into(), r),
+                ("bottom".into(), b),
+                ("left".into(), l),
+            ],
+            None => Vec::new(),
+        },
+        "border-width" => box_longhands("border-", "-width"),
+        "border-style" => box_longhands("border-", "-style"),
+        "border-color" => box_longhands("border-", "-color"),
+        "overflow" => match parts.len() {
+            1 => vec![
+                ("overflow-x".into(), parts[0].into()),
+                ("overflow-y".into(), parts[0].into()),
+            ],
+            2 => vec![
+                ("overflow-x".into(), parts[0].into()),
+                ("overflow-y".into(), parts[1].into()),
+            ],
+            _ => Vec::new(),
+        },
+        "gap" => match parts.len() {
+            1 => vec![
+                ("row-gap".into(), parts[0].into()),
+                ("column-gap".into(), parts[0].into()),
+            ],
+            2 => vec![
+                ("row-gap".into(), parts[0].into()),
+                ("column-gap".into(), parts[1].into()),
+            ],
+            _ => Vec::new(),
+        },
+        // Only the single-token colour form; anything richer needs a real parser.
+        "background" if parts.len() == 1 => {
+            let v = parts[0];
+            let is_colour = v.starts_with('#')
+                || v.starts_with("rgb")
+                || v.starts_with("hsl")
+                || crate::css_values::types::color::named_color(&v.to_ascii_lowercase()).is_some();
+            if is_colour {
+                vec![("background-color".into(), v.to_string())]
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    };
+    out.push((lower, value.to_string()));
+    out
+}
+
+/// True when `id` is a `<style>` element, or an element containing one.
+/// Mutating such a subtree changes the document's CSS, so the cascade must be
+/// rebuilt — otherwise a `<style>` created and appended by script never applies.
+fn touches_stylesheet(state: &DomState, id: NodeId) -> bool {
+    if state
+        .dom
+        .get(id)
+        .and_then(|n| n.as_element())
+        .is_some_and(|e| e.name.local.eq_ignore_ascii_case("style"))
+    {
+        return true;
+    }
+    !state.dom.get_elements_by_tag_name(id, "style").is_empty()
+}
+
+fn refresh_stylesheets(state: &mut DomState) {
+    let entries = crate::stylesheet_collector::find_stylesheets(&state.dom);
+    state.stylesheets = crate::stylesheet_collector::resolve_inline_only(&entries);
+    state.update_cached_rules();
 }
 
 // Convention: ops that return "nullable NodeId" return i64.
@@ -272,7 +385,16 @@ pub fn op_dom_query_selector(
             }
             match DomElement::new(&state.dom, children[0]) {
                 Some(el) => {
-                    // Search from root element
+                    // `document.querySelector` matches every descendant of the document
+                    // node, and that set INCLUDES the document element — so `html`,
+                    // `:root` and `*` must be able to return <html> itself. Since
+                    // `query_selector` only walks descendants of the root it is given,
+                    // test the root separately first (it is also first in document order).
+                    if let Ok(list) = crate::css_selectors::parse_selector_list(selector) {
+                        if crate::css_selectors::matches_any(&el, &list) {
+                            return el.node_id().to_raw() as i32;
+                        }
+                    }
                     if let Ok(Some(found)) = crate::css_selectors::query_selector(&el, selector) {
                         return found.node_id().to_raw() as i32;
                     }
@@ -298,18 +420,35 @@ pub fn op_dom_query_selector_all(
     let state = state.borrow::<DomState>();
     let id = NodeId::from_raw(node_id as u32);
     // For document or element, try to build a DomElement for querying
-    let root_el = DomElement::new(&state.dom, id).or_else(|| {
+    let self_el = DomElement::new(&state.dom, id);
+    // No DomElement for this id means it is the Document node, whose match set
+    // includes the document element itself (see op_dom_query_selector).
+    let from_document = self_el.is_none();
+    let root_el = self_el.or_else(|| {
         let children = state.dom.child_elements(id);
         children
             .first()
             .and_then(|&c| DomElement::new(&state.dom, c))
     });
     match root_el {
-        Some(el) => crate::css_selectors::query_selector_all(&el, &selector)
-            .unwrap_or_default()
-            .iter()
-            .map(|e| e.node_id().to_raw() as i32)
-            .collect(),
+        Some(el) => {
+            let mut out = Vec::new();
+            if from_document {
+                if let Ok(list) = crate::css_selectors::parse_selector_list(&selector) {
+                    if crate::css_selectors::matches_any(&el, &list) {
+                        // Document order: the root precedes all of its descendants.
+                        out.push(el.node_id().to_raw() as i32);
+                    }
+                }
+            }
+            out.extend(
+                crate::css_selectors::query_selector_all(&el, &selector)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|e| e.node_id().to_raw() as i32),
+            );
+            out
+        }
         None => vec![],
     }
 }
@@ -386,11 +525,14 @@ pub fn op_dom_create_document_fragment(state: &mut OpState) -> i32 {
 #[op2(fast)]
 pub fn op_dom_append_child(state: &mut OpState, #[smi] parent: i32, #[smi] child: i32) {
     let state = state.borrow_mut::<DomState>();
-    state.dom.append_child(
-        NodeId::from_raw(parent as u32),
-        NodeId::from_raw(child as u32),
-    );
+    let child_id = NodeId::from_raw(child as u32);
+    state
+        .dom
+        .append_child(NodeId::from_raw(parent as u32), child_id);
     state.layout_engine.mark_dirty();
+    if touches_stylesheet(state, child_id) {
+        refresh_stylesheets(state);
+    }
 }
 
 #[op2(fast)]
@@ -464,10 +606,64 @@ pub fn op_dom_remove_attribute(state: &mut OpState, #[smi] node_id: i32, #[strin
 #[op2(fast)]
 pub fn op_dom_set_text_content(state: &mut OpState, #[smi] node_id: i32, #[string] text: &str) {
     let state = state.borrow_mut::<DomState>();
-    state
-        .dom
-        .set_text_content(NodeId::from_raw(node_id as u32), text);
+    let id = NodeId::from_raw(node_id as u32);
+    state.dom.set_text_content(id, text);
     state.layout_engine.mark_dirty();
+    if touches_stylesheet(state, id) {
+        refresh_stylesheets(state);
+    }
+}
+
+/// Queue a `postMessage` for a child iframe realm.
+///
+/// Cross-realm delivery cannot happen in JS: each iframe is its own V8 isolate.
+/// The payload is parked here and `Page::pump_iframe_messages` hands it to the
+/// matching `ChildIframe`.
+#[op2(fast)]
+pub fn op_iframe_post_to_child(state: &mut OpState, #[smi] node_id: i32, #[string] json: &str) {
+    let state = state.borrow_mut::<DomState>();
+    state
+        .messages_to_children
+        .push((node_id as u32, json.to_string()));
+}
+
+/// Queue a `parent.postMessage` from inside a child realm.
+#[op2(fast)]
+pub fn op_iframe_post_to_parent(state: &mut OpState, #[string] json: &str) {
+    let state = state.borrow_mut::<DomState>();
+    state.messages_to_parent.push(json.to_string());
+}
+
+/// Drain queued child-bound messages: `[node_id, json, node_id, json, …]`.
+#[op2]
+#[serde]
+pub fn op_iframe_take_child_messages(state: &mut OpState) -> Vec<String> {
+    let state = state.borrow_mut::<DomState>();
+    let mut out = Vec::with_capacity(state.messages_to_children.len() * 2);
+    for (id, json) in std::mem::take(&mut state.messages_to_children) {
+        out.push(id.to_string());
+        out.push(json);
+    }
+    out
+}
+
+/// Drain queued parent-bound messages from this (child) realm.
+#[op2]
+#[serde]
+pub fn op_iframe_take_parent_messages(state: &mut OpState) -> Vec<String> {
+    let state = state.borrow_mut::<DomState>();
+    std::mem::take(&mut state.messages_to_parent)
+}
+
+/// Re-collect `<style>` content from the live DOM and rebuild the cascade.
+///
+/// The document's stylesheets are gathered once at parse time, so anything a page
+/// injects afterwards — `sheet.insertRule` (how emotion/MUI ship *all* of their CSS),
+/// or a `<style>` whose text is set from script — never reached the cascade or layout.
+/// JS calls this after any such mutation.
+#[op2(fast)]
+pub fn op_dom_refresh_stylesheets(state: &mut OpState) {
+    refresh_stylesheets(state.borrow_mut::<DomState>());
 }
 
 #[op2(fast)]
@@ -785,11 +981,14 @@ pub fn op_dom_get_all_computed_styles(
                 let s = crate::css_selectors::compute_specificity(sel);
                 let spec = s.a * 10000 + s.b * 100 + s.c;
                 for (name, val) in &rule.declarations {
-                    let entry = declarations
-                        .entry(name.clone())
-                        .or_insert((0, 0, String::new()));
-                    if spec > entry.0 || (spec == entry.0 && source_order >= entry.1) {
-                        *entry = (spec, source_order, val.clone());
+                    // Expand at insertion so the generated longhands take part in the
+                    // same specificity/source-order contest as explicit ones — a later
+                    // `margin-top` still beats an earlier `margin`.
+                    for (prop, pval) in expand_shorthand(name, val) {
+                        let entry = declarations.entry(prop).or_insert((0, 0, String::new()));
+                        if spec > entry.0 || (spec == entry.0 && source_order >= entry.1) {
+                            *entry = (spec, source_order, pval);
+                        }
                     }
                 }
             }
@@ -806,9 +1005,11 @@ pub fn op_dom_get_all_computed_styles(
         {
             for decl in style.value.split(';') {
                 if let Some(colon) = decl.find(':') {
-                    let name = decl[..colon].trim().to_string();
-                    let val = decl[colon + 1..].trim().to_string();
-                    declarations.insert(name, (999999, 999999, val));
+                    let name = decl[..colon].trim();
+                    let val = decl[colon + 1..].trim();
+                    for (prop, pval) in expand_shorthand(name, val) {
+                        declarations.insert(prop, (999999, 999999, pval));
+                    }
                 }
             }
         }
@@ -822,7 +1023,14 @@ pub fn op_dom_get_all_computed_styles(
     let ctx = calc_context_from(state);
     let res: HashMap<String, String> = declarations
         .into_iter()
-        .map(|(k, v)| (k, resolve_computed_value(&v.2, &ctx)))
+        .map(|(k, v)| {
+            let resolved = resolve_computed_value(&v.2, &ctx);
+            // Then relative lengths: Chrome reports used pixels, not the authored
+            // `60vw`/`2rem`. Percentages stay as authored — resolving them needs the
+            // containing block, which is layout's job, not this op's.
+            let px = resolve_length_to_px(&resolved, &ctx).unwrap_or(resolved);
+            (k, px)
+        })
         .collect();
     res
 }
@@ -1451,6 +1659,11 @@ deno_core::extension!(
         op_dom_class_list_remove,
         op_dom_get_computed_style,
         op_dom_get_all_computed_styles,
+        op_dom_refresh_stylesheets,
+        op_iframe_post_to_child,
+        op_iframe_post_to_parent,
+        op_iframe_take_child_messages,
+        op_iframe_take_parent_messages,
         op_dom_get_stylesheet_count,
         op_dom_get_stylesheet_rules,
         op_dom_attach_shadow,

@@ -1,4 +1,4 @@
-use crate::css_cascade::ComputedStyle;
+use crate::css_cascade::{ComputedStyle, StyleRule};
 use crate::css_values::property::{CssValue, PropertyId};
 use crate::css_values::types::display::Display;
 use crate::dom::node::{NodeData, NodeId};
@@ -24,6 +24,10 @@ pub struct LayoutEngine {
     viewport: Viewport,
     dirty: bool,
     root_taffy: Option<taffy::NodeId>,
+    /// Author rules to cascade onto each element. Empty until the document's
+    /// stylesheets are parsed; without them every box falls back to UA defaults,
+    /// which is what made `getBoundingClientRect` report full-viewport widths.
+    rules: Vec<StyleRule>,
 }
 
 impl LayoutEngine {
@@ -34,7 +38,24 @@ impl LayoutEngine {
             viewport,
             dirty: true,
             root_taffy: None,
+            rules: Vec::new(),
         }
+    }
+
+    /// Point layout at the viewport the page believes it has. Without this the
+    /// engine laid out against a compiled-in 1920x1080 while `window.innerWidth`
+    /// reported the profile's size — so `vw`/`vh` and every percentage resolved
+    /// against a viewport the page never sees, and the two disagreed observably.
+    pub fn set_viewport(&mut self, viewport: Viewport) {
+        self.viewport = viewport;
+        self.dirty = true;
+    }
+
+    /// Install the document's author rules. Marks layout dirty: geometry computed
+    /// before the stylesheets arrived is wrong by definition.
+    pub fn set_style_rules(&mut self, rules: Vec<StyleRule>) {
+        self.rules = rules;
+        self.dirty = true;
     }
 
     /// Mark layout as dirty (needs recomputation).
@@ -215,13 +236,11 @@ impl LayoutEngine {
                 }
             }
             NodeData::Element(elem) => {
-                let computed = ComputedStyle::resolve(&HashMap::new(), None);
-                let inline_style = self.parse_inline_style(elem);
-                let computed = if !inline_style.is_empty() {
-                    ComputedStyle::resolve(&inline_style, None)
-                } else {
-                    computed
-                };
+                // Author rules first (specificity, then source order), inline last —
+                // inline always wins, matching the cascade.
+                let mut declarations = self.match_rules(dom, node_id);
+                declarations.extend(self.parse_inline_style(elem));
+                let computed = ComputedStyle::resolve(&declarations, None);
                 if let Some(CssValue::Display(Display::None)) = computed.get(&PropertyId::Display) {
                     return;
                 }
@@ -250,6 +269,65 @@ impl LayoutEngine {
             _ => return,
         };
         self.dom_to_taffy.insert(node_id.to_raw(), taffy_id);
+    }
+
+    /// Declarations from author rules that match `node_id`, resolved in cascade
+    /// order. Shorthands are expanded by `css_values::parse_property`, so a rule
+    /// like `margin: 15vh auto` lands as the four longhands layout actually reads.
+    fn match_rules(&self, dom: &Dom, node_id: NodeId) -> HashMap<PropertyId, CssValue> {
+        let mut out: HashMap<PropertyId, CssValue> = HashMap::new();
+        if self.rules.is_empty() {
+            return out;
+        }
+        let Some(element) = crate::dom::DomElement::new(dom, node_id) else {
+            return out;
+        };
+        // (specificity, source order) per property — later wins ties.
+        let mut winner: HashMap<PropertyId, (u32, usize)> = HashMap::new();
+        for (order, rule) in self.rules.iter().enumerate() {
+            let Some(spec) = rule
+                .selectors
+                .iter()
+                .filter(|sel| crate::css_selectors::matches_selector(&element, sel))
+                .map(|sel| {
+                    let s = crate::css_selectors::compute_specificity(sel);
+                    s.a * 10000 + s.b * 100 + s.c
+                })
+                .max()
+            else {
+                continue;
+            };
+            // Re-serialise and parse through the same path as inline styles so
+            // shorthands expand identically. `declarations` is a HashMap, so
+            // within-rule source order is already lost upstream — a rule mixing
+            // `margin` and `margin-top` can resolve either way.
+            let text: String = rule
+                .declarations
+                .iter()
+                .map(|(k, v)| format!("{k}:{v};"))
+                .collect();
+            let (decls, _) = crate::css_parser::parse_declaration_list(&text);
+            for decl in &decls {
+                let Ok(props) =
+                    crate::css_values::parse_property(decl.name, &decl.value, decl.important)
+                else {
+                    continue;
+                };
+                for prop in props {
+                    let beats = match winner.get(&prop.property) {
+                        Some(&(w_spec, w_order)) => {
+                            spec > w_spec || (spec == w_spec && order >= w_order)
+                        }
+                        None => true,
+                    };
+                    if beats {
+                        winner.insert(prop.property.clone(), (spec, order));
+                        out.insert(prop.property, prop.value);
+                    }
+                }
+            }
+        }
+        out
     }
 
     fn parse_inline_style(

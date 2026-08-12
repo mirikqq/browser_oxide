@@ -448,6 +448,13 @@ pub struct Page {
     children: Vec<iframe::ChildIframe>,
     event_loop: BrowserEventLoop,
     url: String,
+    /// Session client kept for post-navigation work — chiefly
+    /// [`Self::materialize_new_iframes`]. `HttpClient` is `Clone` over `Arc`s, so
+    /// this shares the cookie jar and connection pool with the navigation that
+    /// created the page; a freshly built client would start with empty cookies and
+    /// fail any challenge that depends on the session.
+    /// `None` for pages built without a network context (`from_html`, srcdoc).
+    client: Option<crate::net::HttpClient>,
     /// Registered [`crate::ChallengeSolver`]s. `Page::navigate` registers
     /// an empty set (this repository ships no solver implementations — see
     /// `SCOPE.md`); embedders supply their own via
@@ -621,6 +628,8 @@ impl Page {
             event_loop,
             url: url.to_string(),
             children: Vec::new(),
+            // No network context on this path: nothing to materialize iframes with.
+            client: None,
             solvers: std::sync::Arc::from(Vec::<std::sync::Arc<dyn crate::ChallengeSolver>>::new()),
         })
     }
@@ -812,13 +821,18 @@ impl Page {
             .execute_script("globalThis._browser_oxide.__documentReadyState = 'interactive';")
             .ok();
 
-        event_loop
-            .execute_script("window.dispatchEvent(new Event('load'));")
-            .ok();
-
-        // After load, readyState = complete
+        // Spec order: the document is "complete" BEFORE the load event fires
+        // ("the end", step 7). Setting it afterwards also made it fragile — a heavy
+        // SPA's load handlers can outrun the V8 deadline, terminate_execution kills
+        // the isolate, and the follow-up assignment silently fails (`.ok()`), leaving
+        // readyState stuck at 'interactive' forever. The nav loop then believes the
+        // page never finished and burns its whole budget on a page that is done.
         event_loop
             .execute_script("globalThis._browser_oxide.__documentReadyState = 'complete';")
+            .ok();
+
+        event_loop
+            .execute_script("window.dispatchEvent(new Event('load'));")
             .ok();
 
         // Run event loop until idle, capped at 8s. Real Chrome treats a page
@@ -880,6 +894,7 @@ impl Page {
             event_loop,
             url: url.to_string(),
             children,
+            client: Some(client.clone()),
             solvers: std::sync::Arc::from(Vec::<std::sync::Arc<dyn crate::ChallengeSolver>>::new()),
         })
     }
@@ -892,6 +907,121 @@ impl Page {
     /// Get the number of child iframes.
     pub fn child_iframe_count(&self) -> usize {
         self.children.len()
+    }
+
+    /// Carry queued `postMessage` payloads across realm boundaries, once in each
+    /// direction. Returns `(delivered to children, delivered to parent)`.
+    ///
+    /// Each iframe is its own V8 isolate, so a `postMessage` cannot cross in JS.
+    /// The JS side parks payloads in `DomState`; this moves them. Drivers should
+    /// call it between event-loop turns — a widget handshake needs several
+    /// round trips, so one pump is rarely enough.
+    pub fn pump_iframe_messages(&mut self) -> (usize, usize) {
+        // Parent → children.
+        let outbound: Vec<String> = self
+            .event_loop
+            .execute_script("JSON.stringify(globalThis.__bo_frames.takeChildMessages())")
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let mut to_children = 0usize;
+        for pair in outbound.chunks(2) {
+            let (Some(id), Some(json)) = (pair.first(), pair.get(1)) else {
+                continue;
+            };
+            let Ok(node_id) = id.parse::<u32>() else {
+                continue;
+            };
+            let Some(child) = self
+                .children
+                .iter_mut()
+                .find(|c| c.node_id.to_raw() == node_id)
+            else {
+                continue;
+            };
+            // Deliver as a real MessageEvent so listeners registered the normal way
+            // (addEventListener('message') / onmessage) see it.
+            let js = format!(
+                "(function(){{var m={json};\
+                 var ev=new MessageEvent('message',{{data:m.data,origin:m.origin,source:null}});\
+                 globalThis.dispatchEvent(ev);\
+                 if(typeof globalThis.onmessage==='function')globalThis.onmessage(ev);}})()"
+            );
+            if child.event_loop.execute_script(&js).is_ok() {
+                to_children += 1;
+            }
+        }
+
+        // Children → parent.
+        let mut to_parent = 0usize;
+        let mut inbound: Vec<String> = Vec::new();
+        for child in self.children.iter_mut() {
+            if let Ok(raw) = child
+                .event_loop
+                .execute_script("JSON.stringify(globalThis.__bo_frames.takeParentMessages())")
+            {
+                if let Ok(list) = serde_json::from_str::<Vec<String>>(&raw) {
+                    inbound.extend(list);
+                }
+            }
+        }
+        for json in inbound {
+            let js = format!(
+                "(function(){{var m={json};\
+                 var ev=new MessageEvent('message',{{data:m.data,origin:m.origin,source:null}});\
+                 globalThis.dispatchEvent(ev);\
+                 if(typeof globalThis.onmessage==='function')globalThis.onmessage(ev);}})()"
+            );
+            if self.event_loop.execute_script(&js).is_ok() {
+                to_parent += 1;
+            }
+        }
+        (to_children, to_parent)
+    }
+
+    /// Run each child iframe's event loop for up to `slice`.
+    ///
+    /// A child is built by running its scripts once and then draining to idle, and
+    /// after that nothing drives it — [`Self::pump_iframe_messages`] only injects
+    /// message deliveries. Any work a frame starts *in response* to its embedder
+    /// therefore never completes: hCaptcha's frame answers the parent handshake and
+    /// then fetches its proof-of-work worker on a timer, which never fires. A driver
+    /// that keeps a page alive across interactions has to keep its frames alive too.
+    ///
+    /// Returns the number of children driven.
+    pub async fn drive_children(&mut self, slice: Duration) -> usize {
+        let mut n = 0;
+        for child in self.children.iter_mut() {
+            if child.event_loop.run_until_idle(slice).await.is_ok() {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Materialize iframes that appeared since the last check, using the page's own
+    /// session client.
+    ///
+    /// [`Self::rematerialize_iframes`] is only reached from the navigation-time
+    /// challenge poll, which is gated on the document *starting* as a challenge.
+    /// Interaction-driven challenges never qualify: on Epic's login the page is an
+    /// ordinary SPA and Talon only injects its modal — and the hCaptcha iframe it
+    /// waits on — after a click, long after navigation returned. A driver that
+    /// clicks and types therefore has to ask for this itself.
+    ///
+    /// Returns the number of iframes newly materialized, or `None` when the page has
+    /// no network context (built via `from_html`).
+    pub async fn materialize_new_iframes(&mut self) -> Option<usize> {
+        let client = self.client.clone()?;
+        let url = self.url.clone();
+        let profile = {
+            let op_state = self.event_loop.runtime_mut().op_state();
+            let state = op_state.borrow();
+            state
+                .try_borrow::<crate::js_runtime::extensions::stealth_ext::StealthState>()
+                .and_then(|s| s.profile.clone())
+        }?;
+        Some(self.rematerialize_iframes(&url, &client, &profile).await)
     }
 
     /// FP-E1: post-JS DOM rescan — materialize **script-injected**
@@ -1157,6 +1287,43 @@ impl Page {
         let client = crate::net::HttpClient::shared(&profile)
             .map_err(|e| deno_core::error::AnyError::msg(e.to_string()))?;
         Self::build_page_with_scripts_and_init(html, url, &profile, &client, &[]).await
+    }
+
+    /// Drain buffered console output from this page **and every child frame**, as
+    /// `(level, text)` pairs where level is `log` / `warn` / `error` / `info`.
+    ///
+    /// Frames are included because a third-party widget reports its failures in its
+    /// own realm: an embedder-only drain shows a silent page while the frame is
+    /// throwing on every tick.
+    pub fn take_console(&mut self) -> Vec<(&'static str, String)> {
+        fn drain(loop_: &mut crate::event_loop::BrowserEventLoop) -> Vec<(&'static str, String)> {
+            let msgs = {
+                let runtime = loop_.runtime_mut().inner();
+                let state = runtime.op_state();
+                let mut state = state.borrow_mut();
+                let dom_state = state.borrow_mut::<crate::js_runtime::state::DomState>();
+                std::mem::take(&mut dom_state.console_output)
+            };
+            msgs.into_iter()
+                .map(|m| {
+                    let level = match m.level {
+                        crate::js_runtime::state::ConsoleLevel::Log => "log",
+                        crate::js_runtime::state::ConsoleLevel::Warn => "warn",
+                        crate::js_runtime::state::ConsoleLevel::Error => "error",
+                        _ => "info",
+                    };
+                    (level, m.args.join(" "))
+                })
+                .collect()
+        }
+
+        let mut out = drain(&mut self.event_loop);
+        for (i, child) in self.children.iter_mut().enumerate() {
+            for (level, text) in drain(&mut child.event_loop) {
+                out.push((level, format!("[фрейм {i}] {text}")));
+            }
+        }
+        out
     }
 
     pub fn consume_and_print_logs(&mut self) {
@@ -4046,11 +4213,20 @@ impl Page {
                 // spin/never mount. Fire readystatechange on each transition.
                 try { globalThis._browser_oxide.__documentReadyState = 'interactive'; } catch (_e) {}
                 document.dispatchEvent(new Event('readystatechange'));
-                document.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true}));
-                window.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true}));
+                // Each dispatch is isolated: one framework's throwing DOMContentLoaded
+                // handler must not skip the transition to 'complete' below.
+                try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true})); } catch (_e) {}
+                try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true})); } catch (_e) {}
+            }, 0);
+            // Separate macrotask on purpose. A heavy SPA's DOMContentLoaded handlers can
+            // outrun the V8 deadline; terminate_execution then unwinds the whole callback,
+            // so a 'complete' assignment sharing that task never runs and readyState stays
+            // 'interactive' forever — the nav loop reads that as "still loading" and burns
+            // its entire budget (~90s) on a page that has actually finished rendering.
+            setTimeout(() => {
                 try { globalThis._browser_oxide.__documentReadyState = 'complete'; } catch (_e) {}
-                document.dispatchEvent(new Event('readystatechange'));
-                window.dispatchEvent(new Event('load'));
+                try { document.dispatchEvent(new Event('readystatechange')); } catch (_e) {}
+                try { window.dispatchEvent(new Event('load')); } catch (_e) {}
             }, 0);
         "#,
             )
@@ -4233,6 +4409,7 @@ impl Page {
             event_loop,
             url: url.to_string(),
             children,
+            client: Some(client.clone()),
             solvers: std::sync::Arc::from(Vec::<std::sync::Arc<dyn crate::ChallengeSolver>>::new()),
         })
     }
