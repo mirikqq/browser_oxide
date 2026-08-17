@@ -35,6 +35,40 @@
     const self = globalThis;
     self.self = self;
 
+    // ...and the interfaces have to exist, because that is how a script decides
+    // it is in a worker at all. The canonical test is
+    // `!self.document && self.WorkerGlobalScope`, and with the second half
+    // missing a library takes its *window* path inside the worker: it finds
+    // nothing it expects, throws nothing anyone sees, and posts nothing back.
+    // Measured on creepjs, whose worker collector produced no data at all and
+    // left four of its own probes reading properties of `undefined`.
+    //
+    // Chained onto the current global prototype rather than replacing it, so
+    // everything already installed there stays reachable.
+    try {
+        if (!self.WorkerGlobalScope) {
+            const _globalProto = Object.getPrototypeOf(self);
+            class WorkerGlobalScope {}
+            Object.setPrototypeOf(WorkerGlobalScope.prototype, _globalProto);
+            class DedicatedWorkerGlobalScope extends WorkerGlobalScope {}
+            for (const [ctor, name] of [
+                [WorkerGlobalScope, "WorkerGlobalScope"],
+                [DedicatedWorkerGlobalScope, "DedicatedWorkerGlobalScope"],
+            ]) {
+                Object.defineProperty(ctor.prototype, Symbol.toStringTag, {
+                    value: name, configurable: true,
+                });
+                Object.defineProperty(self, name, {
+                    value: ctor, writable: true, enumerable: false, configurable: true,
+                });
+                if (typeof globalThis._maskFunction === "function") {
+                    globalThis._maskFunction(ctor, name);
+                }
+            }
+            Object.setPrototypeOf(self, DedicatedWorkerGlobalScope.prototype);
+        }
+    } catch (_) { /* ignore */ }
+
     // --- WorkerLocation ---
     // Real Chrome workers expose `self.location` as a WorkerLocation
     // object reporting the script's URL. Some workers read

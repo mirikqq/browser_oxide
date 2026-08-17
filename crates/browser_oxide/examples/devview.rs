@@ -18,6 +18,17 @@ use tokio::sync::{broadcast, mpsc};
 
 const PAGE: &str = include_str!("devview.html");
 
+/// Frame documents already sent, keyed by node id — `push_snapshot` sends a
+/// frame's markup only when it differs from the record here, because a captcha
+/// frame's document is ~600 KB and the loop ticks five times a second.
+///
+/// Cleared on a view's `resync`, which is the only reliable signal that somebody
+/// is holding nothing.
+static LAST_FRAME_DOCS: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
+
+/// Resolves the engine's symbol-keyed internal namespace (see `page.rs`).
+const NS_RESOLVE: &str = "(function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()";
+
 /// Properties compared engine-vs-Chrome. Both sides iterate the same list.
 const INSPECT_PROPS: &str = "['display','position','width','height','fontSize','fontFamily',\
 'color','backgroundColor','marginTop','marginLeft','paddingTop','paddingLeft',\
@@ -49,6 +60,25 @@ const SNAPSHOT_JS: &str = r#"
     }
     return parts.join(' > ');
   }
+  // Tag every frame before serialising: the mirror runs without allow-scripts,
+  // so a real <iframe> there would either stay blank or — worse — re-run the
+  // third party in the viewer's own browser. Tagging lets the view swap each one
+  // for a box holding the document *this engine* built for it.
+  var frames = [].map.call(document.querySelectorAll('iframe'), function (f, i) {
+    try { f.setAttribute('data-bo-frame', String(i)); } catch (_) {}
+    var r = f.getBoundingClientRect(), c = getComputedStyle(f);
+    // A hidden frame still holds a full document — hCaptcha keeps the challenge
+    // built and merely hides it. Reporting visibility lets the view leave it out
+    // instead of spilling "Please try again / Verify" across the page.
+    var shown = c.display !== 'none' && c.visibility !== 'hidden' &&
+                Number(c.opacity) > 0 && r.width > 24 && r.height > 24;
+    return {
+      idx: i,
+      src: String(f.getAttribute('src') || (f.hasAttribute('srcdoc') ? 'srcdoc' : 'about:blank')),
+      shown: shown,
+      box: [Math.round(r.width), Math.round(r.height)]
+    };
+  });
   var acts = [].map.call(
     document.querySelectorAll('input,button,a[href],select,textarea,[role=button],[role=link]'),
     function (el) {
@@ -63,7 +93,8 @@ const SNAPSHOT_JS: &str = r#"
         box: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)]
       };
     });
-  var bo = globalThis.__bo_input_events || null;
+  var _ns = (function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})();
+  var bo = (_ns && _ns.input) || null;
   var cursor = [];
   if (bo && bo.mouse && bo.mouse.length) { cursor = bo.mouse.splice(0, bo.mouse.length); }
   var challenges = [].map.call(
@@ -81,6 +112,7 @@ const SNAPSHOT_JS: &str = r#"
     title: document.title,
     html: document.documentElement.outerHTML,
     actionables: acts,
+    frames: frames,
     cursor: cursor,
     lastPos: (bo && bo._lastPos) || null,
     challenges: challenges,
@@ -101,6 +133,13 @@ async fn main() {
     let ws_port = port + 1;
 
     browser_oxide::net::netlog::enable();
+    // Opt-in: an attached V8 inspector changes how `debugger` behaves, and pages
+    // that probe for developer tools by timing a `debugger` statement then take a
+    // branch no ordinary visitor takes. Off unless asked for.
+    if std::env::var_os("DEVVIEW_INSPECT").is_some() {
+        // Must precede page construction: the inspector is decided with the isolate.
+        browser_oxide::js_runtime::inspect::enable();
+    }
 
     let inspect: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     // Events fan out to every connected view; commands funnel back to the engine.
@@ -111,15 +150,19 @@ async fn main() {
     serve_ws(ws_port, events_tx.clone(), cmd_tx).await;
 
     let open_url = format!("http://127.0.0.1:{port}/");
-    println!("devview: {open_url}  (события: ws://127.0.0.1:{ws_port})");
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else if cfg!(target_os = "windows") {
-        "explorer"
-    } else {
-        "xdg-open"
-    };
-    let _ = std::process::Command::new(opener).arg(&open_url).spawn();
+    println!("devview: {open_url}  (события: ws://127.0.0.1:{ws_port})  — вкладка откроется только с DEVVIEW_OPEN=1");
+    // Opt-in: stealing focus with a new tab on every run is hostile when the
+    // engine is being driven from a script while someone works in the same browser.
+    if std::env::var_os("DEVVIEW_OPEN").is_some() {
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else if cfg!(target_os = "windows") {
+            "explorer"
+        } else {
+            "xdg-open"
+        };
+        let _ = std::process::Command::new(opener).arg(&open_url).spawn();
+    }
 
     let emit = {
         let tx = events_tx.clone();
@@ -140,7 +183,10 @@ async fn main() {
             if let Ok(seed) = pool.acquire(Some(profile.clone())).await {
                 pool.release(seed);
             }
-            let mut page = match pool.navigate(&url, profile).await {
+            // `INIT=<js>` runs before the page's own scripts — the only place from
+            // which anything can be observed before the page touches it.
+            let init: Vec<String> = std::env::var("INIT").ok().into_iter().collect();
+            let mut page = match pool.navigate_with_init(&url, profile, &init).await {
                 Ok(p) => p,
                 Err(e) => {
                     emit("status", format!("\"text\":\"ошибка навигации: {e}\""));
@@ -176,9 +222,118 @@ async fn main() {
                 // ~10 s to land and felt like the trigger had been ignored.
                 while let Ok(raw) = cmd_rx.try_recv() {
                     let t0 = std::time::Instant::now();
+                    // A view that just opened holds no frame documents, and the
+                    // change-gate in `push_snapshot` would answer "unchanged" to it
+                    // for as long as the markup inside a frame holds still. The view
+                    // asks for the record to be dropped rather than the loop guessing
+                    // from the subscriber count: a reload disconnects and reconnects
+                    // between two ticks, so the count never looks any different.
+                    if raw.contains("\"resync\"") {
+                        LAST_FRAME_DOCS.lock().unwrap().clear();
+                        continue;
+                    }
                     // `frame` evaluates inside a child realm instead of the page —
                     // the only way to see why a third-party widget's own document
                     // (hCaptcha's, here) does or does not finish booting.
+                    // Which child realm belongs to which <iframe> element. Message
+                    // routing keys on node ids, so a frame missing from this list
+                    // is a frame the page can post to and never reach.
+                    // What V8 actually compiled, plus whether anything is still
+                    // pending. The DOM and the network log both answer "fine" for
+                    // a script that failed to compile or never ran.
+                    if raw.contains("\"scripts\"") {
+                        let (ops, timers, intervals, res) = page.pending_work();
+                        let out = match page.inspect_snapshot() {
+                            Some(log) => {
+                                let mut lines = vec![log.summary()];
+                                lines.push(format!(
+                                    "не завершено: ops {ops}, таймеров {timers}, интервалов {intervals}, ресурсов {res}"
+                                ));
+                                for f in log.failures.iter() {
+                                    lines.push(format!(
+                                        "НЕ СКОМПИЛИРОВАЛСЯ: {} ({} байт)",
+                                        if f.url.is_empty() { "<инлайн>" } else { &f.url },
+                                        f.length
+                                    ));
+                                }
+                                for e in log.exceptions.iter() {
+                                    lines.push(format!("ИСКЛЮЧЕНИЕ: {} @ {}:{}", e.text, e.url, e.line));
+                                }
+                                for c in log.contexts.iter() {
+                                    lines.push(format!(
+                                        "реалм {} {} {}",
+                                        c.id,
+                                        if c.origin.is_empty() { "-" } else { &c.origin },
+                                        if c.destroyed { "(уничтожен)" } else { "" }
+                                    ));
+                                }
+                                for sc in log.scripts.iter() {
+                                    lines.push(format!(
+                                        "  [{}] {} {} байт{}",
+                                        sc.context_id,
+                                        if sc.url.is_empty() { "<eval/Function>" } else { &sc.url },
+                                        sc.length,
+                                        if sc.is_module { " (модуль)" } else { "" }
+                                    ));
+                                }
+                                lines.join("\n")
+                            }
+                            None => "инспектор выключен".to_string(),
+                        };
+                        emit(
+                            "action",
+                            format!("\"raw\":{},\"state\":{}", json_str(&raw), json_str(&out)),
+                        );
+                        continue;
+                    }
+                    // A click the viewer aimed at a frame has to be replayed in
+                    // that frame's own realm. Its DOM is a separate document, so a
+                    // selector resolved against the top one would find nothing.
+                    if raw.contains("\"frameclick\"") {
+                        let idx: usize = field(&raw, "index").parse().unwrap_or(0);
+                        let sel = field(&raw, "sel").replace('`', "\\`");
+                        let js = format!(
+                            "(function(){{var e=document.querySelector(`{sel}`);\
+                             if(!e)return 'нет элемента';\
+                             var r=e.getBoundingClientRect();\
+                             var b={{bubbles:true,cancelable:true,view:window,\
+                                    clientX:Math.round(r.left+r.width/2),\
+                                    clientY:Math.round(r.top+r.height/2)}};\
+                             try{{e.focus&&e.focus();}}catch(_){{}}\
+                             ['pointerdown','mousedown','pointerup','mouseup','click']\
+                               .forEach(function(t){{\
+                                 var C=(t.indexOf('pointer')===0&&typeof PointerEvent!=='undefined')\
+                                       ?PointerEvent:MouseEvent;\
+                                 try{{e.dispatchEvent(new C(t,b));}}catch(_){{}}\
+                               }});\
+                             return 'клик во фрейме по '+(e.id||e.tagName);}})()"
+                        );
+                        let out = match page.child_iframe(idx) {
+                            Some(c) => c.evaluate(&js).unwrap_or_else(|e| format!("ошибка: {e}")),
+                            None => format!("нет фрейма {idx}"),
+                        };
+                        emit(
+                            "action",
+                            format!("\"raw\":{},\"state\":{}", json_str(&raw), json_str(&out)),
+                        );
+                        continue;
+                    }
+                    if raw.contains("\"frames\"") {
+                        // Materialize first: the listing is only meaningful next to
+                        // the DOM as it stands right now.
+                        page.materialize_new_iframes().await;
+                        let ids = page.child_frame_ids();
+                        let out = ids
+                            .iter()
+                            .map(|(id, url)| format!("node {id} → {url}"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        emit(
+                            "action",
+                            format!("\"raw\":{},\"state\":{}", json_str(&raw), json_str(&out)),
+                        );
+                        continue;
+                    }
                     if raw.contains("\"frame\"") {
                         let idx: usize = field(&raw, "index").parse().unwrap_or(0);
                         let js = field(&raw, "text");
@@ -212,7 +367,7 @@ async fn main() {
                                 .evaluate_async("void 0", std::time::Duration::from_millis(100))
                                 .await;
                             push_snapshot(&mut page, &events_tx, &inspect);
-                            let r = page.evaluate("globalThis.__boResult").unwrap_or_default();
+                            let r = page.evaluate(&format!("({NS_RESOLVE}||{{}}).devviewResult")).unwrap_or_default();
                             if r != "выполняется…" {
                                 emit(
                                     "action",
@@ -239,10 +394,30 @@ async fn main() {
                     }
                 }
 
+                // A rendering-opportunity cadence, and the only point that yields.
+                //
+                // `run_until_idle` returns the moment the runtime reports no work,
+                // and background timers deliberately do not pin it — so a driver
+                // that just calls it in a loop spins a whole core. On a
+                // single-threaded runtime that starves every other task: the
+                // socket stops being served, and the timers the page is waiting on
+                // never get their chance to fire. Measured on a page with 15
+                // pending background timers, this loop was at 100% CPU with zero
+                // forward progress.
+                tokio::time::sleep(std::time::Duration::from_millis(16)).await;
+
                 // Short slice keeps the cursor overlay smooth and actions responsive.
                 let _ = page
                     .evaluate_async("void 0", std::time::Duration::from_millis(120))
                     .await;
+                // Frames appear on their own — a widget injects one seconds after
+                // load with no command from us — so materialise on every tick, not
+                // only after a driver action. Already-built frames are skipped.
+                if let Some(n) = page.materialize_new_iframes().await {
+                    if n > 0 {
+                        emit("log", format!("\"text\":\"материализовано iframe: {n}\""));
+                    }
+                }
                 page.drive_children(std::time::Duration::from_millis(60))
                     .await;
                 let (down, up) = page.pump_iframe_messages();
@@ -272,15 +447,48 @@ fn push_snapshot(
     if let Ok(json) = page.evaluate(SNAPSHOT_JS) {
         let ins = inspect.lock().unwrap().clone();
         let ins = if ins.is_empty() { "null".into() } else { ins };
+        // Each child realm's own document, so the mirror can show what the engine
+        // built inside a frame instead of an empty rectangle.
+        //
+        // Only when it changed: a captcha frame's document is ~600 KB and the loop
+        // ticks five times a second, which is megabytes per second of unchanged
+        // markup. `null` means "keep what you have".
+        let frame_docs: Vec<String> = {
+            let slots = page.child_frame_dom_slots();
+            let width = slots
+                .iter()
+                .filter_map(|(_, at)| *at)
+                .max()
+                .map_or(0, |m| m + 1);
+            let mut out = vec!["null".to_string(); width];
+            let mut last = LAST_FRAME_DOCS.lock().unwrap();
+            for (realm, (node_id, at)) in slots.iter().enumerate() {
+                let Some(at) = *at else { continue };
+                let html = page
+                    .child_iframe(realm)
+                    .and_then(|c| c.evaluate("document.documentElement.outerHTML").ok())
+                    .unwrap_or_default();
+                match last.iter_mut().find(|(id, _)| id == node_id) {
+                    Some((_, prev)) if *prev == html => continue,
+                    Some((_, prev)) => *prev = html.clone(),
+                    None => last.push((*node_id, html.clone())),
+                }
+                out[at] = json_str(&html);
+            }
+            out
+        };
+
         let console: Vec<String> = page
             .take_console()
             .iter()
             .map(|(level, text)| format!("{{\"level\":\"{level}\",\"text\":{}}}", json_str(text)))
             .collect();
         let _ = events.send(format!(
-            "{{\"kind\":\"snapshot\",\"inspect\":{ins},\"net\":{},\"console\":[{}],\"data\":{json}}}",
+            "{{\"kind\":\"snapshot\",\"inspect\":{ins},\"net\":{},\"console\":[{}],\
+             \"frameDocs\":[{}],\"data\":{json}}}",
             drain_netlog(),
-            console.join(",")
+            console.join(","),
+            frame_docs.join(",")
         ));
     }
 }
@@ -334,14 +542,17 @@ fn json_str(s: &str) -> String {
 /// Park the settled value of an async action so the loop can poll for it: humanized
 /// input returns a Promise and `evaluate` would only ever see "[object Promise]".
 fn wrap_action(inner: &str) -> String {
+    // Parked on the engine's internal namespace rather than a global slot: a
+    // symbol on `window` is visible to `Object.getOwnPropertySymbols`, and this
+    // tool has no business adding one to a page it is meant to observe.
     format!(
-        "(function(){{globalThis.__boResult='выполняется…';\
+        "(function(){{var ns={NS_RESOLVE}||{{}};ns.devviewResult='выполняется…';\
          var r=({inner});\
          if(r&&typeof r.then==='function'){{\
-           r.then(function(v){{globalThis.__boResult=String(v);}},\
-                  function(e){{globalThis.__boResult='ошибка: '+e.message;}});\
+           r.then(function(v){{ns.devviewResult=String(v);}},\
+                  function(e){{ns.devviewResult='ошибка: '+e.message;}});\
            return 'запущено';}}\
-         globalThis.__boResult=String(r);return String(r);}})()"
+         ns.devviewResult=String(r);return String(r);}})()"
     )
 }
 
@@ -419,13 +630,13 @@ fn action_to_js(raw: &str) -> String {
         // what vendor sensors read.
         "click" => format!(
             "(function(){{var e=document.querySelector(`{sel}`);if(!e)return 'нет элемента';\
-             var h=globalThis.__bo_input_events;\
+             var h=({NS_RESOLVE}||{{}}).input;\
              if(h&&typeof h.clickElement==='function')return h.clickElement(e);\
              e.click();return 'клик (isTrusted=false — humanize не загружен)';}})()"
         ),
         "fill" => format!(
             "(function(){{var e=document.querySelector(`{sel}`);if(!e)return 'нет элемента';\
-             var h=globalThis.__bo_input_events;\
+             var h=({NS_RESOLVE}||{{}}).input;\
              if(h&&typeof h.typeElement==='function')return h.typeElement(e,`{text}`);\
              var p=Object.getOwnPropertyDescriptor(e.constructor.prototype,'value');\
              if(p&&p.set){{p.set.call(e,`{text}`);}}else{{e.value=`{text}`;}}\

@@ -65,7 +65,7 @@
     // and survives cleanup_bootstrap's `internals` string purge. Without
     // a backing op (e.g. test paths that don't run a full runtime) we
     // fall back to the V8 default so the page still renders.
-    const _rand = globalThis[Symbol.for('__browser_oxide_behavior_rand__')]
+    const _rand = ((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return {};})().rand)
         || Math.random;
 
     // Use the engine-internal background-timer helper so our synthetic
@@ -82,17 +82,20 @@
     // Each event we synthesise also gets recorded into a per-page
     // buffer that an embedder's sensor-payload assembler can consume.
     // The buffer lives on globalThis so the Rust HTTP client can drain it via
-    // `page.evaluate("globalThis.__bo_input_events")` before scheduling
+    // `page.evaluate("_boNs.input")` before scheduling
     // the sensor-payload POST.
-    if (!globalThis.__bo_input_events) {
-        Object.defineProperty(globalThis, '__bo_input_events', {
-            value: { mouse: [], key: [], touch: [], scroll: [], counters: { key: 0, mouse: 0, touch: 0, scroll: 0, accel: 0 } },
-            writable: true,
-            configurable: true,
-            enumerable: false,
-        });
+    // Internal namespace, keyed by a symbol so it stays out of
+    // `Object.getOwnPropertyNames(window)` — see dom_bootstrap.js.
+    const _boNs = (function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})() || {};
+    if (!_boNs.input) {
+        try {
+            Object.defineProperty(_boNs, 'input', {
+                value: { mouse: [], key: [], touch: [], scroll: [], _lastPos: null, counters: { key: 0, mouse: 0, touch: 0, scroll: 0, accel: 0 } },
+                writable: true, configurable: true, enumerable: false,
+            });
+        } catch (_) { _boNs.input = { mouse: [], key: [], touch: [], scroll: [], _lastPos: null, counters: { key: 0, mouse: 0, touch: 0, scroll: 0, accel: 0 } }; }
     }
-    const _akEvents = globalThis.__bo_input_events;
+    const _akEvents = _boNs.input;
     const _akT0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
     function _akT() {
         const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
@@ -130,7 +133,7 @@
     // schedule. Populates _akRecKey for
     // the sensor-payload behavioral tap. Single-shot per element
     // (avoid flooding pages that re-focus a field many times).
-    const _ksFn = globalThis[Symbol.for('__browser_oxide_keystroke_schedule__')];
+    const _ksFn = ((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return {};})().keystrokes);
     if (typeof _ksFn === 'function') {
         const _typedSym = Symbol.for('__browser_oxide_humanize_typed__');
         document.addEventListener('focusin', function (e) {
@@ -327,10 +330,10 @@
         const _ops = (typeof Deno !== 'undefined' && Deno.core && Deno.core.ops) || null;
         // Persistent cursor position across cycles (seeded by the historical
         // path at __bo_input_events._lastPos; falls back to viewport centre).
-        let _from = (globalThis.__bo_input_events
-            && Array.isArray(globalThis.__bo_input_events._lastPos)
-            && globalThis.__bo_input_events._lastPos.length === 2)
-            ? globalThis.__bo_input_events._lastPos.slice()
+        let _from = (_boNs.input
+            && Array.isArray(_boNs.input._lastPos)
+            && _boNs.input._lastPos.length === 2)
+            ? _boNs.input._lastPos.slice()
             : [_vw * 0.5, _vh * 0.45];
         // Ambient motion aims at real interactive elements, not random coordinates.
         // Wandering to arbitrary viewport points is not what a person does — they move
@@ -390,7 +393,7 @@
             _from = [toX, toY];
         }
         // Persist final cursor position for the next cycle's starting point.
-        if (globalThis.__bo_input_events) globalThis.__bo_input_events._lastPos = _from.slice();
+        if (_boNs.input) _boNs.input._lastPos = _from.slice();
 
         // 3) Scroll-down
         const scStartT = mouseT + 100;
@@ -513,7 +516,7 @@
         // Capture the final position so runCycle's deltas pick up
         // from where this seeding left off.
         try {
-            globalThis.__bo_input_events._lastPos = [lastX, lastY];
+            _boNs.input._lastPos = [lastX, lastY];
         } catch (_) {}
     })();
 
@@ -560,9 +563,9 @@
 
     /// Travel the cursor to (x, y), dispatching moves on the real clock.
     async function _travelTo(x, y, targetW) {
-        let from = (globalThis.__bo_input_events
-            && Array.isArray(globalThis.__bo_input_events._lastPos))
-            ? globalThis.__bo_input_events._lastPos.slice()
+        let from = (_boNs.input
+            && Array.isArray(_boNs.input._lastPos))
+            ? _boNs.input._lastPos.slice()
             : [(window.innerWidth || 1280) * 0.5, (window.innerHeight || 800) * 0.45];
         const traj = _trajectory(from[0], from[1], x, y, targetW);
         let prev = from.slice();
@@ -574,15 +577,20 @@
             try { _akRecMouse(Math.round(p.x), Math.round(p.y), 'move', 0); } catch (_) {}
             prev = [p.x, p.y];
         }
-        try { globalThis.__bo_input_events._lastPos = [x, y]; } catch (_) {}
+        try { _boNs.input._lastPos = [x, y]; } catch (_) {}
     }
 
+    /// Returns false when a listener cancelled the event, mirroring
+    /// `dispatchEvent` — the caller needs that to decide whether the default
+    /// action still runs.
     function _fireAt(el, Ctor, type, opts) {
         try {
             const ev = new Ctor(type, opts);
             if (_markTrusted) _markTrusted(ev);
-            el.dispatchEvent(ev);
-        } catch (_) {}
+            return el.dispatchEvent(ev);
+        } catch (_) {
+            return true;
+        }
     }
 
     async function _humanClick(el) {
@@ -639,8 +647,14 @@
 
         if (PE) _fireAt(el, PE, 'pointerup', { ...base, buttons: 0, ...pointer, pressure: 0 });
         _fireAt(el, MouseEvent, 'mouseup', { ...base, buttons: 0 });
-        _fireAt(el, MouseEvent, 'click', { ...base, buttons: 0 });
+        const notCancelled = _fireAt(el, MouseEvent, 'click', { ...base, cancelable: true, buttons: 0 });
         try { _akRecMouse(cx, cy, 'click', 0); } catch (_) {}
+        // The click event alone is not a click: a real browser then runs the
+        // target's activation behaviour, which is what submits a form. This path
+        // never reaches `HTMLElement.prototype.click()`, so it has to ask.
+        if (notCancelled && typeof _boNs.activate === 'function') {
+            try { _boNs.activate(el); } catch (_) { /* ignore */ }
+        }
         return 'клик ок (isTrusted, с траекторией)';
     }
 

@@ -10,7 +10,39 @@
     // returns the raw JS source of polyfilled functions. We patch
     // Function.prototype.toString itself to consult a private Symbol tag
     // we set on masked functions.
+    // The engine's internal namespace: one anonymous symbol on the global, shared
+    // by every bootstrap. Get-or-create, because the bootstraps run in a fixed
+    // order and more than one of them needs it before `dom_bootstrap` does.
+    //
+    // Everything the engine keeps here used to be its own `Symbol.for(...)` slot
+    // on `globalThis`. Chrome's window has no own symbols at all, so each one was
+    // a visible difference — and three of them spelled the engine's name.
+    const _boNsFind = () => {
+        try {
+            const syms = Object.getOwnPropertySymbols(globalThis);
+            for (let i = 0; i < syms.length; i++) {
+                const v = globalThis[syms[i]];
+                if (v && v.__bo) return v;
+            }
+        } catch (_e) { /* ignore */ }
+        return null;
+    };
+    const _boNsMake = () => {
+        const found = _boNsFind();
+        if (found) return found;
+        const ns = { __bo: true };
+        try {
+            Object.defineProperty(globalThis, Symbol(""), {
+                value: ns, writable: false, configurable: true, enumerable: false,
+            });
+        } catch (_e) { /* ignore */ }
+        return ns;
+    };
+
+    const _boNs = _boNsMake();
     const _nativeTag = Symbol.for('__browser_oxide_native__');
+    // Masked function → the name its `toString` should report.
+    const _nativeNames = new WeakMap();
     const _origFnToStr = Function.prototype.toString;
 
     // Re-entrant guard: prevents infinite recursion when this[_nativeTag] access
@@ -26,9 +58,19 @@
         if (_inPatchedToStr) return _origFnToStr.call(this);
         _inPatchedToStr = true;
         try {
-            if (this !== null && this !== undefined) {
+            // Callable receiver, own tag. Both guards matter:
+            //
+            //  · `Object.create(maskedFn)` is a plain object that *inherits* the
+            //    tag through its prototype chain. Answering it produced a native
+            //    string where Chrome throws "Function.prototype.toString requires
+            //    that 'this' be a Function" — which is exactly the probe
+            //    fingerprinters use to find a patched `toString`, and it marked
+            //    every masked accessor as a lie.
+            //  · an *inherited* tag would likewise claim page code is native
+            //    merely because its prototype is one of ours.
+            if (typeof this === "function") {
                 try {
-                    const tag = this[_nativeTag];
+                    const tag = _nativeNames.get(this);
                     if (tag) return `function ${tag}() { [native code] }`;
                 } catch (_) {}
             }
@@ -38,7 +80,8 @@
         }
     } }).toString;
     // Tag the patched toString itself so recursive calls also appear native
-    Object.defineProperty(_patchedFnToStr, _nativeTag, { value: 'toString', configurable: true });
+    _nativeNames.set(_patchedFnToStr, 'toString');
+    try { ops.op_stealth_mark_native(_patchedFnToStr, 'toString'); } catch (_) {}
     Object.defineProperty(_patchedFnToStr, 'name', { value: 'toString', configurable: true });
 
     Object.defineProperty(Function.prototype, 'toString', {
@@ -53,12 +96,19 @@
         try {
             // Native fns have an own configurable `name` (Chrome-correct).
             Object.defineProperty(fn, 'name', { value: name, configurable: true });
-            // Symbol tag — read by the patched Function.prototype.toString
-            // above. `Symbol.for` (global registry) is DELIBERATE: an
-            // iframe realm's patched toString must resolve the tag on
-            // PARENT-realm functions (cross-realm robustness — see iframe
-            // contentWindow self-loop commits).
-            Object.defineProperty(fn, _nativeTag, { value: name, configurable: true });
+            // The tag lives OFF the function: in a WeakMap for the JS
+            // fallback below, and in a v8 private symbol for the genuine
+            // `Function.prototype.toString` in `native_fns.rs`.
+            //
+            // It used to be an own symbol property, which meant
+            // `Object.getOwnPropertySymbols(fetch)` returned
+            // `Symbol(__browser_oxide_native__)` — this engine's name, on every
+            // masked function, readable by any script. It also broke the shape
+            // fingerprinters check against natives:
+            // `Reflect.ownKeys(fn).sort().toString()` must be exactly
+            // "length,name", and an extra symbol makes that call throw.
+            _nativeNames.set(fn, name);
+            try { ops.op_stealth_mark_native(fn, name); } catch (_) {}
             // NO own `toString`: it was a self-inflicted leak — an
             // earlier version gave every masked fn an own `toString`, so
             // `getOwnPropertyNames(fn)` included "toString" (Chrome:
@@ -110,7 +160,7 @@
     // Expose seeded random under a Symbol-keyed
     // slot that survives cleanup_bootstrap's string-keyed `internals`
     // purge. humanize.js (injected per-navigation, AFTER cleanup) reads
-    // this via `globalThis[Symbol.for('__browser_oxide_behavior_rand__')]`
+    // this via `globalThis[Symbol.for('#r')]`
     // and uses it instead of Math.random(), so synthetic mouse/scroll/
     // key event streams are deterministic per page lifetime (two-level
     // seed pattern). Falls back to undefined if the op is unavailable —
@@ -119,13 +169,9 @@
         const _randOp = Deno && Deno.core && Deno.core.ops
             && Deno.core.ops.op_behavior_random;
         if (typeof _randOp === 'function') {
-            const _sym = Symbol.for('__browser_oxide_behavior_rand__');
-            Object.defineProperty(globalThis, _sym, {
-                value: function () {
-                    try { return _randOp(); } catch (_e) { return Math.random(); }
-                },
-                writable: false, configurable: true, enumerable: false,
-            });
+            _boNs.rand = function () {
+                try { return _randOp(); } catch (_e) { return Math.random(); }
+            };
         }
     } catch (_e) {}
 
@@ -139,14 +185,10 @@
         const _ksOp = Deno && Deno.core && Deno.core.ops
             && Deno.core.ops.op_human_keystroke_schedule;
         if (typeof _ksOp === 'function') {
-            const _sym = Symbol.for('__browser_oxide_keystroke_schedule__');
-            Object.defineProperty(globalThis, _sym, {
-                value: function (text, wpm) {
-                    try { return _ksOp(text || '', (wpm | 0) || 0); }
-                    catch (_e) { return []; }
-                },
-                writable: false, configurable: true, enumerable: false,
-            });
+            _boNs.keystrokes = function (text, wpm) {
+                try { return _ksOp(text || '', (wpm | 0) || 0); }
+                catch (_e) { return []; }
+            };
         }
     } catch (_e) {}
 

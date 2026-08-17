@@ -196,13 +196,19 @@ pub fn op_dom_get_outer_html(state: &mut OpState, #[smi] node_id: i32) -> String
     state.dom.serialize_html(NodeId::from_raw(node_id as u32))
 }
 
+/// `None` (JS `null`) when the attribute is absent — the DOM spec's return
+/// value for `getAttribute`, and load-bearing: this used to answer `""` for
+/// every missing attribute, so a bot detector probing
+/// `documentElement.getAttribute("__webdriver_evaluate") !== null` — the
+/// standard Selenium sweep over ~30 marker names — scored a hit on all of
+/// them. An element carrying only `lang` reported every marker present.
 #[op2]
 #[string]
 pub fn op_dom_get_attribute(
     state: &mut OpState,
     #[smi] node_id: i32,
     #[string] name: &str,
-) -> String {
+) -> Option<String> {
     let state = state.borrow::<DomState>();
     let id = NodeId::from_raw(node_id as u32);
     state
@@ -215,7 +221,6 @@ pub fn op_dom_get_attribute(
                 .find(|a| a.name.local.eq_ignore_ascii_case(name))
                 .map(|a| a.value.clone())
         })
-        .unwrap_or_default()
 }
 
 #[op2(fast)]
@@ -515,11 +520,46 @@ pub fn op_dom_create_text_node(state: &mut OpState, #[string] text: &str) -> i32
     state.dom.create_text(text.to_string()).to_raw() as i32
 }
 
+/// A real comment node. `document.createComment` used to allocate a *text*
+/// node, so every comment read back `nodeType` 3 and serialised as bare text —
+/// visible to anything that walks `childNodes`, and it puts the comment's
+/// contents into the document's text.
+#[op2(fast)]
+#[smi]
+pub fn op_dom_create_comment(state: &mut OpState, #[string] text: &str) -> i32 {
+    let state = state.borrow_mut::<DomState>();
+    state.dom.create_comment(text.to_string()).to_raw() as i32
+}
+
 #[op2(fast)]
 #[smi]
 pub fn op_dom_create_document_fragment(state: &mut OpState) -> i32 {
     let state = state.borrow_mut::<DomState>();
     state.dom.create_document_fragment().to_raw() as i32
+}
+
+/// Node ids of `<iframe>` elements in the subtree rooted at `id`, `id` included.
+///
+/// A subtree move or removal takes every browsing context inside it with it, so
+/// the whole subtree is walked rather than just the node named by the mutation.
+fn frames_in_subtree(dom: &crate::dom::Dom, id: NodeId, out: &mut Vec<u32>) {
+    if let Some(node) = dom.get(id) {
+        if let crate::dom::node::NodeData::Element(elem) = &node.data {
+            if elem.name.local.eq_ignore_ascii_case("iframe") {
+                out.push(id.to_raw());
+            }
+        }
+    }
+    for child in dom.children(id) {
+        frames_in_subtree(dom, child, out);
+    }
+}
+
+/// Queue every frame in the subtree for rebuild. See `DomState::invalidated_frames`.
+fn invalidate_frames(state: &mut DomState, id: NodeId) {
+    let mut found = Vec::new();
+    frames_in_subtree(&state.dom, id, &mut found);
+    state.invalidated_frames.extend(found);
 }
 
 #[op2(fast)]
@@ -530,6 +570,7 @@ pub fn op_dom_append_child(state: &mut OpState, #[smi] parent: i32, #[smi] child
         .dom
         .append_child(NodeId::from_raw(parent as u32), child_id);
     state.layout_engine.mark_dirty();
+    invalidate_frames(state, child_id);
     if touches_stylesheet(state, child_id) {
         refresh_stylesheets(state);
     }
@@ -543,18 +584,23 @@ pub fn op_dom_insert_before(
     #[smi] reference: i32,
 ) {
     let state = state.borrow_mut::<DomState>();
+    let child_id = NodeId::from_raw(child as u32);
     state.dom.insert_before(
         NodeId::from_raw(parent as u32),
-        NodeId::from_raw(child as u32),
+        child_id,
         NodeId::from_raw(reference as u32),
     );
     state.layout_engine.mark_dirty();
+    invalidate_frames(state, child_id);
 }
 
 #[op2(fast)]
 pub fn op_dom_remove_child(state: &mut OpState, #[smi] _parent: i32, #[smi] child: i32) {
     let state = state.borrow_mut::<DomState>();
-    state.dom.detach(NodeId::from_raw(child as u32));
+    let child_id = NodeId::from_raw(child as u32);
+    // Collected before the detach: afterwards the subtree is unreachable.
+    invalidate_frames(state, child_id);
+    state.dom.detach(child_id);
     state.layout_engine.mark_dirty();
 }
 
@@ -586,6 +632,11 @@ pub fn op_dom_set_attribute(
     if name.eq_ignore_ascii_case("style") || name.eq_ignore_ascii_case("class") {
         state.layout_engine.mark_dirty();
     }
+    // Rewriting `src`/`srcdoc` navigates the frame: the old browsing context is
+    // discarded and a new one is created for the new document.
+    if name.eq_ignore_ascii_case("src") || name.eq_ignore_ascii_case("srcdoc") {
+        invalidate_frames(state, id);
+    }
 }
 
 #[op2(fast)]
@@ -607,6 +658,8 @@ pub fn op_dom_remove_attribute(state: &mut OpState, #[smi] node_id: i32, #[strin
 pub fn op_dom_set_text_content(state: &mut OpState, #[smi] node_id: i32, #[string] text: &str) {
     let state = state.borrow_mut::<DomState>();
     let id = NodeId::from_raw(node_id as u32);
+    // Replacing the contents destroys every frame under this node.
+    invalidate_frames(state, id);
     state.dom.set_text_content(id, text);
     state.layout_engine.mark_dirty();
     if touches_stylesheet(state, id) {
@@ -676,7 +729,10 @@ pub fn op_dom_set_inner_html(state: &mut OpState, #[smi] node_id: i32, #[string]
         .into_iter()
         .next();
 
-    // Remove existing children
+    // Remove existing children. Every frame under them loses its browsing
+    // context — this is the path a widget takes when it rebuilds its container
+    // wholesale rather than mutating it, and skipping it strands the realm.
+    invalidate_frames(state, id);
     let old_children: Vec<NodeId> = state.dom.children(id);
     for child in old_children {
         state.dom.remove(child);
@@ -689,6 +745,8 @@ pub fn op_dom_set_inner_html(state: &mut OpState, #[smi] node_id: i32, #[string]
             state.dom.append_child(id, new_child);
         }
     }
+    // …and whatever frames the new markup brought with it need one.
+    invalidate_frames(state, id);
     state.layout_engine.mark_dirty();
 }
 
@@ -890,6 +948,62 @@ pub fn op_dom_document_write(state: &mut OpState, #[string] html: &str) -> Vec<i
             state.dom.append_child(body_id, new_child);
             new_ids.push(new_child.to_raw() as i32);
         }
+    }
+    state.layout_engine.mark_dirty();
+    new_ids
+}
+
+/// `document.write` from a script, inserted where that script sits.
+///
+/// A browser writes into the parser's own insertion point, which is exactly
+/// where the `<script>` element is. This engine runs inline scripts after the
+/// parse rather than interleaved with it, so there is no parser to write into —
+/// and appending to `<body>` instead sends the markup to the bottom of the page.
+/// The observable damage is not subtle: `<td><script>document.write(v)</script></td>`
+/// leaves the cell empty and piles every written value up at the end of the
+/// document, which is what a whole class of legacy pages is built out of.
+///
+/// Anchoring on the script element reproduces the placement for that shape. It
+/// does not reproduce a write that opens a tag the later markup closes — that
+/// needs the parse and the scripts to interleave for real.
+#[op2]
+#[serde]
+pub fn op_dom_document_write_after(
+    state: &mut OpState,
+    #[smi] anchor_id: i32,
+    #[string] html: &str,
+) -> Vec<i32> {
+    let state = state.borrow_mut::<DomState>();
+    let anchor = NodeId::from_raw(anchor_id as u32);
+    let Some(parent) = state.dom.get(anchor).and_then(|n| n.parent) else {
+        return vec![];
+    };
+    let fragment_dom = crate::html_parser::parse_html(&format!("<body>{html}</body>"));
+    let Some(frag_body) = fragment_dom
+        .get_elements_by_tag_name(NodeId::DOCUMENT, "body")
+        .into_iter()
+        .next()
+    else {
+        return vec![];
+    };
+
+    // The cursor walks forward so several nodes from one call keep their source
+    // order; the caller passes the last one back to keep order across calls too.
+    let mut new_ids = Vec::new();
+    let mut cursor = anchor;
+    for child_id in fragment_dom.children(frag_body) {
+        let new_child = state.dom.merge_subtree(&fragment_dom, child_id);
+        let siblings = state.dom.children(parent);
+        let next = siblings
+            .iter()
+            .position(|&s| s == cursor)
+            .and_then(|i| siblings.get(i + 1).copied());
+        match next {
+            Some(reference) => state.dom.insert_before(parent, new_child, reference),
+            None => state.dom.append_child(parent, new_child),
+        }
+        cursor = new_child;
+        new_ids.push(new_child.to_raw() as i32);
     }
     state.layout_engine.mark_dirty();
     new_ids
@@ -1568,7 +1682,12 @@ pub fn op_set_child_realm_prop<'s>(
 /// (coerced to string) or `undefined` on compile/runtime error. Used for
 /// cases where `op_set_child_realm_prop` cannot express the required
 /// descriptor shape (e.g. accessor properties with a getter function).
-#[op2]
+///
+/// `reentrant`: the code we run is page script, and it calls ops of its own —
+/// a srcdoc frame that runs `querySelector` re-enters `op_dom_query_selector`
+/// from inside this one. Without the marker deno_core aborts the process
+/// (non-unwinding panic), so it is not optional.
+#[op2(reentrant)]
 #[string]
 pub fn op_eval_in_child_realm<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -1644,6 +1763,7 @@ deno_core::extension!(
         op_dom_get_elements_by_class_name,
         op_dom_create_element,
         op_dom_create_text_node,
+        op_dom_create_comment,
         op_dom_create_document_fragment,
         op_dom_append_child,
         op_dom_insert_before,
@@ -1653,6 +1773,7 @@ deno_core::extension!(
         op_dom_set_text_content,
         op_dom_set_inner_html,
         op_dom_document_write,
+        op_dom_document_write_after,
         op_dom_clone_node,
         op_dom_insert_adjacent_html,
         op_dom_class_list_add,

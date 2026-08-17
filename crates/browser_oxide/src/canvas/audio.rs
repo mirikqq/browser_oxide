@@ -40,6 +40,9 @@ pub struct AudioFingerprint {
     pub channel_count: u32,
     pub length: u32,
     pub data: Vec<f32>,
+    /// `DynamicsCompressorNode.reduction` after the render: the kernel's
+    /// metering gain, already in dB (Blink stores it that way).
+    pub reduction: f32,
 }
 
 /// Oscillator wave type.
@@ -230,6 +233,7 @@ impl AudioFingerprint {
             channel_count: 1,
             length: params.length,
             data: output,
+            reduction: kernel.metering_gain,
         }
     }
 }

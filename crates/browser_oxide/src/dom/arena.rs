@@ -145,11 +145,34 @@ impl Dom {
     /// throw a JS exception from here (called from non-unwinding op fast
     /// paths), so we log and no-op — the script's bug surfaces as a silently
     /// skipped mutation rather than a process abort or a stack overflow.
+    /// True when `id` is a `DocumentFragment`.
+    ///
+    /// Inserting one inserts its *children* and leaves the fragment empty (DOM
+    /// "pre-insert", step 6) — the fragment itself never becomes a child node.
+    fn is_fragment(&self, id: NodeId) -> bool {
+        self.get(id)
+            .is_some_and(|n| matches!(n.data, NodeData::DocumentFragment))
+    }
+
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
         // Both ids must reference live arena nodes. The JS shim returns
         // NodeId(u32::MAX) (-1 cast) for non-Node values; treat unknown ids
         // as a silent no-op rather than partially wiring the link list.
         if self.get(parent).is_none() || self.get(child).is_none() {
+            return;
+        }
+
+        // A fragment is a carrier, not content. Linking it in as a node hides
+        // everything it holds from every element-oriented view: `children` skips
+        // it because it is not an element, and selector matching never descends
+        // through it — while whole-tree walks like `getElementsByTagName` still
+        // find what is inside, so the DOM contradicts itself. Widgets that build
+        // their markup in a fragment and append it once — hCaptcha's checkbox
+        // iframe among them — then appear to render nothing.
+        if self.is_fragment(child) {
+            for grandchild in self.children(child) {
+                self.append_child(parent, grandchild);
+            }
             return;
         }
         if self.is_ancestor_or_self(child, parent) {
@@ -198,6 +221,16 @@ impl Dom {
             );
             return;
         }
+
+        // Same flattening as `append_child`: the fragment's children go in, in
+        // order, and the fragment is left empty.
+        if self.is_fragment(child) {
+            for grandchild in self.children(child) {
+                self.insert_before(parent, grandchild, reference);
+            }
+            return;
+        }
+
         self.detach(child);
 
         let prev = self.get(reference).and_then(|n| n.prev_sibling);
@@ -300,6 +333,14 @@ impl Dom {
 
     /// Get text content of a subtree.
     pub fn text_content(&self, id: NodeId) -> String {
+        // A CharacterData node's `textContent` is its own data. Only the
+        // *descendant* walk skips comments: `element.textContent` must not
+        // include them, while `comment.textContent` is exactly the comment.
+        // Without this a comment reads back empty through `.data` as well,
+        // since that shares this path.
+        if let Some(NodeData::Comment(text)) = self.get(id).map(|n| &n.data) {
+            return text.clone();
+        }
         let mut result = String::new();
         self.collect_text(id, &mut result);
         result

@@ -1,5 +1,6 @@
 use crate::stealth::StealthProfile;
 use deno_core::op2;
+use deno_core::v8;
 use deno_core::OpState;
 
 /// Stealth profile stored in OpState. Optional — if absent, defaults apply.
@@ -155,6 +156,35 @@ pub fn op_has_stealth_profile(state: &mut OpState) -> bool {
 
 /// Returns whether the document is cross-origin-isolated. Drives
 /// `self.crossOriginIsolated` and gates SAB transfer.
+/// Tag a function as native — invisibly.
+///
+/// The tag used to be an OWN property, `fn[Symbol.for('__browser_oxide_native__')]`,
+/// so `Object.getOwnPropertySymbols(fetch)` handed any script this engine's name
+/// on every masked function. It also broke the shape check fingerprinters run
+/// against natives — `Reflect.ownKeys(fn).sort().toString() === 'length,name'` —
+/// because the extra symbol both changes the result and makes `toString()` throw.
+///
+/// A v8 private symbol is reachable from the `Function.prototype.toString`
+/// replacement in `native_fns.rs` and invisible to every JS reflection there is.
+#[op2(fast)]
+pub fn op_stealth_mark_native<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    target: v8::Local<v8::Value>,
+    #[string] name: &str,
+) {
+    let Ok(obj) = v8::Local::<v8::Object>::try_from(target) else {
+        return;
+    };
+    let Some(key) = v8::String::new(scope, crate::js_runtime::native_fns::NATIVE_TAG) else {
+        return;
+    };
+    let private = v8::Private::for_api(scope, Some(key));
+    let Some(value) = v8::String::new(scope, name) else {
+        return;
+    };
+    obj.set_private(scope, private, value.into());
+}
+
 #[op2(fast)]
 pub fn op_cross_origin_isolated(state: &mut OpState) -> bool {
     let state = state.borrow::<StealthState>();
@@ -209,6 +239,7 @@ deno_core::extension!(
         op_get_profile_value,
         op_has_stealth_profile,
         op_cross_origin_isolated,
+        op_stealth_mark_native,
         op_is_secure_context,
         op_behavior_mouse_trajectory,
     ],

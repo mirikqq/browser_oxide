@@ -153,7 +153,10 @@
         Object.defineProperty(proto, name, {
             get: getter,
             set: setter,
-            enumerable: false,
+            // Enumerable: a WebIDL attribute on an interface prototype is, and
+            // `Object.getOwnPropertyDescriptor(Navigator.prototype, 'userAgent')`
+            // is among the handful of descriptors a bot check actually reads.
+            enumerable: true,
             configurable: true,
         });
         _maskFunction(getter, `get ${name}`);
@@ -179,7 +182,36 @@
     // Navigator class + prototype — kNoScriptId-safe layout
     // ================================================================
     const _NavProto = globalThis.Navigator.prototype;
-    const _defNav = (name, getter) => _defProtoGetter(_NavProto, name, getter);
+    // Navigator's attributes reject a foreign receiver, as every platform
+    // object's do: `Object.getOwnPropertyDescriptor(Navigator.prototype,
+    // 'userAgent').get.call({})` throws `TypeError: Illegal invocation` in a
+    // browser. Ours returned a value for any `this`, and that is the check
+    // fingerprinters run to decide a property has been redefined — creepjs
+    // records it as a lie against `Navigator.webdriver` specifically, which then
+    // counts as "webdriver is on" no matter what the property actually says.
+    //
+    // Only the receiver is checked; the getters themselves ignore `this`.
+    //
+    // Method shorthand, not a function expression: the latter carries a
+    // `prototype` and is constructible, neither of which a native getter is —
+    // wrapping every accessor in one would trade this tell for a worse one.
+    const _navBrand = (getter) => ({
+        get() {
+            if (!(this instanceof Navigator)) {
+                throw new TypeError("Illegal invocation");
+            }
+            return getter.call(this);
+        },
+    }).get;
+    // Closure slots, not globals. Every symbol left on `globalThis` is one more
+    // entry `Object.getOwnPropertySymbols(window)` reports, and Chrome's window
+    // has none at all — a service slot the engine talks to itself through has no
+    // business being visible to the page.
+    let _syncFrameIndicesRef = null;
+    let _currentDispatchedEvent;
+
+    const _defNav = (name, getter) =>
+        _defProtoGetter(_NavProto, name, _navBrand(getter));
     const _defNavMethod = (name, fn) => _defProtoMethod(_NavProto, name, fn);
 
     // Stable-object references — object getters return the same reference
@@ -187,13 +219,36 @@
     let NetworkInformation = globalThis.NetworkInformation || class NetworkInformation extends EventTarget {
         constructor() { super(); }
     };
-    const _navConnection = Object.create(NetworkInformation.prototype);
-    Object.defineProperty(_navConnection, 'effectiveType', { get: () => _p("connection_effective_type", "4g"), enumerable: true });
-    Object.defineProperty(_navConnection, 'rtt', { get: () => Math.round(_pInt("connection_rtt", 50) / 25) * 25, enumerable: true });
-    Object.defineProperty(_navConnection, 'downlink', { get: () => Math.round(_pFloat("connection_downlink", 10) * 40) / 40, enumerable: true });
-    Object.defineProperty(_navConnection, 'saveData', { get: () => false, enumerable: true });
-    Object.defineProperty(_navConnection, 'downlinkMax', { get: () => Infinity, enumerable: true });
-    _navConnection.onchange = null;
+    // On the *prototype*, which is where WebIDL attributes live. Verified
+    // against Chrome: `Object.getOwnPropertyDescriptor(navigator.connection,
+    // 'effectiveType')` is undefined there and the descriptor sits on
+    // `NetworkInformation.prototype`. Defining them on the instance inverted
+    // both answers — an own-property probe is one line and this failed it.
+    //
+    // `downlinkMax` is deliberately absent: Chrome does not implement it either,
+    // and adding it would be its own mismatch.
+    const _NIProto = NetworkInformation.prototype;
+    _defProtoGetter(_NIProto, 'effectiveType', function effectiveType() {
+        return _p("connection_effective_type", "4g");
+    });
+    _defProtoGetter(_NIProto, 'rtt', function rtt() {
+        return Math.round(_pInt("connection_rtt", 50) / 25) * 25;
+    });
+    _defProtoGetter(_NIProto, 'downlink', function downlink() {
+        return Math.round(_pFloat("connection_downlink", 10) * 40) / 40;
+    });
+    _defProtoGetter(_NIProto, 'saveData', function saveData() { return false; });
+    const _niOnChange = new WeakMap();
+    _defProtoGetter(
+        _NIProto,
+        'onchange',
+        function onchange() { return _niOnChange.get(this) || null; },
+        function onchange(fn) { _niOnChange.set(this, typeof fn === "function" ? fn : null); },
+    );
+    Object.defineProperty(_NIProto, Symbol.toStringTag, {
+        value: "NetworkInformation", configurable: true,
+    });
+    const _navConnection = Object.create(_NIProto);
 
     let PluginArray = globalThis.PluginArray || class PluginArray {};
     let MimeTypeArray = globalThis.MimeTypeArray || class MimeTypeArray {};
@@ -1027,7 +1082,12 @@
     // "returns undefined" was a wrong assumption. Some scripts also check
     // the getter source, so it is masked native via _maskFunction.
     Object.defineProperty(Navigator.prototype, 'webdriver', {
-        get: _maskFunction(function() { return false; }, 'get webdriver'),
+        // Arrow, like every other navigator getter here: a plain function
+        // expression carries a `prototype` and is constructible, and a native
+        // getter is neither. `Object.getOwnPropertyNames(get)` read
+        // `length,name,prototype` against `length,name` everywhere else — a
+        // difference that names this one property as the patched one.
+        get: _maskFunction(_navBrand(() => false), 'get webdriver'),
         enumerable: true,
         configurable: true
     });
@@ -1480,19 +1540,50 @@
             enumerable: true
         });
     }
-    // Privileged setter, published non-enumerably and revoked by the child-frame
-    // installer right after use (same discipline as __bo_mark_trusted).
-    Object.defineProperty(globalThis, '__bo_set_frame_links', {
-        value: (parent, top) => {
-            if (parent) _frameLinks.parent = parent;
-            if (top) _frameLinks.top = top;
-        },
-        configurable: true, enumerable: false, writable: false,
-    });
+    // Privileged setter for the child-frame installer. It lives on the
+    // symbol-keyed namespace rather than as a `__bo_*` global: a string key is
+    // listed by `Object.getOwnPropertyNames(window)` whether enumerable or not,
+    // and that sweep is exactly what fingerprinting scripts run.
+    try {
+        const _ns = (function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})();
+        if (_ns) {
+            Object.defineProperty(_ns, 'setFrameLinks', {
+                value: (parent, top) => {
+                    if (parent) _frameLinks.parent = parent;
+                    if (top) _frameLinks.top = top;
+                },
+                configurable: true, enumerable: false, writable: false,
+            });
+        }
+    } catch (_) { /* ignore */ }
     globalThis.opener = null;
-    // window.length = number of child frames. Starts at 0; dom_bootstrap.js
-    // updates it when iframes are appended to the document.
-    try { Object.defineProperty(globalThis, 'length', { value: 0, configurable: true, writable: true }); } catch (_) {}
+    // window.length = number of child browsing contexts, read live.
+    //
+    // It used to be a counter maintained by a hook on `appendChild`, which only
+    // ever sees a frame appended *directly*. A frame that arrives inside an
+    // inserted subtree — a DocumentFragment, an `innerHTML` — was never counted:
+    // measured with three iframes in the document and `length` still reporting
+    // two, which no browser does and which is a single line to check.
+    //
+    // `[Replaceable]` per WebIDL: assigning to it replaces the accessor with the
+    // assigned value, rather than throwing or being silently dropped.
+    try {
+        Object.defineProperty(globalThis, 'length', {
+            get() {
+                try {
+                    const n = document.querySelectorAll('iframe').length;
+                    if (typeof _syncFrameIndicesRef === 'function') _syncFrameIndicesRef();
+                    return n;
+                } catch (_) { return 0; }
+            },
+            set(v) {
+                Object.defineProperty(globalThis, 'length', {
+                    value: v, writable: true, enumerable: true, configurable: true,
+                });
+            },
+            configurable: true, enumerable: true,
+        });
+    } catch (_) {}
 
     // screen — prototype-backed so own-descriptor probe returns undefined.
     const _ScreenProto = Screen.prototype;
@@ -1725,7 +1816,54 @@
             },
             csi: _chromeCsi,
             loadTimes: _chromeLoadTimes,
+            // `chrome.runtime` is present on ordinary pages in desktop Chrome —
+            // it is how a page talks to `externally_connectable` extensions —
+            // and historically absent in headless. `!!window.chrome &&
+            // !window.chrome.runtime` is therefore a standard headless probe,
+            // and pixelscan.dev's "Headless Mode" signal is exactly that
+            // expression; without `runtime` we answered it truthfully.
+            //
+            // `id` is `undefined` off an extension page, and the enums below
+            // are the ones Chrome exposes verbatim.
+            runtime: {
+                id: undefined,
+                connect: function connect() { return undefined; },
+                sendMessage: function sendMessage() { return undefined; },
+                OnInstalledReason: {
+                    CHROME_UPDATE: "chrome_update", INSTALL: "install",
+                    SHARED_MODULE_UPDATE: "shared_module_update", UPDATE: "update",
+                },
+                OnRestartRequiredReason: {
+                    APP_UPDATE: "app_update", OS_UPDATE: "os_update", PERIODIC: "periodic",
+                },
+                PlatformArch: {
+                    ARM: "arm", ARM64: "arm64", MIPS: "mips", MIPS64: "mips64",
+                    X86_32: "x86-32", X86_64: "x86-64",
+                },
+                PlatformNaclArch: {
+                    ARM: "arm", MIPS: "mips", MIPS64: "mips64",
+                    X86_32: "x86-32", X86_64: "x86-64",
+                },
+                PlatformOs: {
+                    ANDROID: "android", CROS: "cros", FUCHSIA: "fuchsia",
+                    LINUX: "linux", MAC: "mac", OPENBSD: "openbsd", WIN: "win",
+                },
+                RequestUpdateCheckStatus: {
+                    NO_UPDATE: "no_update", THROTTLED: "throttled",
+                    UPDATE_AVAILABLE: "update_available",
+                },
+                ContextType: {
+                    BACKGROUND: "BACKGROUND", OFFSCREEN_DOCUMENT: "OFFSCREEN_DOCUMENT",
+                    POPUP: "POPUP", SIDE_PANEL: "SIDE_PANEL", TAB: "TAB",
+                },
+            },
         };
+        // `chrome.runtime.connect.toString()` must read as native, like every
+        // other engine-provided function.
+        if (typeof _maskFunction === 'function') {
+            _maskFunction(globalThis.chrome.runtime.connect, 'connect');
+            _maskFunction(globalThis.chrome.runtime.sendMessage, 'sendMessage');
+        }
     }
 
     // --- Document visibility/hidden stubs ---
@@ -1745,7 +1883,12 @@
         // webdriver: defined identically to the Navigator.prototype block
         // above — `false` (Chrome-148-faithful).
         Object.defineProperty(_NavProto, 'webdriver', {
-            get: _maskFunction(function() { return false; }, 'get webdriver'),
+            // Arrow, like every other navigator getter here: a plain function
+        // expression carries a `prototype` and is constructible, and a native
+        // getter is neither. `Object.getOwnPropertyNames(get)` read
+        // `length,name,prototype` against `length,name` everywhere else — a
+        // difference that names this one property as the patched one.
+        get: _maskFunction(_navBrand(() => false), 'get webdriver'),
             enumerable: true,
             configurable: true
         });
@@ -1954,16 +2097,26 @@
             if (s.startsWith('blob:')) {
                 try { return _wops.op_blob_fetch_text(s) || ''; } catch (e) { return ''; }
             }
-            if (s.startsWith('http:') || s.startsWith('https:')) {
-                try { return _wops.op_worker_sync_fetch(s) || ''; } catch (e) { return ''; }
+            // Anything not already absolute is resolved against the document's
+            // base, the same as any other subresource URL.
+            //
+            // This used to read a base off a `__browser_oxide` global that the
+            // cleanup pass deletes, so it was always empty and *every* relative
+            // worker URL failed — `new Worker('./worker.js')`, the most common
+            // form there is, fired an error event instead of starting.
+            // `new URL(…, base)` also covers the shapes the old prefix-join got
+            // wrong: root-relative `/w.js` and protocol-relative `//host/w.js`.
+            let full = s;
+            if (!/^https?:/i.test(s)) {
+                try {
+                    const base = (typeof document !== 'undefined' && document.baseURI)
+                        || (typeof location !== 'undefined' && location.href) || '';
+                    if (!base) return '';
+                    full = new URL(s, base).href;
+                } catch (e) { return ''; }
             }
-            // Fallback to relative URL resolution via base
-            if (!s.includes(':')) {
-                const base = (globalThis.__browser_oxide && globalThis.__browser_oxide._baseUrl) || '';
-                if (base.startsWith('http')) {
-                    const full = base.replace(/\/[^\/]*$/, '/') + s;
-                    try { return _wops.op_worker_sync_fetch(full) || ''; } catch (e) { return ''; }
-                }
+            if (/^https?:/i.test(full)) {
+                try { return _wops.op_worker_sync_fetch(full) || ''; } catch (e) { return ''; }
             }
             return '';
         }
@@ -2031,6 +2184,23 @@
                         let payload = null;
                         try { payload = JSON.parse(raw); }
                         catch (e) { return _drainOnce(); }
+                        // An uncaught error in the worker arrives on the same
+                        // channel, told apart by its key. Without this a worker
+                        // that threw on its first line was indistinguishable
+                        // from one that is simply still working.
+                        if (payload && payload.error) {
+                            const err = payload.error;
+                            try {
+                                self._fireEvent('error', {
+                                    type: 'error',
+                                    message: String(err.message || ''),
+                                    filename: String(err.filename || ''),
+                                    lineno: err.lineno | 0,
+                                    colno: err.colno | 0,
+                                });
+                            } catch (_) {}
+                            return _drainOnce();
+                        }
                         const data = deserializer
                             ? deserializer(payload && payload.data)
                             : payload && payload.data;
@@ -2576,7 +2746,19 @@
     _defProtoGetter(_SSProto, 'pending', () => false);
     _defProtoGetter(_SSProto, 'speaking', () => false);
     _defProtoGetter(_SSProto, 'paused', () => false);
-    _defProtoGetter(_SSProto, 'onvoiceschanged', () => null);
+    // Event handler attribute, so it has a setter: assigning to a getter-only
+    // property throws in strict mode, and `speechSynthesis.onvoiceschanged = fn`
+    // is the ordinary way to wait for the voice list. A page that does it gets
+    // a TypeError out of a line that cannot fail in a browser.
+    const _ssVoicesChanged = new WeakMap();
+    _defProtoGetter(
+        _SSProto,
+        'onvoiceschanged',
+        function onvoiceschanged() { return _ssVoicesChanged.get(this) || null; },
+        function onvoiceschanged(fn) {
+            _ssVoicesChanged.set(this, typeof fn === "function" ? fn : null);
+        },
+    );
     _defProtoMethod(_SSProto, 'getVoices', function getVoices() { return _ssVoices.slice(); });
     _defProtoMethod(_SSProto, 'speak', function speak() {});
     _defProtoMethod(_SSProto, 'cancel', function cancel() {});
@@ -3724,40 +3906,41 @@
             const nodeId = _getNodeIdForCompStyle(element);
             // Create an instance of CSSStyleDeclaration.
             const style = Object.create(globalThis.CSSStyleDeclaration.prototype || Object.prototype);
-        let cache = null;
+        // The returned declaration is *live*: per spec it reflects the element's
+        // current state on every read, so the snapshot may not outlive the access
+        // that needed it. Memoising it once per element — as this did — froze the
+        // element at whatever it looked like the first time anything asked. A page
+        // that reveals a node by rewriting its inline style then reads back the
+        // state it started in, which is indistinguishable from "the reveal did not
+        // happen" and stalls anything waiting on it.
+        //
+        // Only enumeration goes through the bulk op; a single property read asks
+        // for that property.
         let keys = null;
-        function ensureCache() {
-            if (cache === null) {
-                cache = ops.op_dom_get_all_computed_styles(nodeId);
-                keys = Object.keys(cache);
-            }
-            return cache;
+        function snapshot() {
+            const c = ops.op_dom_get_all_computed_styles(nodeId);
+            keys = Object.keys(c);
+            return c;
         }
         styleProxy = new Proxy(style, {
             get(target, prop) {
                 if (prop === "getPropertyValue") {
-                    return (name) => {
-                        const c = ensureCache();
-                        return c[name] || ops.op_dom_get_computed_style(nodeId, name);
-                    };
+                    return (name) => ops.op_dom_get_computed_style(nodeId, name);
                 }
                 if (prop === "setProperty" || prop === "removeProperty") {
                     return () => {}; // read-only
                 }
                 if (prop === "length") {
-                    ensureCache();
+                    snapshot();
                     return keys.length;
                 }
                 if (prop === Symbol.toStringTag) return "CSSStyleDeclaration";
                 if (typeof prop === "string") {
                     if (/^\d+$/.test(prop)) {
-                        ensureCache();
+                        snapshot();
                         return keys[parseInt(prop, 10)];
                     }
                     const kebab = prop.replace(/[A-Z]/g, m => "-" + m.toLowerCase());
-                    const c = ensureCache();
-                    if (Object.prototype.hasOwnProperty.call(c, kebab)) return c[kebab];
-                    // Fallback to single-op for inheritance/defaults
                     return ops.op_dom_get_computed_style(nodeId, kebab);
                 }
                 return undefined;
@@ -4122,7 +4305,22 @@
     const _HistoryProto = History.prototype;
     _defProtoGetter(_HistoryProto, 'length', () => _historyStack.length);
     _defProtoGetter(_HistoryProto, 'state', () => _historyStack[_historyIndex]?.state || null);
-    _defProtoGetter(_HistoryProto, 'scrollRestoration', () => "auto");
+    // Writable, as in a browser: `history.scrollRestoration = 'manual'` is the
+    // documented way to opt out of scroll restoration, and a getter-only property
+    // makes that assignment throw. Angular does it during bootstrap, so the throw
+    // aborted the framework's initialisation before the application rendered.
+    {
+        const _scrollRestoration = new WeakMap();
+        _defProtoGetter(
+            _HistoryProto,
+            'scrollRestoration',
+            function scrollRestoration() { return _scrollRestoration.get(this) || "auto"; },
+            function scrollRestoration(v) {
+                const value = String(v);
+                if (value === "auto" || value === "manual") _scrollRestoration.set(this, value);
+            },
+        );
+    }
     _defProtoMethod(_HistoryProto, 'pushState', function pushState(state, title, url) {
         _historyStack.splice(_historyIndex + 1);
         _historyStack.push({ state, title, url: url || "" });
@@ -4527,6 +4725,25 @@
 
     // --- URL ---
     if (!globalThis.URL) {
+    // RFC 3986 §5.2.4 — a resolved path must have its `.` and `..` segments
+    // removed. Without it `new URL('./w.js', 'https://h/dir/')` yields
+    // "https://h/dir/./w.js", which a server may well 404: measured as
+    // `new Worker('./creep.js')` failing to load on a site whose own script
+    // sits right next to the document.
+    function _removeDotSegments(path) {
+        if (path.indexOf('.') === -1) return path;
+        const out = [];
+        for (const seg of path.split('/')) {
+            if (seg === '.') continue;
+            if (seg === '..') { if (out.length > 1) out.pop(); continue; }
+            out.push(seg);
+        }
+        let res = out.join('/');
+        // A path ending in a dot segment keeps its trailing slash.
+        if (/(^|\/)\.\.?$/.test(path) && !res.endsWith('/')) res += '/';
+        return res || '/';
+    }
+
         globalThis.URL = class URL {
             constructor(url, base) {
                 let full = String(url);
@@ -4547,7 +4764,7 @@
                     this.protocol = m[1].toLowerCase() + ':';
                     this.hostname = m[2];
                     this.port = m[3] || '';
-                    this.pathname = m[4] || '/';
+                    this.pathname = _removeDotSegments(m[4] || '/');
                     this.search = m[5] || '';
                     this.hash = m[6] || '';
                     this.host = this.port ? this.hostname + ':' + this.port : this.hostname;
@@ -5298,6 +5515,36 @@
         send() {}
         close() {}
     };
+    const _rtcHexDigit = () => Math.floor(Math.random() * 16).toString(16);
+    const _rtcDigits = (n) => {
+        let out = String(1 + Math.floor(Math.random() * 9));
+        for (let i = 1; i < n; i++) out += Math.floor(Math.random() * 10);
+        return out;
+    };
+    const _rtcBase64ish = (n) => {
+        const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+        let out = '';
+        for (let i = 0; i < n; i++) out += alphabet[Math.floor(Math.random() * alphabet.length)];
+        return out;
+    };
+    const _rtcFingerprint = () => {
+        const bytes = [];
+        for (let i = 0; i < 32; i++) {
+            bytes.push((_rtcHexDigit() + _rtcHexDigit()).toUpperCase());
+        }
+        return bytes.join(':');
+    };
+    const _rtcUuid4 = () => {
+        let out = '';
+        for (let i = 0; i < 36; i++) {
+            if (i === 8 || i === 13 || i === 18 || i === 23) out += '-';
+            else if (i === 14) out += '4';
+            else if (i === 19) out += (8 + Math.floor(Math.random() * 4)).toString(16);
+            else out += _rtcHexDigit();
+        }
+        return out;
+    };
+
     globalThis.RTCPeerConnection = class RTCPeerConnection extends EventTarget {
         constructor(config) {
             super();
@@ -5313,6 +5560,46 @@
             this.ondatachannel = null;
             this.ontrack = null;
             this._channels = [];
+            // Per-connection identity, the way a browser mints one: ICE
+            // credentials and a DTLS certificate fingerprint are fresh for every
+            // RTCPeerConnection, so these are random rather than profile-derived.
+            this._ice = {
+                sessionId: _rtcDigits(19),
+                ufrag: _rtcBase64ish(4),
+                pwd: _rtcBase64ish(24),
+                fingerprint: _rtcFingerprint(),
+                mdns: _rtcUuid4() + '.local',
+                port: 50000 + Math.floor(Math.random() * 15000),
+                foundation: String(Math.floor(Math.random() * 4000000000)),
+            };
+        }
+        // A Chrome-shaped offer for a data channel. The stub this replaces was
+        // four lines with no media section, no ICE credentials and no candidate,
+        // which is not something any WebRTC stack emits — detectors parse the SDP
+        // for exactly those fields and reported the transport as blocked or
+        // unsupported because none of them were there.
+        _buildSdp(setup) {
+            const ice = this._ice;
+            const lines = [
+                'v=0',
+                `o=- ${ice.sessionId} 2 IN IP4 127.0.0.1`,
+                's=-',
+                't=0 0',
+                'a=group:BUNDLE 0',
+                'a=extmap-allow-mixed',
+                'a=msid-semantic: WMS',
+                'm=application 9 UDP/DTLS/SCTP webrtc-datachannel',
+                'c=IN IP4 0.0.0.0',
+                'a=ice-ufrag:' + ice.ufrag,
+                'a=ice-pwd:' + ice.pwd,
+                'a=ice-options:trickle',
+                'a=fingerprint:sha-256 ' + ice.fingerprint,
+                'a=setup:' + setup,
+                'a=mid:0',
+                'a=sctp-port:5000',
+                'a=max-message-size:262144',
+            ];
+            return lines.join('\r\n') + '\r\n';
         }
         createDataChannel(label, options) {
             const ch = new RTCDataChannel();
@@ -5321,10 +5608,10 @@
             return ch;
         }
         createOffer() {
-            return Promise.resolve({ type: "offer", sdp: "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n" });
+            return Promise.resolve({ type: "offer", sdp: this._buildSdp('actpass') });
         }
         createAnswer() {
-            return Promise.resolve({ type: "answer", sdp: "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n" });
+            return Promise.resolve({ type: "answer", sdp: this._buildSdp('active') });
         }
         setLocalDescription(desc) {
             this.localDescription = desc;
@@ -5333,30 +5620,48 @@
             // Returning ONLY `{candidate: null}` is itself a tell — every
             // legitimate Chrome session yields at least one mDNS host.
             // The `<uuid>.local` form is privacy-preserving (no real IP).
-            // Some fingerprint scripts probe candidate
-            // length; one mDNS host closes the parity gap without leaking.
-            const _hex = (n) => Math.floor(Math.random() * 16).toString(16);
-            const _uuid4 = () => {
-                let s = '';
-                for (let i = 0; i < 36; i++) {
-                    if (i === 8 || i === 13 || i === 18 || i === 23) s += '-';
-                    else if (i === 14) s += '4';
-                    else if (i === 19) s += (8 + Math.floor(Math.random() * 4)).toString(16);
-                    else s += _hex();
-                }
-                return s;
-            };
-            const mdnsHost = _uuid4() + '.local';
-            const foundation = String(Math.floor(Math.random() * 4_000_000_000));
-            const candidate = `candidate:${foundation} 1 udp 2113937151 ${mdnsHost} ${1024 + Math.floor(Math.random() * 60000)} typ host generation 0 network-cost 999`;
+            //
+            // Built from this connection's own identity so the candidate and the
+            // SDP agree: a host line whose credentials belong to a different
+            // session is exactly the kind of internal contradiction a detector
+            // looks for.
+            const ice = this._ice;
+            const candidate = `candidate:${ice.foundation} 1 udp 2113937151 ${ice.mdns} `
+                + `${ice.port} typ host generation 0 ufrag ${ice.ufrag} network-cost 999`;
             const iceCandidate = new globalThis.RTCIceCandidate({
                 candidate, sdpMid: '0', sdpMLineIndex: 0,
             });
+            // Chrome folds gathered candidates into the local description, so a
+            // script that reads `pc.localDescription.sdp` after gathering sees
+            // them there and not only through the event.
+            if (desc && typeof desc.sdp === 'string' && desc.sdp.indexOf('a=candidate') < 0) {
+                const withCandidate = desc.sdp
+                    + 'a=' + candidate + '\r\n'
+                    + 'a=end-of-candidates\r\n';
+                this.localDescription = { type: desc.type, sdp: withCandidate };
+            }
+            this.iceGatheringState = "gathering";
+            // Both halves: the handler attribute and a dispatched event, because
+            // a page may use either and a browser fires both.
+            const emit = (value) => {
+                let ev = null;
+                try {
+                    ev = new Event('icecandidate');
+                    Object.defineProperty(ev, 'candidate', {
+                        value, enumerable: true, configurable: true,
+                    });
+                    this.dispatchEvent(ev);
+                } catch (_) { /* ignore */ }
+                if (this.onicecandidate) this.onicecandidate(ev || { candidate: value });
+            };
             setTimeout(() => {
-                if (this.onicecandidate) this.onicecandidate({ candidate: iceCandidate });
+                emit(iceCandidate);
                 setTimeout(() => {
-                    if (this.onicecandidate) this.onicecandidate({ candidate: null });
+                    emit(null);
                     this.iceGatheringState = "complete";
+                    try {
+                        this.dispatchEvent(new Event('icegatheringstatechange'));
+                    } catch (_) { /* ignore */ }
                 }, 12);
             }, 8);
             return Promise.resolve();
@@ -5375,13 +5680,45 @@
             this.iceConnectionState = "closed";
             this.connectionState = "closed";
         }
-        addEventListener() {}
-        removeEventListener() {}
+        // No `addEventListener`/`removeEventListener` overrides here: they used
+        // to be empty stubs shadowing the real EventTarget methods, so a listener
+        // registered the standard way was silently dropped. Every WebRTC probe
+        // that watches for `icecandidate` through `addEventListener` — which is
+        // the usual form — then saw nothing and reported the transport blocked.
     };
     globalThis.RTCPeerConnection.generateCertificate = () => Promise.resolve({});
     globalThis.webkitRTCPeerConnection = globalThis.RTCPeerConnection;
     globalThis.RTCSessionDescription = class RTCSessionDescription { constructor(d) { this.type = d?.type; this.sdp = d?.sdp; } };
-    globalThis.RTCIceCandidate = class RTCIceCandidate { constructor(c) { this.candidate = c?.candidate || ""; this.sdpMid = c?.sdpMid; this.sdpMLineIndex = c?.sdpMLineIndex; } };
+    // Chrome parses the candidate line into named fields, and probes read them
+    // directly — `event.candidate.foundation` was undefined here.
+    globalThis.RTCIceCandidate = class RTCIceCandidate {
+        constructor(c) {
+            this.candidate = c?.candidate || "";
+            this.sdpMid = c?.sdpMid ?? null;
+            this.sdpMLineIndex = c?.sdpMLineIndex ?? null;
+            const m = /^candidate:(\S+) (\d+) (\S+) (\d+) (\S+) (\d+) typ (\S+)/.exec(this.candidate);
+            this.foundation = m ? m[1] : null;
+            this.component = m ? (m[2] === '1' ? 'rtp' : 'rtcp') : null;
+            this.protocol = m ? m[3].toLowerCase() : null;
+            this.priority = m ? Number(m[4]) : null;
+            this.address = m ? m[5] : null;
+            this.port = m ? Number(m[6]) : null;
+            this.type = m ? m[7] : null;
+            this.tcpType = null;
+            this.relatedAddress = null;
+            this.relatedPort = null;
+            const uf = /\bufrag (\S+)/.exec(this.candidate);
+            this.usernameFragment = uf ? uf[1] : (c?.usernameFragment ?? null);
+        }
+        toJSON() {
+            return {
+                candidate: this.candidate,
+                sdpMid: this.sdpMid,
+                sdpMLineIndex: this.sdpMLineIndex,
+                usernameFragment: this.usernameFragment,
+            };
+        }
+    };
 
     // ================================================================
     // Font enumeration spoofing — return OS-appropriate fonts
@@ -7136,9 +7473,71 @@
         },
         configurable: true, enumerable: true, writable: true,
     });
+    // Window members Chrome has and this engine did not. Not interfaces — the
+    // interface table cannot create them — so they are declared here. A missing
+    // name is the same kind of namespace difference as an extra one: both show up
+    // when a detector diffs `Object.getOwnPropertyNames(window)` against a real
+    // browser's, which is precisely what the "unusual window properties" check is.
+    (() => {
+        const nativeFn = (name, impl) => {
+            const fn = ({ [name](...args) { return impl.apply(this, args); } })[name];
+            if (typeof globalThis._maskFunction === 'function') globalThis._maskFunction(fn, name);
+            return fn;
+        };
+        const define = (name, value) => {
+            if (name in globalThis) return;
+            Object.defineProperty(globalThis, name, {
+                value, writable: true, enumerable: true, configurable: true,
+            });
+        };
+        // Window geometry and focus verbs. A headless window cannot honour them,
+        // and Chrome ignores most of them for a non-script-opened window too, so
+        // no-ops match the observable behaviour.
+        for (const name of ['blur', 'focus', 'moveBy', 'moveTo', 'resizeBy', 'resizeTo',
+                            'captureEvents', 'releaseEvents']) {
+            define(name, nativeFn(name, () => undefined));
+        }
+        define('find', nativeFn('find', () => false));
+        // Legacy `window.event`: the event currently being dispatched, undefined
+        // outside a dispatch.
+        if (!('event' in globalThis)) {
+            Object.defineProperty(globalThis, 'event', {
+                get() { return _currentDispatchedEvent; },
+                set(v) { _currentDispatchedEvent = v; },
+                enumerable: true, configurable: true,
+            });
+        }
+        // Handler attributes default to null, like every other `on…` on Window.
+        for (const name of ['onerror', 'ondevicemotion', 'ondeviceorientation',
+                            'ondeviceorientationabsolute']) {
+            define(name, null);
+        }
+        // Async entry points that need a permission or a user gesture this engine
+        // never has: they exist and reject, which is what Chrome does when the
+        // request is denied.
+        const denied = (name) => nativeFn(name, () =>
+            Promise.reject(new DOMException('Permission denied', 'NotAllowedError')));
+        for (const name of ['getScreenDetails', 'queryLocalFonts', 'showDirectoryPicker',
+                            'showOpenFilePicker', 'showSaveFilePicker']) {
+            define(name, denied(name));
+        }
+        define('fetchLater', nativeFn('fetchLater', () => ({ activated: false })));
+        define('webkitRequestFileSystem', nativeFn('webkitRequestFileSystem',
+            (_type, _size, _ok, err) => { if (typeof err === 'function') err(new DOMException('', 'SecurityError')); }));
+        define('webkitResolveLocalFileSystemURL', nativeFn('webkitResolveLocalFileSystemURL',
+            (_url, _ok, err) => { if (typeof err === 'function') err(new DOMException('', 'SecurityError')); }));
+        // Objects, shaped enough to be inspected without throwing.
+        define('navigation', globalThis.Navigation ? Object.create(globalThis.Navigation.prototype) : {});
+        define('documentPictureInPicture', globalThis.DocumentPictureInPicture
+            ? Object.create(globalThis.DocumentPictureInPicture.prototype) : {});
+        define('sharedStorage', globalThis.SharedStorage
+            ? Object.create(globalThis.SharedStorage.prototype) : {});
+    })();
+
     globalThis.clientInformation = globalThis.navigator;
     globalThis.offscreenBuffering = true;
-    globalThis.defaultStatus = "";
+    // No `defaultStatus`: Chrome removed it, and a global we have that the
+    // browser we claim to be does not is the worse direction to differ in.
     globalThis.name = "";
     globalThis.status = "";
     
@@ -7155,10 +7554,36 @@
             configurable: true, enumerable: true
         });
     };
-    // Pre-define for common counts.
-    for (let i = 0; i < 5; i++) _defineIframeGetter(i);
+    // Exactly as many as there are frames, and no more. Five were defined
+    // unconditionally, so `Object.getOwnPropertyNames(window)` on a page with no
+    // frames at all listed "0".."4" — five names a real browser does not have,
+    // and comparing that list against Chrome's is a standard check.
+    const _syncFrameIndices = () => {
+        let count = 0;
+        try { count = document.querySelectorAll('iframe').length; } catch (_) {}
+        for (let i = 0; i < count; i++) {
+            if (!Object.getOwnPropertyDescriptor(globalThis, String(i))) _defineIframeGetter(i);
+        }
+        for (let i = count; i < 32; i++) {
+            const d = Object.getOwnPropertyDescriptor(globalThis, String(i));
+            if (!d) break;
+            if (d.configurable) { try { delete globalThis[String(i)]; } catch (_) {} }
+        }
+    };
+    _syncFrameIndicesRef = _syncFrameIndices;
+
+    // On the prototype, where Chrome keeps it: `Object.getOwnPropertySymbols(window)`
+    // is empty there, and every symbol we leave on the global is one more entry a
+    // namespace comparison can see.
+    try {
+        Object.defineProperty(Object.getPrototypeOf(globalThis), Symbol.toStringTag, {
+            value: "Window", configurable: true,
+        });
+    } catch (_) {
+    
 
     Object.defineProperty(globalThis, Symbol.toStringTag, { value: "Window", configurable: true });
+    }
 
     // Warm-reuse custom-element reaper. Both registries hold page-supplied
     // constructors (and, for `whenDefined`, unresolved promise resolvers)
@@ -7176,4 +7601,56 @@
         configurable: true,
         enumerable: false,
     });
+
+    // -- Window attributes are accessors, not data properties --------
+    //
+    // In Chrome every `on…` handler and the window's own attributes (`screen`,
+    // `history`, `navigator`, `innerWidth`, …) are getter/setter pairs on the
+    // instance: 184 accessors against 49 plain values. This engine had it the
+    // other way round — 20 accessors and 258 values — so a descriptor sweep of
+    // `window`, which is one loop for a detector, disagreed on two hundred
+    // properties at once.
+    //
+    // Converted in place at the end of setup, keeping whatever value each one
+    // already holds, so behaviour is untouched: reading returns the same thing
+    // and assignment still lands in the same slot.
+    (() => {
+        const INSTANCE_ATTRS = [
+            'self', 'name', 'customElements', 'history', 'navigation', 'locationbar',
+            'menubar', 'personalbar', 'scrollbars', 'statusbar', 'toolbar', 'status',
+            'closed', 'frames', 'length', 'opener', 'frameElement', 'navigator',
+            'origin', 'external', 'screen', 'innerWidth', 'innerHeight', 'scrollX',
+            'pageXOffset', 'scrollY', 'pageYOffset', 'visualViewport', 'screenX',
+            'screenY', 'outerWidth', 'outerHeight', 'devicePixelRatio', 'event',
+            'clientInformation', 'screenLeft', 'screenTop', 'styleMedia',
+            'isSecureContext', 'crossOriginIsolated', 'scheduler', 'performance',
+            'trustedTypes', 'crypto', 'indexedDB', 'localStorage', 'sessionStorage',
+            'caches', 'cookieStore', 'documentPictureInPicture', 'sharedStorage',
+            'originAgentCluster', 'viewport', 'credentialless', 'fence', 'launchQueue',
+            'speechSynthesis', 'crashReport',
+        ];
+        const slots = Object.create(null);
+        const convert = (name) => {
+            let d;
+            try { d = Object.getOwnPropertyDescriptor(globalThis, name); } catch (_) { return; }
+            if (!d || d.get || d.set || !d.configurable) return;
+            slots[name] = d.value;
+            const get = ({ [name]() { return slots[name]; } })[name];
+            const set = ({ [name](v) { slots[name] = v; } })[name];
+            if (typeof globalThis._maskFunction === 'function') {
+                globalThis._maskFunction(get, 'get ' + name);
+                globalThis._maskFunction(set, 'set ' + name);
+            }
+            try {
+                Object.defineProperty(globalThis, name, {
+                    get, set, enumerable: true, configurable: true,
+                });
+            } catch (_) { /* ignore */ }
+        };
+        for (const name of Object.getOwnPropertyNames(globalThis)) {
+            if (/^on[a-z]/.test(name)) convert(name);
+        }
+        for (const name of INSTANCE_ATTRS) convert(name);
+    })();
+
 })(globalThis);

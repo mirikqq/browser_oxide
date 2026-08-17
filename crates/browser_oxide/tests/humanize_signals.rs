@@ -20,7 +20,13 @@
 use browser_oxide::stealth::presets::chrome_148_macos;
 use browser_oxide::Page;
 
+// The ambient cursor cycle visits *real* interactive elements — moving to random
+// viewport coordinates is itself a bot tell — so a fixture with nothing to visit
+// produces only the two seeding moves and no distribution to measure.
 const HTML: &str = r#"<!doctype html><html><head><title>humanize</title></head><body>
+<a href='#one' style="position:absolute;left:40px;top:60px">one</a>
+<button type="button" style="position:absolute;left:300px;top:200px">two</button>
+<input style="position:absolute;left:120px;top:400px">
 <script>
   globalThis.__events = [];
   globalThis.__lastMove = null;

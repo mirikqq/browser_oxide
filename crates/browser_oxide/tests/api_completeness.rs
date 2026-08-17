@@ -74,9 +74,17 @@ async fn ctor_highlight_exists() {
 async fn ctor_highlight_registry_exists() {
     assert_ctor("HighlightRegistry").await
 }
+/// `CSSPseudoElement` is not in Chrome's global namespace — checked against a
+/// real Chrome 148, where `Object.getOwnPropertyNames(window)` does not list it.
+/// Having it was a difference in the direction that gets reported as an unusual
+/// window property, so the expectation is inverted rather than the name restored.
 #[tokio::test]
-async fn ctor_css_pseudo_element_exists() {
-    assert_ctor("CSSPseudoElement").await
+async fn ctor_css_pseudo_element_is_absent_like_in_chrome() {
+    let t = evaluate("typeof globalThis.CSSPseudoElement").await;
+    assert_eq!(
+        t, "undefined",
+        "CSSPseudoElement нет в глобалах Chrome — не должно быть и у нас"
+    );
 }
 #[tokio::test]
 async fn ctor_static_range_exists() {

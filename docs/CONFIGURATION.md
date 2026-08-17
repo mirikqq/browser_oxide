@@ -103,9 +103,10 @@ are *profiling* flags — they have nothing to do with stealth **profiles**
 | Variable | Effect |
 |----------|--------|
 | `BROWSER_OXIDE_BUILD_PROFILE` | Log build-phase (parse + inline-script) timing. |
-| `BROWSER_OXIDE_WARM_PROFILE` | Log warm-navigation timing. |
+| `BROWSER_OXIDE_WARM_PROFILE` | Log warm-navigation timing, including per-script execution time and size. |
 | `BROWSER_OXIDE_EVENT_LOOP_PROFILE` / `BROWSER_OXIDE_EVENT_LOOP_PROFILE_LABEL` | Profile the event loop (the label tags the output for comparison). |
 | `BROWSER_OXIDE_SAMPLE_PROFILE` | Enable sampling-profile output in `sweep_metrics` (chrome profile only). |
+| `BROWSER_OXIDE_V8_FLAGS` | Pass flags straight to V8, e.g. `--trace-gc --trace-deopt --no-opt`. Read once, before the first isolate. |
 
 ## Sweeps (`sweep_metrics` example)
 

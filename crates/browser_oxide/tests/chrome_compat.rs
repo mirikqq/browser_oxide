@@ -5981,7 +5981,7 @@ async fn webgl_param_golden_snapshot_chrome_148_linux() {
 // v0.1.0-parity Fix 5 — keystroke generator wiring
 // The Rust CMU+Buffalo bigram-modulated keystroke generator existed
 // (behavior.rs:421-464) but humanize.js never called it. It is now
-// exposed via `Symbol.for('__browser_oxide_keystroke_schedule__')` and
+// exposed via `Symbol.for('#k')` and
 // humanize.js consumes it on input focusin.
 // ================================================================
 
@@ -5990,7 +5990,7 @@ async fn keystroke_schedule_slot_installed_and_monotonic() {
     let result = check(
         r#"
         (() => {
-            const fn = globalThis[Symbol.for('__browser_oxide_keystroke_schedule__')];
+            const fn = (function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return {};})().keystrokes;
             if (typeof fn !== 'function') return JSON.stringify({err: 'slot missing'});
             const sch = fn('abc', 50);
             if (!Array.isArray(sch) || sch.length === 0) return JSON.stringify({err: 'empty schedule', sch});
@@ -6041,8 +6041,7 @@ async fn behavior_rand_slot_installed_and_in_unit_range() {
     let result = check(
         r#"
         (() => {
-            const sym = Symbol.for('__browser_oxide_behavior_rand__');
-            const fn = globalThis[sym];
+            const fn = (function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return {};})().rand;
             if (typeof fn !== 'function') return JSON.stringify({err: 'slot missing'});
             const a = fn();
             const b = fn();
@@ -6191,7 +6190,7 @@ async fn raf_cadence_jitter() {
     let result = check(
         r#"
         (() => {
-            const fn = globalThis[Symbol.for('__browser_oxide_raf_jitter_ms__')];
+            const fn = (function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return {};})().rafDelayMs;
             if (typeof fn !== 'function') return JSON.stringify({err: 'sampler missing'});
             const n = 1000;
             const xs = new Array(n);

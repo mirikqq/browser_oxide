@@ -485,6 +485,44 @@ impl Drop for Page {
     }
 }
 
+/// JS that resolves the engine's symbol-keyed internal namespace.
+///
+/// Host-injected scripts run after `cleanup_bootstrap` has removed `Deno`, so
+/// they need a handle left behind by the bootstrap. It is symbol-keyed rather
+/// than a `__bo_*` global because `Object.getOwnPropertyNames(window)` — the
+/// standard fingerprinting sweep — lists non-enumerable string keys but never
+/// symbols.
+const NS_RESOLVE: &str = "(function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()";
+
+/// Tell the DOM which script the host is about to run.
+///
+/// `document.currentScript` cannot be derived inside the page here: the host
+/// executes each of the document's scripts itself, one `execute_script` at a
+/// time, so nothing in JS knows which element the code came from. This used to
+/// go through a `__browser_oxide` global that the cleanup pass deletes, so every
+/// call threw into a discarded result and `currentScript` was null for the whole
+/// document — wrong for any library that locates its own tag, and a tell, since
+/// a browser always has it set while a classic script runs.
+fn set_current_script_js(node_id: impl std::fmt::Display) -> String {
+    format!(
+        "(function(){{var ns={NS_RESOLVE};if(ns&&ns.script)ns.script.setCurrent({node_id});}})()"
+    )
+}
+
+/// Companion to [`set_current_script_js`]: `currentScript` is null outside a
+/// script.
+///
+/// The reset is queued as a microtask, matching HTML's "clean up after running
+/// script": the microtask checkpoint runs while the element is still
+/// `document.currentScript`, and only then is it restored. Each script here is
+/// its own `execute_script` and deno_core drains microtasks afterwards, so an
+/// inline reset landed ahead of every microtask the script had just queued and
+/// those all read null. See `_evalAsScript` in `dom_bootstrap.js` for the same
+/// fix on the dynamically-inserted-script path.
+fn clear_current_script_js() -> String {
+    format!("(function(){{var ns={NS_RESOLVE};if(ns&&ns.script)ns.script.clearLater();}})()")
+}
+
 impl Page {
     /// Simulate a user switching to another tab and then coming back.
     /// This defeats macro-behavioral heuristics that flag sessions
@@ -612,15 +650,11 @@ impl Page {
                 // W2.7 — name inline scripts with document URL (Chrome
                 // parity) instead of letting V8 default to <anonymous>.
                 // document.currentScript parity (see build_page_with_scripts_init_and_storage).
-                let _ = event_loop.execute_script(&format!(
-                    "globalThis.__browser_oxide._setCurrentScript(globalThis.__browser_oxide._wrapNode({}))",
-                    script.node_id
-                ));
+                let _ = event_loop.execute_script(&set_current_script_js(script.node_id));
                 if let Err(e) = event_loop.execute_script_with_name(&script.code, url) {
                     tracing::warn!(script_index = i, error = %e, "Script error in inline script");
                 }
-                let _ =
-                    event_loop.execute_script("globalThis.__browser_oxide._setCurrentScript(null)");
+                let _ = event_loop.execute_script(&clear_current_script_js());
             }
         }
 
@@ -667,19 +701,16 @@ impl Page {
             }
             // W2.7 — Chrome parity: inline scripts report the document URL.
             // document.currentScript parity (see build_page_with_scripts_init_and_storage).
-            let _ = self.event_loop.execute_script(&format!(
-                "globalThis.__browser_oxide._setCurrentScript(globalThis.__browser_oxide._wrapNode({}))",
-                script.node_id
-            ));
+            let _ = self
+                .event_loop
+                .execute_script(&set_current_script_js(script.node_id));
             if let Err(e) = self
                 .event_loop
                 .execute_script_with_name(&script.code, &self.url)
             {
                 tracing::warn!(script_index = i, error = %e, "Script error in inline script");
             }
-            let _ = self
-                .event_loop
-                .execute_script("globalThis.__browser_oxide._setCurrentScript(null)");
+            let _ = self.event_loop.execute_script(&clear_current_script_js());
         }
     }
 
@@ -747,7 +778,17 @@ impl Page {
         crate::js_runtime::extensions::fetch_ext::set_fetch_client(client.clone());
 
         // Execute scripts in document order
-        for (i, script) in scripts.iter().enumerate() {
+        // `async` scripts run after DOMContentLoaded, not at their document
+        // position: the markup they attach to is built by earlier scripts'
+        // DOMContentLoaded handlers. Same reasoning as the warm path.
+        let mut cold_async: Vec<(String, String)> = Vec::new();
+
+        // Same grouping as the warm path: blocking scripts, then `defer`.
+        let mut cold_order: Vec<usize> = (0..scripts.len()).collect();
+        cold_order.sort_by_key(|&i| u8::from(scripts[i].defer));
+
+        for i in cold_order {
+            let script = &scripts[i];
             if let Some(src) = &script.src {
                 if let Some(full_url) = Self::resolve_url(url, src) {
                     // CSP gate — same enforcement point as the parallel
@@ -770,16 +811,16 @@ impl Page {
                         Ok(resp) => {
                             let code = resp.text();
                             // document.currentScript parity (see build_page_with_scripts_init_and_storage).
-                            let _ = event_loop.execute_script(&format!(
-                                "globalThis.__browser_oxide._setCurrentScript(globalThis.__browser_oxide._wrapNode({}))",
-                                script.node_id
-                            ));
-                            if let Err(e) = event_loop.execute_script(&code) {
+                            let _ =
+                                event_loop.execute_script(&set_current_script_js(script.node_id));
+                            if script.is_async {
+                                // Held back until after DOMContentLoaded — see
+                                // `cold_async` below.
+                                cold_async.push((src.clone(), code));
+                            } else if let Err(e) = event_loop.execute_script(&code) {
                                 tracing::warn!(script_src = %src, error = %e, "Script error in external script");
                             }
-                            let _ = event_loop.execute_script(
-                                "globalThis.__browser_oxide._setCurrentScript(null)",
-                            );
+                            let _ = event_loop.execute_script(&clear_current_script_js());
                         }
                         Err(e) => {
                             tracing::warn!(script_src = %src, error = %e, "Failed to fetch script")
@@ -788,15 +829,11 @@ impl Page {
                 }
             } else if !script.code.is_empty() {
                 // document.currentScript parity (see build_page_with_scripts_init_and_storage).
-                let _ = event_loop.execute_script(&format!(
-                    "globalThis.__browser_oxide._setCurrentScript(globalThis.__browser_oxide._wrapNode({}))",
-                    script.node_id
-                ));
+                let _ = event_loop.execute_script(&set_current_script_js(script.node_id));
                 if let Err(e) = event_loop.execute_script(&script.code) {
                     tracing::warn!(script_index = i, error = %e, "Script error in inline script");
                 }
-                let _ =
-                    event_loop.execute_script("globalThis.__browser_oxide._setCurrentScript(null)");
+                let _ = event_loop.execute_script(&clear_current_script_js());
             }
         }
 
@@ -806,7 +843,18 @@ impl Page {
         // `globalThis.__browser_oxide.__documentReadyState = ...` assignments preserve
         // enumerable=false (writable=true, descriptor inherited).
         event_loop
-            .execute_script("globalThis._browser_oxide.__documentReadyState = 'loading';")
+            .execute_script("(((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__documentReadyState = 'loading';")
+            .ok();
+
+        // Spec order ("the end", steps 4-5): readyState becomes "interactive"
+        // *before* DOMContentLoaded is dispatched, not after. Widgets defer their
+        // init to this event and then re-check the state inside the handler — the
+        // ubiquitous `if (document.readyState !== 'loading') init()` guard. Seeing
+        // "loading" there, a widget concludes it is still too early and waits for
+        // an event that has already fired, so it loads, exposes its whole API and
+        // silently never renders. hCaptcha's auto-render is one of these.
+        event_loop
+            .execute_script("(((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__documentReadyState = 'interactive';")
             .ok();
 
         // Fire DOMContentLoaded and load events — many scripts wait for these
@@ -816,10 +864,13 @@ impl Page {
             )
             .ok();
 
-        // After DOMContentLoaded, readyState = interactive
-        event_loop
-            .execute_script("globalThis._browser_oxide.__documentReadyState = 'interactive';")
-            .ok();
+        // Async scripts, now that the page's own DOMContentLoaded handlers have
+        // run and built whatever markup they build.
+        for (src, code) in std::mem::take(&mut cold_async) {
+            if let Err(e) = event_loop.execute_script_with_name(&code, &src) {
+                tracing::warn!(script_src = %src, error = %e, "Script error in async script");
+            }
+        }
 
         // Spec order: the document is "complete" BEFORE the load event fires
         // ("the end", step 7). Setting it afterwards also made it fragile — a heavy
@@ -828,7 +879,7 @@ impl Page {
         // readyState stuck at 'interactive' forever. The nav loop then believes the
         // page never finished and burns its whole budget on a page that is done.
         event_loop
-            .execute_script("globalThis._browser_oxide.__documentReadyState = 'complete';")
+            .execute_script("(((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__documentReadyState = 'complete';")
             .ok();
 
         event_loop
@@ -920,7 +971,9 @@ impl Page {
         // Parent → children.
         let outbound: Vec<String> = self
             .event_loop
-            .execute_script("JSON.stringify(globalThis.__bo_frames.takeChildMessages())")
+            .execute_script(&format!(
+                "JSON.stringify({NS_RESOLVE}.frames.takeChildMessages())"
+            ))
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
@@ -940,43 +993,96 @@ impl Page {
                 continue;
             };
             // Deliver as a real MessageEvent so listeners registered the normal way
-            // (addEventListener('message') / onmessage) see it.
+            // (addEventListener('message') / onmessage) see it. `source` is the
+            // embedder's window — a frame that answers via `event.source` must be
+            // able to reach back.
             let js = format!(
                 "(function(){{var m={json};\
-                 var ev=new MessageEvent('message',{{data:m.data,origin:m.origin,source:null}});\
-                 globalThis.dispatchEvent(ev);\
-                 if(typeof globalThis.onmessage==='function')globalThis.onmessage(ev);}})()"
+                 var ev=new MessageEvent('message',\
+                   {{data:m.data,origin:m.origin,source:globalThis.parent||null}});\
+                 globalThis.dispatchEvent(ev);}})()"
             );
             if child.event_loop.execute_script(&js).is_ok() {
                 to_children += 1;
             }
         }
 
-        // Children → parent.
+        // Children → parent. The sending frame's node id travels with each message:
+        // the embedder replies with `event.source.postMessage(...)`, and without a
+        // source it has no handle on the frame that spoke to it. hCaptcha's widget
+        // ends its handshake with `site-setup` and then waits for exactly that
+        // reply, so a null source stalls the challenge with no error anywhere.
         let mut to_parent = 0usize;
-        let mut inbound: Vec<String> = Vec::new();
+        let mut inbound: Vec<(u32, String)> = Vec::new();
         for child in self.children.iter_mut() {
-            if let Ok(raw) = child
-                .event_loop
-                .execute_script("JSON.stringify(globalThis.__bo_frames.takeParentMessages())")
-            {
+            let node_id = child.node_id.to_raw();
+            if let Ok(raw) = child.event_loop.execute_script(&format!(
+                "JSON.stringify({NS_RESOLVE}.frames.takeParentMessages())"
+            )) {
                 if let Ok(list) = serde_json::from_str::<Vec<String>>(&raw) {
-                    inbound.extend(list);
+                    inbound.extend(list.into_iter().map(|j| (node_id, j)));
                 }
             }
         }
-        for json in inbound {
+        for (node_id, json) in inbound {
             let js = format!(
                 "(function(){{var m={json};\
-                 var ev=new MessageEvent('message',{{data:m.data,origin:m.origin,source:null}});\
-                 globalThis.dispatchEvent(ev);\
-                 if(typeof globalThis.onmessage==='function')globalThis.onmessage(ev);}})()"
+                 var src=null;\
+                 try{{src={NS_RESOLVE}.frames.windowForNode({node_id});}}catch(_){{}}\
+                 var ev=new MessageEvent('message',{{data:m.data,origin:m.origin,source:src}});\
+                 globalThis.dispatchEvent(ev);}})()"
             );
             if self.event_loop.execute_script(&js).is_ok() {
                 to_parent += 1;
             }
         }
         (to_children, to_parent)
+    }
+
+    /// `(node_id, url)` for every materialized child frame, in materialization
+    /// order — which is *not* DOM order, so this is the only reliable way to tell
+    /// which `<iframe>` element a child realm actually belongs to.
+    pub fn child_frame_ids(&mut self) -> Vec<(u32, String)> {
+        self.children
+            .iter_mut()
+            .map(|c| {
+                let url = c
+                    .evaluate("String(location.href)")
+                    .unwrap_or_else(|_| "?".into());
+                (c.node_id.to_raw(), url)
+            })
+            .collect()
+    }
+
+    /// `(node_id, position among the top document's `<iframe>` elements)` for
+    /// every materialized child frame, in materialization order.
+    ///
+    /// The position is `None` when the element the realm was built for is no
+    /// longer in the tree. Pairs with [`Self::child_frame_ids`], and exists
+    /// because the two orders diverge the moment a widget injects a frame ahead
+    /// of one that was materialized earlier: a consumer that pairs realm *n*
+    /// with the *n*-th `<iframe>` then attributes one frame's document to
+    /// another, or reads past the end and sees nothing at all.
+    pub fn child_frame_dom_slots(&mut self) -> Vec<(u32, Option<usize>)> {
+        let js = format!(
+            "(function(){{var ns={NS_RESOLVE};if(!ns||!ns.frames)return '';\
+             var f=document.querySelectorAll('iframe'),out=[];\
+             for(var i=0;i<f.length;i++)out.push(ns.frames.nodeIdOf(f[i]));\
+             return out.join(',');}})()"
+        );
+        let raw = self.evaluate(&js).unwrap_or_default();
+        let in_tree: Vec<u32> = raw
+            .trim_matches('"')
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        self.children
+            .iter()
+            .map(|c| {
+                let id = c.node_id.to_raw();
+                (id, in_tree.iter().position(|&seen| seen == id))
+            })
+            .collect()
     }
 
     /// Run each child iframe's event loop for up to `slice`.
@@ -1065,6 +1171,46 @@ impl Page {
             let dom_state = state.borrow::<crate::js_runtime::state::DomState>();
             iframe::find_iframes(&dom_state.dom)
         };
+        // Apply the browsing-context lifecycle the DOM recorded since the last
+        // pass. Dropping the realm is all that is needed for both cases: a frame
+        // still in the tree is rebuilt below from its current attributes, and one
+        // that left the tree is not found by the scan and so stays gone.
+        let invalidated: Vec<u32> = {
+            let dom_ref = self.event_loop.runtime_mut().inner();
+            let state = dom_ref.op_state();
+            let mut state = state.borrow_mut();
+            let dom_state = state.borrow_mut::<crate::js_runtime::state::DomState>();
+            std::mem::take(&mut dom_state.invalidated_frames)
+        };
+        if !invalidated.is_empty() {
+            // A mutation only says the frame *may* have navigated. Rebuilding on
+            // the signal alone is an unbounded fetch loop — widgets re-append and
+            // re-attribute their own frames on every tick — so the realm is
+            // discarded only when its element is gone or its source actually
+            // changed.
+            let live: std::collections::HashMap<u32, String> = iframes
+                .iter()
+                .map(|i| {
+                    let src = i
+                        .srcdoc
+                        .clone()
+                        .or_else(|| i.src.clone())
+                        .unwrap_or_default();
+                    (i.node_id.to_raw(), src)
+                })
+                .collect();
+            self.children.retain(|c| {
+                let id = c.node_id.to_raw();
+                if !invalidated.contains(&id) {
+                    return true;
+                }
+                match live.get(&id) {
+                    None => false,
+                    Some(src) => src == &c.source,
+                }
+            });
+        }
+
         let already: Vec<_> = self.children.iter().map(|c| c.node_id).collect();
         let mut materialized = 0usize;
         for info in &iframes {
@@ -1073,7 +1219,10 @@ impl Page {
             }
             if let Some(srcdoc) = &info.srcdoc {
                 match iframe::ChildIframe::from_srcdoc(info.node_id, srcdoc, profile).await {
-                    Ok(child) => {
+                    Ok(mut child) => {
+                        // Store the raw attribute, not the resolved document: the
+                        // staleness check above compares against what the DOM holds.
+                        child.source = srcdoc.clone();
                         self.children.push(child);
                         materialized += 1;
                     }
@@ -1092,7 +1241,8 @@ impl Page {
                     )
                     .await
                     {
-                        Ok(child) => {
+                        Ok(mut child) => {
+                            child.source = src.clone();
                             self.children.push(child);
                             materialized += 1;
                         }
@@ -1289,6 +1439,39 @@ impl Page {
         Self::build_page_with_scripts_and_init(html, url, &profile, &client, &[]).await
     }
 
+    /// What V8 compiled and ran in this page and in every child frame realm.
+    ///
+    /// `None` unless the inspector tap was enabled before the page was built —
+    /// `RuntimeOptions::inspector` is fixed at isolate construction. Child logs
+    /// are folded in so a frame's scripts are not invisible from the embedder.
+    pub fn inspect_snapshot(&mut self) -> Option<crate::js_runtime::inspect::InspectLog> {
+        let mut log = self.event_loop.runtime_mut().inspect_snapshot()?;
+        for child in self.children.iter_mut() {
+            if let Some(c) = child.event_loop.runtime_mut().inspect_snapshot() {
+                log.scripts.extend(c.scripts);
+                log.failures.extend(c.failures);
+                log.contexts.extend(c.contexts);
+                log.exceptions.extend(c.exceptions);
+            }
+        }
+        Some(log)
+    }
+
+    /// Outstanding async work in this page and its frames, summed:
+    /// `(ops, timers, intervals, resources)`. All zero means the JavaScript has
+    /// genuinely finished rather than merely having been compiled.
+    pub fn pending_work(&mut self) -> (u32, u32, u32, u32) {
+        let (mut a, mut b, mut c, mut d) = self.event_loop.pending_work();
+        for child in self.children.iter_mut() {
+            let (x, y, z, w) = child.event_loop.pending_work();
+            a += x;
+            b += y;
+            c += z;
+            d += w;
+        }
+        (a, b, c, d)
+    }
+
     /// Drain buffered console output from this page **and every child frame**, as
     /// `(level, text)` pairs where level is `log` / `warn` / `error` / `info`.
     ///
@@ -1381,7 +1564,7 @@ impl Page {
     /// Generic navigation entry point.
     ///
     /// Loops by re-fetching whenever a script sets
-    /// `globalThis.__pendingNavigation` (via `location.reload`,
+    /// `(((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).__pendingNavigation` (via `location.reload`,
     /// `location.href = ...`, `location.assign/replace`, or a
     /// `<meta http-equiv="refresh">` tag). Each iteration drops the
     /// previous V8 isolate and builds a fresh one — identical to how a
@@ -1712,10 +1895,10 @@ impl Page {
     ///   reset so the new page's fetches aren't mixed with the old's.
     /// - `window.__cookieWrites`, `window.__scriptErrors` —
     ///   instrumentation buffers re-initialised per page.
-    /// - `globalThis.__bo_input_events` (mouse / key / touch / scroll
+    /// - the symbol-keyed input buffer (mouse / key / touch / scroll
     ///   buffers + counters) — humanize.js re-installs into these and
     ///   sensors read them on POST, so stale values would skew detection.
-    /// - `globalThis.__jsCookies` — cookie cache snapshot (the real
+    /// - `(((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).__jsCookies` — cookie cache snapshot (the real
     ///   source of truth is the HTTP client's jar, re-synced below).
     /// - `globalThis.__keepLongTimersRefed` — per-navigation challenge
     ///   flag; left set, it would pin long timers on every later page.
@@ -1729,39 +1912,61 @@ impl Page {
         let _ = self.event_loop.execute_script(
             r#"(function() {
                 const g = globalThis;
-                try { g.__cancelAllTimers && g.__cancelAllTimers(); } catch (_) {}
-                try { g.__cancelAllListeners && g.__cancelAllListeners(); } catch (_) {}
-                try { g.__resetDomRegistries && g.__resetDomRegistries(); } catch (_) {}
-                try { g.__resetCustomElements && g.__resetCustomElements(); } catch (_) {}
+                // The reset hooks moved onto the internal namespace when the
+                // named globals came off `window`; calling them through `g` kept
+                // compiling and silently did nothing. Measured cost of that: every
+                // warm navigation retained its predecessor, ~17 MB of unreclaimable
+                // V8 heap per load of a heavy page.
+                const _h = (function () {
+                    try {
+                        const s = Object.getOwnPropertySymbols(globalThis);
+                        for (let i = 0; i < s.length; i++) {
+                            const v = globalThis[s[i]];
+                            if (v && v.__bo && v.host) return v.host;
+                        }
+                    } catch (_) {}
+                    return {};
+                })();
+                const bo = _h.bo || g._browser_oxide;
+                const call = (name) => {
+                    const fn = _h[name] || g[name];
+                    try { if (typeof fn === 'function') fn(); } catch (_) {}
+                };
+                call('__cancelAllTimers');
+                call('__cancelAllListeners');
+                call('__resetDomRegistries');
+                call('__resetCustomElements');
                 try { delete g.__keepLongTimersRefed; } catch (_) {}
-                if (g._browser_oxide) {
-                    g._browser_oxide.__pendingNavigation = null;
-                    if (Array.isArray(g._browser_oxide.__fetchLog)) {
-                        g._browser_oxide.__fetchLog.length = 0;
+                if (bo) {
+                    bo.__pendingNavigation = null;
+                    if (Array.isArray(bo.__fetchLog)) {
+                        bo.__fetchLog.length = 0;
                     }
                 }
                 const w = (g.window && g.window !== g) ? g.window : g;
                 try { if (Array.isArray(w.__cookieWrites)) w.__cookieWrites.length = 0; } catch (_) {}
                 try { if (Array.isArray(w.__scriptErrors)) w.__scriptErrors.length = 0; } catch (_) {}
-                if (g.__bo_input_events) {
-                    g.__bo_input_events.mouse.length = 0;
-                    g.__bo_input_events.key.length = 0;
-                    g.__bo_input_events.touch.length = 0;
-                    g.__bo_input_events.scroll.length = 0;
-                    if (g.__bo_input_events.counters) {
-                        g.__bo_input_events.counters.key = 0;
-                        g.__bo_input_events.counters.mouse = 0;
-                        g.__bo_input_events.counters.touch = 0;
-                        g.__bo_input_events.counters.scroll = 0;
-                        g.__bo_input_events.counters.accel = 0;
+                var _ns = (function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})();
+                if (_ns && _ns.input) {
+                    _ns.input.mouse.length = 0;
+                    _ns.input.key.length = 0;
+                    _ns.input.touch.length = 0;
+                    _ns.input.scroll.length = 0;
+                    if (_ns.input.counters) {
+                        _ns.input.counters.key = 0;
+                        _ns.input.counters.mouse = 0;
+                        _ns.input.counters.touch = 0;
+                        _ns.input.counters.scroll = 0;
+                        _ns.input.counters.accel = 0;
                     }
                 }
-                if (g.__jsCookies) g.__jsCookies = {};
+                if (_h.__jsCookies) _h.__jsCookies = {};
+                else if (g.__jsCookies) g.__jsCookies = {};
                 // Last: drop everything the previous page's scripts hung
                 // off `window`. Runs after the buffer resets above so those
                 // engine-owned names are already back to a clean value (they
                 // are baseline-allowlisted, so this does not remove them).
-                try { g.__resetPageGlobals && g.__resetPageGlobals(); } catch (_) {}
+                call('__resetPageGlobals');
             })();"#,
         );
         // Reap Workers the OUTGOING page spawned but never terminated. The
@@ -1804,6 +2009,21 @@ impl Page {
     /// the warm path is a known follow-up (see the comment above
     /// `Self::navigate_loop_internal`).
     pub async fn navigate_warm(&mut self, url: &str) -> Result<(), deno_core::error::AnyError> {
+        self.navigate_warm_with_init(url, &[]).await
+    }
+
+    /// Warm navigation that first runs `init_scripts` in the fresh document.
+    ///
+    /// They execute after the DOM swap and `location` update but before a single
+    /// line of the page's own code, which is the only window in which anything can
+    /// be observed or replaced before the page sees it. The cold path has had this
+    /// since the start; the warm one did not, so a pooled page could not be
+    /// instrumented at all — and the pool is what every driver actually uses.
+    pub async fn navigate_warm_with_init(
+        &mut self,
+        url: &str,
+        init_scripts: &[String],
+    ) -> Result<(), deno_core::error::AnyError> {
         let warm_trace = std::env::var("BROWSER_OXIDE_WARM_PROFILE").is_ok();
         let warm_t0 = std::time::Instant::now();
         macro_rules! wmark {
@@ -1955,7 +2175,7 @@ impl Page {
                 let client = client.clone();
                 let profile = profile.clone();
                 let referer = resp_url.clone();
-                Some(async move {
+                Some((i, async move {
                     // Script fetches inherit the parent doc's
                     // regional accept-language (real Chrome sends one
                     // accept-language per session, not per-URL — keyed off
@@ -1997,12 +2217,42 @@ impl Page {
                             None
                         }
                     }
-                })
+                }))
             })
             .collect();
+
+        // Blocking and `defer` scripts execute in document order, so nothing is
+        // lost by waiting for all of them. `async` ones are held as live tasks and
+        // drained by completion below.
+        // `async` scripts are held as live tasks; the ordered ones are joined as
+        // before. Only the async half needs arrival timing — that is the half whose
+        // position in the page is decided by when its download finishes.
+        let async_indices: std::collections::HashSet<usize> = scripts_meta
+            .iter()
+            .enumerate()
+            .filter(|(_, sc)| sc.is_async && sc.src.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        // `async` scripts are live tasks — their position in the page is decided by
+        // when their download finishes. The ordered ones are still joined up front.
+        //
+        // Driving those by arrival too is what a browser does, and it is what Epic's
+        // flow needs: there, an SDK that injects its own copy of a library must find
+        // the page's own `<script async>` copy already loaded. It is not enabled
+        // because arrival-driven blocking scripts expose a second gap — a pooled
+        // page reports the previous document's `readyState`, so a library asking
+        // "am I too late?" is told yes and never attaches. Fixing that by resetting
+        // the state to "loading" then costs Talon its initialisation, for reasons
+        // not yet understood. All three behaviours are one lifecycle question.
+        let (async_futs, sync_futs): (Vec<_>, Vec<_>) = script_futures
+            .into_iter()
+            .partition(|(i, _)| async_indices.contains(i));
+        let mut async_pending: futures_util::stream::FuturesUnordered<_> =
+            async_futs.into_iter().map(|(_, f)| f).collect();
+
         let (fetched_css, fetched_scripts) = futures_util::future::join(
             futures_util::future::join_all(css_futures),
-            futures_util::future::join_all(script_futures),
+            futures_util::future::join_all(sync_futs.into_iter().map(|(_, f)| f)),
         )
         .await;
         wmark!("subresources fetched");
@@ -2035,6 +2285,22 @@ impl Page {
         }
         wmark!("replace_dom");
 
+        // Back to `loading` for the new document. Only the cold build did this,
+        // so a pooled page carried `complete` over from the previous navigation
+        // and every script of the new document ran seeing
+        // `document.readyState === 'complete'` — a state a real browser never
+        // shows while it is still running the document's scripts.
+        //
+        // Anything that branches on it took the wrong branch. Next.js closes its
+        // RSC stream on `DOMContentLoaded`, and registers that listener only
+        // when `readyState === 'loading'`; seeing `complete` it closed the
+        // stream immediately, after 2 of the payload's 11 chunks, and React
+        // failed the hydration with `Connection closed.`
+        let _ = self.event_loop.execute_script(&format!(
+            "(function(){{var ns={NS_RESOLVE};\
+             if(ns&&ns.host&&ns.host.bo)ns.host.bo.__documentReadyState='loading';}})()"
+        ));
+
         // Build-phase deadline watcher — preempts CPU-bound inline-script
         // spins on the warm isolate the same way the cold build does.
         let build_budget_ms: u64 = std::env::var("BROWSER_OXIDE_BUILD_BUDGET_MS")
@@ -2055,6 +2321,30 @@ impl Page {
             .execute_script(&format!("location.href = '{}';", url_js));
         self.event_loop.reset_nav_pending();
 
+        // Init scripts, before anything the page ships.
+        for script in init_scripts {
+            if let Err(e) = self.event_loop.execute_script(script) {
+                tracing::warn!(error = %e, "warm init script error");
+            }
+        }
+
+        // Secure context follows the document, and this path replaces the
+        // document. A pooled page is built once on a blank document and reused,
+        // so without this it reports an insecure context for the rest of its life
+        // — on an https origin, which no real browser does. Everything gated on it
+        // reads as a headless browser, `Notification.permission` most visibly:
+        // "denied" where Chrome says "default" is one of the oldest bot signals.
+        {
+            let secure = is_secure_url(&resp_url);
+            let op_state = self.event_loop.runtime_mut().op_state();
+            let mut op_state = op_state.borrow_mut();
+            if let Some(stealth) = op_state
+                .try_borrow_mut::<crate::js_runtime::extensions::stealth_ext::StealthState>()
+            {
+                stealth.is_secure_context = secure;
+            }
+        }
+
         // Refresh `document.cookie` for the new origin. Fast op call,
         // 50 ms cap is plenty (same as the cold path).
         let _ = self
@@ -2065,10 +2355,92 @@ impl Page {
             )
             .await;
 
-        // Run inline + external scripts in document order, draining
-        // between each so microtasks land before the next script reads
-        // them. Mirrors the cold path's script loop.
-        for (i, script) in scripts_meta.iter().enumerate() {
+        // Scripts run in document order: parser-blocking first, then `defer`.
+        // `async` ones are held until after DOMContentLoaded (see below).
+        //
+        // A browser instead runs each as its own download completes, and that
+        // overlap decides real ordering questions — measured here, an SDK that
+        // injects its own copy of a library beats the page's own `<script async>`
+        // for it, and the page then talks to the discarded instance. Reproducing
+        // that faithfully needs the whole document lifecycle to be event-driven,
+        // not a batch with an ordering rule; attempting it as a local change to
+        // this loop broke pages that build their markup in a DOMContentLoaded
+        // handler, so the batch stays until the lifecycle work lands.
+        use futures_util::StreamExt;
+        macro_rules! run_arrived {
+            ($item:expr) => {
+                if let Some((idx, code, timings)) = $item {
+                    self.event_loop.runtime_mut().record_resource_timing(timings);
+                    // Resolved against the document, not taken raw. A `src` is
+                    // usually relative, and for a `<script type="module">` this
+                    // string becomes the module specifier: `ModuleSpecifier::parse`
+                    // rejects a relative one, so the module never ran at all.
+                    //
+                    // It failed in silence — the error goes to `tracing`, and a
+                    // host without a subscriber drops it — so a 1.27 MB Angular
+                    // bundle "executed" in 0 ms and the page simply stayed as the
+                    // server had rendered it: no hydration, no event handlers, and
+                    // whatever placeholder markup the server shipped left standing.
+                    let name = match &scripts_meta[idx].src {
+                        Some(src) => url::Url::parse(&resp_url)
+                            .and_then(|base| base.join(src))
+                            .map(|u| u.to_string())
+                            .unwrap_or_else(|_| src.clone()),
+                        None => resp_url.clone(),
+                    };
+                    let len = code.len();
+                    // `document.currentScript` for the warm path too — the cold
+                    // build sets it around every script and this loop did not,
+                    // so a real navigation ran the whole document with it null
+                    // while the synthetic-HTML path looked correct.
+                    let _ = self
+                        .event_loop
+                        .execute_script(&set_current_script_js(scripts_meta[idx].node_id));
+                    let t_script = std::time::Instant::now();
+                    // Script failures also go to the warm trace. `tracing` alone
+                    // drops them entirely in a host that installed no subscriber,
+                    // and a module that refuses to load looks exactly like one that
+                    // ran instantly — which is how a 1.27 MB bundle failing on its
+                    // first line went unnoticed.
+                    if scripts_meta[idx].is_module {
+                        if let Err(e) = self.event_loop.eval_module_code(&name, code).await {
+                            tracing::warn!(script = %name, error = %e, "async module error");
+                            if warm_trace {
+                                eprintln!("[warm]   МОДУЛЬ НЕ ВЫПОЛНЕН {name}: {e}");
+                            }
+                        }
+                    } else if let Err(e) = self.event_loop.execute_script_with_name(&code, &name) {
+                        tracing::warn!(script = %name, error = %e, "async script error");
+                        if warm_trace {
+                            eprintln!("[warm]   СКРИПТ НЕ ВЫПОЛНЕН {name}: {e}");
+                        }
+                    }
+                    let _ = self
+                        .event_loop
+                        .execute_script(&clear_current_script_js());
+                    if warm_trace {
+                        eprintln!(
+                            "[warm]   script {:>6}ms {:>7}B {}",
+                            t_script.elapsed().as_millis(),
+                            len,
+                            name
+                        );
+                    }
+                    let _ = self
+                        .event_loop
+                        .run_until_idle(Duration::from_millis(50))
+                        .await;
+                }
+            };
+        }
+
+        let mut order: Vec<usize> = (0..scripts_meta.len())
+            .filter(|i| !async_indices.contains(i))
+            .collect();
+        order.sort_by_key(|&i| u8::from(scripts_meta[i].defer));
+
+        for i in order {
+            let script = &scripts_meta[i];
             let code = if script.src.is_some() {
                 match prefetched.get(&i) {
                     Some(c) => c.clone(),
@@ -2080,49 +2452,38 @@ impl Page {
             if code.trim().is_empty() {
                 continue;
             }
-            let name = script.src.clone().unwrap_or_else(|| resp_url.clone());
-            if script.is_module {
-                // Mirror the cold path (navigate_loop_internal): route
-                // `<script type="module">` through the ES-module loader instead
-                // of classic `execute_script`, which throws `SyntaxError: Cannot
-                // use import statement outside a module` and drops the whole
-                // bundle. Without this the warm/PagePool path serves only the
-                // server shell for every modern Vite/React/Vue SPA — reddit's
-                // 16 module scripts rendered 8 KB warm vs 676 KB cold (the
-                // dominant warm-pool thin-render artifact; the gate runs pooled).
-                // Bounded at 10s/module so a stalled import graph can't hang the
-                // nav; on timeout we log and continue with what rendered.
-                let eval_fut = async {
-                    if let Some(src) = &script.src {
-                        let module_url = url::Url::parse(&resp_url)
-                            .ok()
-                            .and_then(|base| base.join(src).ok())
-                            .map(|u| u.to_string())
-                            .unwrap_or_else(|| src.clone());
-                        self.event_loop
-                            .eval_module_code(&module_url, code.clone())
-                            .await
-                    } else {
-                        let spec = format!("{resp_url}#oxide-mod-{i}");
-                        self.event_loop.eval_module_code(&spec, code.clone()).await
-                    }
-                };
-                match tokio::time::timeout(Duration::from_secs(10), eval_fut).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        tracing::warn!(script = %name, error = %e, "warm ES module eval error")
-                    }
-                    Err(_) => {
-                        tracing::warn!(script = %name, "warm ES module eval timed out (10s) — continuing")
-                    }
-                }
-            } else if let Err(e) = self.event_loop.execute_script_with_name(&code, &name) {
-                tracing::warn!(script = %name, error = %e, "warm script error");
-            }
+            run_arrived!(Some((i, code, crate::net::TimingStats::default())));
+
+            // Turn the event loop between scripts. A browser would not — it keeps
+            // parsing — but this engine has no loop running alongside, so this is
+            // the only place a timer or a network callback gets to run at all.
+            // Measured: shortening it to 2 ms breaks pages whose next script
+            // depends on work the previous one scheduled.
             let _ = self
                 .event_loop
                 .run_until_idle(Duration::from_millis(50))
                 .await;
+
+            // Then give the outstanding `async` downloads a slice — a future only
+            // advances while something polls it, and in a browser parsing and
+            // downloading overlap. The slice is short and skipped entirely once
+            // nothing is in flight: joining a never-completing drain with the loop
+            // burned the full timeout on *every* script, which on a page with a few
+            // hundred of them added ~10 s and pushed DOMContentLoaded past the
+            // watchdogs third-party SDKs arm on themselves.
+            let mut arrived = Vec::new();
+            if !async_pending.is_empty() {
+                let drain = async {
+                    while let Some(done) = async_pending.next().await {
+                        arrived.push(done);
+                    }
+                };
+                let _ = tokio::time::timeout(Duration::from_millis(5), drain).await;
+            }
+            arrived.sort_by_key(|x| x.as_ref().map(|(i, _, _)| *i));
+            for item in arrived {
+                run_arrived!(item);
+            }
         }
         wmark!("scripts executed");
 
@@ -2136,13 +2497,34 @@ impl Page {
         // DOMContentLoaded + load events — same setTimeout(0) trick the
         // cold build uses so dispatched handlers run inside the event
         // loop (not synchronously during setup).
+        //
+        // `readyState` is advanced in spec order around them ("the end", steps
+        // 4-7): interactive *before* DOMContentLoaded, complete *before* load.
+        // This path skipped it entirely, leaving the document "loading" forever —
+        // and a widget that re-checks the state inside its own DOMContentLoaded
+        // handler then waits for an event that has already fired.
         let _ = self.event_loop.execute_script(
             r#"setTimeout(() => {
+                (((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__documentReadyState = 'interactive';
                 document.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true}));
                 window.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true}));
+                (((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__documentReadyState = 'complete';
                 window.dispatchEvent(new Event('load'));
             }, 0);"#,
         );
+
+        // `async` scripts, once the page's own DOMContentLoaded handlers have run
+        // and built whatever markup they build.
+        if !async_pending.is_empty() {
+            let _ = self
+                .event_loop
+                .run_until_idle(Duration::from_millis(300))
+                .await;
+            while let Some(done) = async_pending.next().await {
+                run_arrived!(done);
+            }
+            wmark!("async scripts executed");
+        }
 
         // Meta-refresh scanner — sets `__pendingNavigation` if the page
         // has one. The caller doesn't loop on it (warm path skips the
@@ -2161,7 +2543,7 @@ impl Page {
                     const delay = parseInt(match[1], 10) || 0;
                     const target = ((match[2] || '').trim()).replace(/^['"]|['"]$/g, '') || location.href;
                     setTimeout(() => {
-                        globalThis.__pendingNavigation = { url: target, kind: 'assign' };
+                        ((((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo||{}).__pendingNavigation = { url: target, kind: 'assign' };
                         try { Deno.core.ops.op_set_pending_nav(); } catch (_) {}
                     }, delay * 1000);
                     break;
@@ -2267,7 +2649,7 @@ impl Page {
         }
 
         const PENDING_NAV_JS: &str = "(function(){\
-                const browser_oxide = globalThis._browser_oxide;\
+                const browser_oxide = (((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo;\
                 const p = browser_oxide && browser_oxide.__pendingNavigation;\
                 if (p) browser_oxide.__pendingNavigation = null;\
                 return p ? JSON.stringify({url: p.url, method: p.method || 'GET', body: p.body, kind: p.kind}) : '';\
@@ -2925,7 +3307,7 @@ impl Page {
                         let fl = page
                             .event_loop()
                             .execute_script(
-                                "JSON.stringify((globalThis._browser_oxide&&globalThis._browser_oxide.__fetchLog)||[])",
+                                "JSON.stringify(((((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo&&(((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__fetchLog)||[])",
                             )
                             .unwrap_or_default();
                         let secck = page
@@ -3885,7 +4267,7 @@ impl Page {
             });
             const _origFetch = globalThis.fetch;
             globalThis.fetch = async function(input, init) {
-                const log = globalThis._browser_oxide && globalThis._browser_oxide.__fetchLog;
+                const log = ((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host && ((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()).host.bo && ((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()).host.bo.__fetchLog;
                 const entry = { method: 'GET', url: '', hasBody: false };
                 let args = Array.from(arguments);
 
@@ -3989,7 +4371,7 @@ impl Page {
                     }
                     entry.reqHeaders = hdrs;
                 } catch {}
-                const log = globalThis._browser_oxide && globalThis._browser_oxide.__fetchLog;
+                const log = ((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host && ((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()).host.bo && ((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()).host.bo.__fetchLog;
                 if (log) log.push(entry);
                 try {
                     const resp = await _origFetch.apply(this, args);
@@ -4025,7 +4407,7 @@ impl Page {
                 _XHR.prototype.send = function(body) {
                     const entry = this.__logEntry || { method: this._method||'GET', url: this._url||'', sync: !this._async };
                     entry.hasBody = body != null && body !== '';
-                    const log = globalThis._browser_oxide && globalThis._browser_oxide.__fetchLog;
+                    const log = ((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host && ((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()).host.bo && ((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()).host.bo.__fetchLog;
                 if (log) log.push(entry);
                     const _origRSC = this.onreadystatechange;
                     const self = this;
@@ -4053,7 +4435,7 @@ impl Page {
         // scripts, which start below.
         event_loop
             .execute_script(
-                "globalThis.__markGlobalsBaseline && globalThis.__markGlobalsBaseline();",
+                "(((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).__markGlobalsBaseline && (((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).__markGlobalsBaseline();",
             )
             .ok();
         mark!("__markGlobalsBaseline");
@@ -4154,15 +4536,11 @@ impl Page {
                 // attribute or resolve a relative path) get null otherwise and
                 // silently stall. The _wrapNode/_setCurrentScript hooks already
                 // exist + are exported; this is the missing call site.
-                let _ = event_loop.execute_script(&format!(
-                    "globalThis.__browser_oxide._setCurrentScript(globalThis.__browser_oxide._wrapNode({}))",
-                    script.node_id
-                ));
+                let _ = event_loop.execute_script(&set_current_script_js(script.node_id));
                 if let Err(e) = event_loop.execute_script_with_name(&code, &name) {
                     tracing::warn!(script = %name, error = %e, "Script execution error");
                 }
-                let _ =
-                    event_loop.execute_script("globalThis.__browser_oxide._setCurrentScript(null)");
+                let _ = event_loop.execute_script(&clear_current_script_js());
             }
 
             // Flush logs for this script
@@ -4211,7 +4589,7 @@ impl Page {
                 // 'complete' for any navigated page — frameworks that gate
                 // mounting on readyState==='complete' (or poll it) would
                 // spin/never mount. Fire readystatechange on each transition.
-                try { globalThis._browser_oxide.__documentReadyState = 'interactive'; } catch (_e) {}
+                try { (((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__documentReadyState = 'interactive'; } catch (_e) {}
                 document.dispatchEvent(new Event('readystatechange'));
                 // Each dispatch is isolated: one framework's throwing DOMContentLoaded
                 // handler must not skip the transition to 'complete' below.
@@ -4224,7 +4602,7 @@ impl Page {
             // 'interactive' forever — the nav loop reads that as "still loading" and burns
             // its entire budget (~90s) on a page that has actually finished rendering.
             setTimeout(() => {
-                try { globalThis._browser_oxide.__documentReadyState = 'complete'; } catch (_e) {}
+                try { (((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__documentReadyState = 'complete'; } catch (_e) {}
                 try { document.dispatchEvent(new Event('readystatechange')); } catch (_e) {}
                 try { window.dispatchEvent(new Event('load')); } catch (_e) {}
             }, 0);
@@ -4251,7 +4629,7 @@ impl Page {
                     const delay = parseInt(match[1], 10) || 0;
                     const target = ((match[2] || '').trim()).replace(/^['"]|['"]$/g, '') || location.href;
                     setTimeout(() => {
-                        globalThis.__pendingNavigation = {
+                        ((((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo||{}).__pendingNavigation = {
                             url: target,
                             kind: 'assign',
                         };
@@ -4274,7 +4652,7 @@ impl Page {
         // any short async chains kicked off by inline scripts.
         //
         // Important: `humanize.js` now schedules its synthetic mouse /
-        // scroll timers via `globalThis.__bgSetTimeout` (timer_bootstrap.js)
+        // scroll timers via `(((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).__bgSetTimeout` (timer_bootstrap.js)
         // which is `.unref()`'d — so the humanize setTimeouts no longer
         // pin this drain to its full ceiling. Benign pages exit idle in
         // milliseconds; anti-bot challenge pages (AWS WAF / reddit verify /
@@ -4814,13 +5192,15 @@ mod tests {
         );
     }
 
-    /// Real Chrome on macOS exposes the `window.ApplePaySession`
-    /// constructor; we match that on the macOS UA for fidelity.
-    /// Regression-locks the macOS-conditional shim in window_bootstrap.
+    /// `ApplePaySession` is Safari's, not Chrome's — absent even on macOS.
+    ///
+    /// This test used to assert the opposite, and the shim it locked in put the
+    /// constructor on every macOS profile. Checked against a real Chrome 148 on
+    /// macOS over https: `window.ApplePaySession` is `undefined` there, and a
+    /// global this engine has that the browser it claims to be does not is
+    /// exactly what a namespace comparison reports as an unusual property.
     #[tokio::test]
-    async fn apple_pay_session_present_on_macos_profile() {
-        // ApplePaySession is gated on isSecureContext so the
-        // page must be loaded over https:// for the macOS shim to install.
+    async fn apple_pay_session_absent_on_macos_profile() {
         let profile = crate::stealth::presets::chrome_148_macos();
         let mut page = Page::from_html_with_url(
             "<html><head></head><body></body></html>",
@@ -4831,13 +5211,9 @@ mod tests {
         .unwrap();
         let t = page.evaluate("typeof ApplePaySession").unwrap();
         assert_eq!(
-            t, "function",
-            "macOS profile must expose ApplePaySession constructor"
+            t, "undefined",
+            "ApplePaySession — интерфейс Safari, в Chrome его нет ни на одной платформе"
         );
-        let cmp = page.evaluate("ApplePaySession.canMakePayments()").unwrap();
-        assert_eq!(cmp, "true");
-        let v = page.evaluate("ApplePaySession.supportsVersion(3)").unwrap();
-        assert_eq!(v, "true");
     }
 
     #[tokio::test]

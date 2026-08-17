@@ -282,6 +282,25 @@
         _maskAsNative(globalThis.URLSearchParams);
     }
     {
+    // RFC 3986 §5.2.4 — a resolved path must have its `.` and `..` segments
+    // removed. Without it `new URL('./w.js', 'https://h/dir/')` yields
+    // "https://h/dir/./w.js", which a server may well 404: measured as
+    // `new Worker('./creep.js')` failing to load on a site whose own script
+    // sits right next to the document.
+    function _removeDotSegments(path) {
+        if (path.indexOf('.') === -1) return path;
+        const out = [];
+        for (const seg of path.split('/')) {
+            if (seg === '.') continue;
+            if (seg === '..') { if (out.length > 1) out.pop(); continue; }
+            out.push(seg);
+        }
+        let res = out.join('/');
+        // A path ending in a dot segment keeps its trailing slash.
+        if (/(^|\/)\.\.?$/.test(path) && !res.endsWith('/')) res += '/';
+        return res || '/';
+    }
+
         globalThis.URL = class URL {
             constructor(url, base) {
                 let full = String(url);
@@ -315,7 +334,7 @@
                 const m = full.match(/^([a-z]+):\/\/([^/:]+)(?::(\d+))?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/i);
                 if (m) {
                     this.protocol = m[1].toLowerCase() + ':'; this.hostname = m[2]; this.port = m[3] || '';
-                    this.pathname = m[4] || '/'; this.search = m[5] || ''; this.hash = m[6] || '';
+                    this.pathname = _removeDotSegments(m[4] || '/'); this.search = m[5] || ''; this.hash = m[6] || '';
                     this.host = this.port ? this.hostname + ':' + this.port : this.hostname;
                     this.origin = this.protocol + '//' + this.host; this.href = this.origin + this.pathname + this.search + this.hash;
                 } else {

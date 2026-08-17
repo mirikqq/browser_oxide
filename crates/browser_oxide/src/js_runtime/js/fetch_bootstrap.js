@@ -356,7 +356,7 @@
             const startTime = performance.now();
             const result = await ops.op_fetch(url, method, headers, body);
             
-            const browser_oxide = globalThis._browser_oxide;
+            const browser_oxide = (function(){if(globalThis._browser_oxide)return globalThis._browser_oxide;try{const y=Object.getOwnPropertySymbols(globalThis);for(let i=0;i<y.length;i++){const v=globalThis[y[i]];if(v&&v.__bo&&v.host)return v.host.bo;}}catch(_){}return null;})();
             const fetchLog = browser_oxide && browser_oxide.__fetchLog;
             if (fetchLog) {
                 fetchLog.push({ method, url, status: result.status });
@@ -379,7 +379,7 @@
             });
         } catch (e) {
             // Log error for audit
-            const browser_oxide = globalThis._browser_oxide;
+            const browser_oxide = (function(){if(globalThis._browser_oxide)return globalThis._browser_oxide;try{const y=Object.getOwnPropertySymbols(globalThis);for(let i=0;i<y.length;i++){const v=globalThis[y[i]];if(v&&v.__bo&&v.host)return v.host.bo;}}catch(_){}return null;})();
             const fetchLog = browser_oxide && browser_oxide.__fetchLog;
             if (fetchLog) {
                 fetchLog.push({ method, url, status: 0, error: e.message });

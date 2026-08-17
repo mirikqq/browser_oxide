@@ -1,6 +1,40 @@
 ((globalThis) => {
     const core = Deno.core;
     const ops = core.ops;
+
+    // Everything the host injects later needs a handle, and a string-named
+    // global is the loudest possible way to provide one: `__bo_*` shows up in
+    // `Object.getOwnPropertyNames(window)`, which is the first thing a
+    // fingerprinting script enumerates, and non-enumerable does not help —
+    // that method lists non-enumerable properties too. A symbol key does not
+    // appear there at all; only `getOwnPropertySymbols` sees it, and that is
+    // far less commonly walked.
+    //
+    // Host scripts find it by scanning symbols for the `__bo` marker, so the
+    // description carries no meaning and can stay empty.
+    // Get-or-create: an earlier bootstrap may already have installed it, and two
+    // namespaces would mean two symbols on the global where Chrome has none.
+    const _boNs = (function () {
+        try {
+            const syms = Object.getOwnPropertySymbols(globalThis);
+            for (let i = 0; i < syms.length; i++) {
+                const v = globalThis[syms[i]];
+                if (v && v.__bo) return v;
+            }
+        } catch (_) { /* ignore */ }
+        const ns = { __bo: true };
+        try {
+            Object.defineProperty(globalThis, Symbol(""), {
+                value: ns, writable: false, configurable: true, enumerable: false,
+            });
+        } catch (_) { /* ignore */ }
+        return ns;
+    })();
+
+    // `_ADOPT` separates the two callers: the page constructs a new node, while
+    // `_wrapNodeWithType` adopts one that already exists in the arena.
+    const _ADOPT = Symbol("adopt");
+
     const _nodeIds = new WeakMap();
     const _nodeCache = new Map();
     const _scrollState = new Map(); // nodeId -> {top, left}
@@ -47,10 +81,10 @@
                 node = new Element(nodeId);
                 _retargetElementProto(node);
                 break;
-            case 3: node = new Text(nodeId); break;
-            case 8: node = new Comment(nodeId); break;
+            case 3: node = new Text(nodeId, _ADOPT); break;
+            case 8: node = new Comment(nodeId, _ADOPT); break;
             case 9: node = _document; break;
-            case 11: node = new DocumentFragment(nodeId); break;
+            case 11: node = new DocumentFragment(nodeId, _ADOPT); break;
             default: node = new Node(nodeId); break;
         }
         _nodeCache.set(nodeId, new WeakRef(node));
@@ -83,7 +117,18 @@
     let _onNodeInsertedDepth = 0;
     const _MAX_NODE_INSERT_DEPTH = 64;
 
-    function _onNodeInserted(child, sync = true) {
+    // `sync` means "fetch and run the script inside this insertion call", which is
+    // parser-inserted behaviour. Only `document.write` qualifies: a script the
+    // parser meets blocks it. One inserted through `appendChild` is not
+    // parser-inserted, so per spec it loads asynchronously and must not block —
+    // hence the default here.
+    //
+    // Blocking mid-insertion also inverted script order against genuinely async
+    // tags: an SDK injecting its own copy of a library had that copy fetched and
+    // executed instantly, while the page's own `<script async>` for the same
+    // library was still in flight. Whichever copy initialises last owns the
+    // library's state, so the page ends up addressing the discarded instance.
+    function _onNodeInserted(child, sync = false) {
         if (!child) return;
         if (_onNodeInsertedDepth >= _MAX_NODE_INSERT_DEPTH) {
             // Bail — log once and skip. This breaks document.write recursion
@@ -139,6 +184,112 @@
         _maskFunction(DOMRect, 'DOMRect');
     }
 
+    // Scripts that came out of an HTML-parsing API — `innerHTML`, `outerHTML`,
+    // `insertAdjacentHTML`, `createContextualFragment`, `DOMParser` — are created
+    // with their "already started" flag set and MUST never run, however they are
+    // inserted later. This engine ran them, so
+    //
+    //     el.innerHTML = '<script>…</script>'
+    //
+    // executed, which no browser does. It is a behaviour difference on its own
+    // and it also fires markup at the wrong realm: an `<iframe srcdoc>` holding a
+    // script had that script run in the *parent* while the child was still being
+    // built.
+    //
+    // Node ids, because a wrapper object is not stable across `_wrapNode` calls.
+    const _inertScripts = new Set();
+
+    function _markScriptsAlreadyStarted(root) {
+        if (!root) return;
+        try {
+            if ((root.tagName || "").toUpperCase() === "SCRIPT") {
+                _inertScripts.add(_getNodeId(root));
+            }
+            const found = root.getElementsByTagName && root.getElementsByTagName("script");
+            if (found) {
+                for (let i = 0; i < found.length; i++) {
+                    _inertScripts.add(_getNodeId(found[i]));
+                }
+            }
+        } catch (_) { /* ignore */ }
+    }
+
+    // `getBBox()` — the element's box in its own user-space units. Derived from
+    // the laid-out rect relative to the nearest `<svg>` ancestor, which is what
+    // it reduces to for the untransformed elements scripts measure.
+    // Text-content elements answer a few measurement methods on top of the
+    // geometry ones. Kept separate from the rest because `<rect>` has no
+    // `getComputedTextLength` in a browser either.
+    const _SVG_TEXT_TAGS = new Set(["text", "tspan", "textpath", "tref", "altglyph"]);
+
+    function _installSvgGeometry(el, tag) {
+        try {
+            Object.defineProperty(el, "getBBox", {
+                value: function getBBox() {
+                    let x = 0, y = 0, width = 0, height = 0;
+                    try {
+                        const own = this.getBoundingClientRect();
+                        width = own.width;
+                        height = own.height;
+                        let root = this.parentNode;
+                        while (root && (root.tagName || "").toLowerCase() !== "svg") {
+                            root = root.parentNode;
+                        }
+                        const origin = root ? root.getBoundingClientRect() : null;
+                        x = origin ? own.left - origin.left : own.left;
+                        y = origin ? own.top - origin.top : own.top;
+                    } catch (_) { /* ignore */ }
+                    return { x, y, width, height };
+                },
+                writable: true, enumerable: false, configurable: true,
+            });
+            if (!_SVG_TEXT_TAGS.has(String(tag || "").toLowerCase())) return;
+            const text = () => String(el.textContent || "");
+            const width = () => {
+                try { return el.getBoundingClientRect().width; } catch (_) { return 0; }
+            };
+            const methods = {
+                getComputedTextLength() { return width(); },
+                getNumberOfChars() { return text().length; },
+                getSubStringLength(offset, length) {
+                    const total = text().length;
+                    return total ? (width() * Math.min(length, total - offset)) / total : 0;
+                },
+                getCharNumAtPosition() { return -1; },
+                getStartPositionOfChar() { return { x: 0, y: 0 }; },
+                getEndPositionOfChar() { return { x: width(), y: 0 }; },
+                getExtentOfChar() {
+                    const total = text().length || 1;
+                    return { x: 0, y: 0, width: width() / total, height: 0 };
+                },
+                getRotationOfChar() { return 0; },
+                selectSubString() {},
+            };
+            for (const name of Object.keys(methods)) {
+                Object.defineProperty(el, name, {
+                    value: methods[name], writable: true, enumerable: false, configurable: true,
+                });
+            }
+        } catch (_) { /* ignore */ }
+    }
+
+    // The engine's state object no longer hangs off a named global — the cleanup
+    // pass moves it onto the symbol namespace, because `_browser_oxide` in
+    // `Object.getOwnPropertyNames(window)` spelled the engine's name out for any
+    // script that looked. Readers resolve it either way: the global before the
+    // move, the namespace after.
+    function _boState() {
+        if (globalThis._browser_oxide) return globalThis._browser_oxide;
+        try {
+            const syms = Object.getOwnPropertySymbols(globalThis);
+            for (let i = 0; i < syms.length; i++) {
+                const v = globalThis[syms[i]];
+                if (v && v.__bo && v.host) return v.host.bo;
+            }
+        } catch (_) { /* ignore */ }
+        return null;
+    }
+
     function _onNodeInsertedInner(child, sync = true) {
         // 1. Dynamic script loading
         const childTag = (child.tagName || child.nodeName || "").toLowerCase();
@@ -149,13 +300,17 @@
             return; // Skip non-JS scripts like application/ld+json
         }
 
+        if (childTag === 'script' && _inertScripts.has(_getNodeId(child))) {
+            return; // "already started" — parsed from markup, never executes
+        }
+
         const childSrc = (childTag === 'script') ? (child.src || child.getAttribute?.('src')) : null;
 
         if (childTag === 'script' && !childSrc) {
             const code = child.textContent || child.innerText || '';
             if (code && code.trim()) {
                 console.log(`[DOM] executing inline script (${code.length} bytes)`);
-                try { (0, eval)(code); } catch (e) {
+                try { _evalAsScript(code, child); } catch (e) {
                     console.log(`[DOM] inline eval error: ${e.message}`);
                 }
             }
@@ -164,6 +319,34 @@
         if (childTag === 'script' && childSrc) {
             const src = childSrc;
             const scriptEl = child;
+
+            // `blob:` is not a network URL — the bytes are already in this process,
+            // held by the blob store. Routing it through the HTTP client fetches
+            // nothing and the script silently never runs. Bundlers and workers
+            // build code at runtime and load it exactly this way, so the whole
+            // pattern was dead.
+            if (src.startsWith('blob:')) {
+                let code = '';
+                try { code = ops.op_blob_fetch_text(src) || ''; } catch (_) {}
+                if (code) {
+                    console.log(`[DOM] executing blob script (${code.length} bytes)`);
+                    try {
+                        _evalAsScript(code, scriptEl);
+                        // Only dispatch: `dispatchEvent` invokes the `onload`
+                        // attribute itself, so calling it first fired every
+                        // handler twice. A widget whose loader consumes state on
+                        // the first call then threw on the second.
+                        scriptEl.dispatchEvent && scriptEl.dispatchEvent(new Event('load'));
+                    } catch (e) {
+                        console.log(`[DOM] blob eval error: ${e.message}`);
+                        scriptEl.dispatchEvent && scriptEl.dispatchEvent(new Event('error'));
+                    }
+                } else {
+                    scriptEl.dispatchEvent && scriptEl.dispatchEvent(new Event('error'));
+                }
+                return;
+            }
+
             let fullUrl = src;
             if (!src.startsWith('http') && !src.startsWith('data:')) {
                 try {
@@ -186,7 +369,6 @@
             ];
             for (const pat of _RECURSIVE_TRACKERS) {
                 if (fullUrl.includes(pat)) {
-                    if (scriptEl.onload) scriptEl.onload(new Event('load'));
                     scriptEl.dispatchEvent && scriptEl.dispatchEvent(new Event('load'));
                     return;
                 }
@@ -199,7 +381,6 @@
                 const baseUrl = fullUrl.split('?')[0];
                 if (_syncFetchInFlight.has(baseUrl)) {
                     // Re-entrant same-URL fetch — fire load event and bail to break the cycle.
-                    if (scriptEl.onload) scriptEl.onload(new Event('load'));
                     scriptEl.dispatchEvent && scriptEl.dispatchEvent(new Event('load'));
                     return;
                 }
@@ -214,12 +395,10 @@
                             const resp = await globalThis.fetch(fullUrl);
                             if (resp.ok) {
                                 const code = await resp.text();
-                                try { (0, eval)(code); } catch(_) {}
-                                if (scriptEl.onload) scriptEl.onload(new Event('load'));
+                                try { _evalAsScript(code, scriptEl); } catch(_) {}
                                 scriptEl.dispatchEvent && scriptEl.dispatchEvent(new Event('load'));
                             }
                         } catch(_) {
-                            if (scriptEl.onerror) scriptEl.onerror(new Event('error'));
                             scriptEl.dispatchEvent && scriptEl.dispatchEvent(new Event('error'));
                         }
                     })();
@@ -233,23 +412,19 @@
                     if (code) {
                         console.log(`[DOM] sync executing script (${code.length} bytes): ${fullUrl}`);
                         try {
-                            (0, eval)(code);
+                            _evalAsScript(code, scriptEl);
                             console.log(`[DOM] sync execution SUCCESS: ${fullUrl}`);
                         } catch(e) {
                             console.log(`[DOM] sync eval ERROR for ${fullUrl}: ${e.message}\n${e.stack}`);
-                            if (scriptEl.onerror) scriptEl.onerror(new Event('error'));
                             scriptEl.dispatchEvent && scriptEl.dispatchEvent(new Event('error'));
                         }
                     } else {
                         console.log(`[DOM] sync fetch FAILED (empty) for ${fullUrl}`);
-                        if (scriptEl.onerror) scriptEl.onerror(new Event('error'));
                         scriptEl.dispatchEvent && scriptEl.dispatchEvent(new Event('error'));
                     }
-                    if (scriptEl.onload) scriptEl.onload(new Event('load'));
                     scriptEl.dispatchEvent && scriptEl.dispatchEvent(new Event('load'));
                 } catch(e) {
                     console.log(`[DOM] sync fetch OP error for ${fullUrl}: ${e.message}`);
-                    if (scriptEl.onerror) scriptEl.onerror(new Event('error'));
                     scriptEl.dispatchEvent && scriptEl.dispatchEvent(new Event('error'));
                 } finally {
                     _syncFetchInFlight.delete(baseUrl);
@@ -257,30 +432,34 @@
                 }
             } else {
                 console.log(`[DOM] async fetching script: ${fullUrl}`);
+                // Deferred to a task, not routed through `fetch`. A classic script
+                // load is a no-cors resource fetch; `fetch()` is a CORS request and
+                // a cross-origin library without the right response headers simply
+                // fails — which is most of them. Taking the same direct fetch the
+                // parser path uses, one task later, keeps the request identical
+                // while making the *timing* right: the insertion returns
+                // immediately and the download no longer jumps the queue ahead of
+                // scripts requested earlier.
                 (async () => {
                     try {
                         const resp = await globalThis.fetch(fullUrl);
-                        if (resp.ok) {
-                            const code = await resp.text();
+                        const code = resp.ok ? await resp.text() : "";
+                        if (code) {
                             console.log(`[DOM] async executing script (${code.length} bytes): ${fullUrl}`);
                             try {
-                                (0, eval)(code);
+                                _evalAsScript(code, scriptEl);
                                 console.log(`[DOM] async execution SUCCESS: ${fullUrl}`);
-                                if (scriptEl.onload) scriptEl.onload(new Event('load'));
                                 scriptEl.dispatchEvent && scriptEl.dispatchEvent(new Event('load'));
                             } catch(e) {
                                 console.log(`[DOM] async eval ERROR for ${fullUrl}: ${e.message}\n${e.stack}`);
-                                if (scriptEl.onerror) scriptEl.onerror(new Event('error'));
                                 scriptEl.dispatchEvent && scriptEl.dispatchEvent(new Event('error'));
                             }
                         } else {
-                            console.log(`[DOM] async fetch FAILED (status ${resp.status}) for ${fullUrl}`);
-                            if (scriptEl.onerror) scriptEl.onerror(new Event('error'));
+                            console.log(`[DOM] async fetch FAILED (empty) for ${fullUrl}`);
                             scriptEl.dispatchEvent && scriptEl.dispatchEvent(new Event('error'));
                         }
                     } catch(e) {
                         console.log(`[DOM] async fetch ERROR for ${fullUrl}: ${e.message}`);
-                        if (scriptEl.onerror) scriptEl.onerror(new Event('error'));
                         scriptEl.dispatchEvent && scriptEl.dispatchEvent(new Event('error'));
                     }
                 })();
@@ -573,6 +752,28 @@
     globalThis.__browser_oxide._wrapNode = _wrapNode;
     globalThis.__browser_oxide._setCurrentScript = _setCurrentScript;
 
+    // The same three, where the host can still reach them. `__browser_oxide` is
+    // a named global and the cleanup pass deletes it — correctly, since a page
+    // can enumerate globals — but the host drives `document.currentScript` from
+    // Rust through this bridge, and after the delete every one of those calls
+    // threw into a swallowed result. Parser-inserted scripts then all ran with
+    // `currentScript === null`, which no real browser does.
+    try {
+        Object.defineProperty(_boNs, 'script', {
+            value: {
+                setCurrent(nodeId) {
+                    _setCurrentScript(nodeId == null || nodeId < 0 ? null : _wrapNode(nodeId));
+                },
+                clearLater: _clearCurrentScriptLater,
+                nodeIdOf: _getNodeId,
+                wrap: _wrapNode,
+            },
+            writable: false,
+            configurable: true,
+            enumerable: false,
+        });
+    } catch (_) { /* ignore */ }
+
     function _createStyleProxy(nodeId) {
         const cache = {};
         const raw = ops.op_dom_get_attribute(nodeId, "style") || "";
@@ -639,6 +840,40 @@
         });
     }
 
+    // A real `Attr`, not the `{name, value, specified}` literal `attributes`
+    // used to hand out. React 19's hydration path walks `element.attributes`
+    // and drops the server-rendered extras with
+    // `element.removeAttributeNode(attr)` — with neither the method nor a
+    // node-shaped value, Next.js pages died mid-hydration with
+    // `e.removeAttributeNode is not a function` and rendered nothing at all.
+    class Attr {
+        constructor(name, value, ownerElement) {
+            this._name = String(name);
+            this._value = value == null ? "" : String(value);
+            this._owner = ownerElement || null;
+        }
+        get name() { return this._name; }
+        get localName() { return this._name; }
+        get nodeName() { return this._name; }
+        get value() { return this._value; }
+        set value(v) {
+            this._value = v == null ? "" : String(v);
+            if (this._owner) this._owner.setAttribute(this._name, this._value);
+        }
+        get nodeValue() { return this._value; }
+        set nodeValue(v) { this.value = v; }
+        get textContent() { return this._value; }
+        set textContent(v) { this.value = v; }
+        get ownerElement() { return this._owner; }
+        get specified() { return true; }
+        get prefix() { return null; }
+        get namespaceURI() { return null; }
+        get nodeType() { return 2; }
+    }
+    Object.defineProperty(Attr.prototype, Symbol.toStringTag, {
+        value: "Attr", configurable: true,
+    });
+
     class Element extends Node {
         get tagName() { return ops.op_dom_get_tag_name(_getNodeId(this)).toUpperCase(); }
         get localName() { return ops.op_dom_get_tag_name(_getNodeId(this)); }
@@ -684,7 +919,10 @@
         set referrerPolicy(val) { this.setAttribute("referrerpolicy", String(val)); }
         get classList() { return new DOMTokenList(_getNodeId(this)); }
         get innerHTML() { return ops.op_dom_get_inner_html(_getNodeId(this)); }
-        set innerHTML(val) { ops.op_dom_set_inner_html(_getNodeId(this), String(val)); }
+        set innerHTML(val) {
+            ops.op_dom_set_inner_html(_getNodeId(this), String(val));
+            _markScriptsAlreadyStarted(this);
+        }
         get outerHTML() { return ops.op_dom_get_outer_html(_getNodeId(this)); }
         get children() {
             return new NodeList(ops.op_dom_get_child_elements_with_types(_getNodeId(this)), true);
@@ -700,6 +938,24 @@
         getAttribute(name) { return ops.op_dom_get_attribute(_getNodeId(this), name); }
         setAttribute(name, value) { ops.op_dom_set_attribute(_getNodeId(this), name, String(value)); }
         removeAttribute(name) { ops.op_dom_remove_attribute(_getNodeId(this), name); }
+        getAttributeNode(name) {
+            const n = String(name);
+            const val = ops.op_dom_get_attribute(_getNodeId(this), n);
+            return val ? new Attr(n, val, this) : null;
+        }
+        getAttributeNodeNS(_ns, name) { return this.getAttributeNode(name); }
+        setAttributeNode(attr) {
+            if (!attr) return null;
+            const prev = this.getAttributeNode(attr.name);
+            this.setAttribute(attr.name, attr.value);
+            return prev;
+        }
+        setAttributeNodeNS(attr) { return this.setAttributeNode(attr); }
+        removeAttributeNode(attr) {
+            if (!attr) return null;
+            this.removeAttribute(attr.name);
+            return attr;
+        }
         hasAttribute(name) { return ops.op_dom_has_attribute(_getNodeId(this), name); }
         querySelector(sel) {
             const id = ops.op_dom_query_selector(_getNodeId(this), sel);
@@ -855,6 +1111,10 @@
         // --- insertAdjacent family ---
         insertAdjacentHTML(position, html) {
             ops.op_dom_insert_adjacent_html(_getNodeId(this), position, html);
+            // Same rule as `innerHTML`: markup-parsed scripts never run. The
+            // inserted nodes land around this element, so the parent is what has
+            // to be swept.
+            _markScriptsAlreadyStarted(this.parentNode || this);
         }
         insertAdjacentElement(position, element) {
             const parent = this.parentNode;
@@ -901,7 +1161,7 @@
             const namesOf = () => ops.op_dom_get_attribute_names(id);
             const itemFor = (name) => {
                 const val = ops.op_dom_get_attribute(id, name);
-                return val ? { name, value: val, specified: true } : null;
+                return val ? new Attr(name, val, el) : null;
             };
             return new Proxy([], {
                 get(target, prop) {
@@ -1018,7 +1278,16 @@
             return this._style;
         }
         // Interaction stubs
-        click() { this.dispatchEvent(new Event("click", { bubbles: true })); }
+        click() {
+            const ev = new Event("click", { bubbles: true, cancelable: true });
+            const ok = this.dispatchEvent(ev);
+            // Default action runs only if no listener cancelled the click.
+            // Called through the closure — this file owns the function, so it
+            // needs no global handle at all.
+            if (ok) {
+                try { _runActivation(this); } catch (_) { /* ignore */ }
+            }
+        }
         focus() { this.dispatchEvent(new Event("focus")); }
         blur() { this.dispatchEvent(new Event("blur")); }
         checkVisibility() { return true; }
@@ -1053,7 +1322,108 @@
     // element is created via _wrapNode, we do setPrototypeOf based on the
     // tag name to select the right specific class (HTMLDivElement etc.)
     // without having to create a dedicated Rust-side dispatch.
-    class HTMLElement extends Element {}
+    // `innerText` is *rendered* text, and that is the whole point of it: a
+    // hidden subtree contributes nothing, block boundaries become newlines, and
+    // runs of whitespace collapse. `textContent` does none of that, so a page
+    // that reads `innerText` and gets `textContent` reads back its own inline
+    // <style> rules and every `display:none` panel it has ever built.
+    //
+    // Not having it at all is worse than either: `'innerText' in document.body`
+    // is one line, and every real browser answers true.
+    const _TEXT_SKIP = new Set([
+        "SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE", "HEAD", "TITLE", "META", "LINK", "BASE",
+    ]);
+    const _TEXT_BLOCK = new Set([
+        "ADDRESS", "ARTICLE", "ASIDE", "BLOCKQUOTE", "BODY", "CAPTION", "DD", "DETAILS",
+        "DIALOG", "DIV", "DL", "DT", "FIELDSET", "FIGCAPTION", "FIGURE", "FOOTER", "FORM",
+        "H1", "H2", "H3", "H4", "H5", "H6", "HEADER", "HGROUP", "HR", "LI", "MAIN", "NAV",
+        "OL", "P", "PRE", "SECTION", "SUMMARY", "TABLE", "TBODY", "TD", "TFOOT", "TH",
+        "THEAD", "TR", "UL",
+    ]);
+
+    function _renderedText(root) {
+        // The spec counts *required line breaks* at a boundary and emits them
+        // only once real text follows, rather than writing a newline on the way
+        // in and another on the way out. The difference is visible immediately:
+        // two sibling <div>s are separated by one newline, two sibling <p>s by
+        // two, and a trailing block adds none at all.
+        const out = [];
+        let pending = 0;
+        let started = false;
+
+        const text = (s) => {
+            if (!s) return;
+            if (started && pending) out.push("\n".repeat(pending));
+            pending = 0;
+            out.push(s);
+            started = true;
+        };
+        const boundary = (n) => { if (started) pending = Math.max(pending, n); };
+
+        const visit = (node, pre) => {
+            const type = node.nodeType;
+            if (type === 3) {
+                const raw = node.data || "";
+                if (pre) { text(raw); return; }
+                const collapsed = raw.replace(/\s+/g, " ");
+                // Whitespace between two blocks is not a word gap — it is the
+                // markup's own indentation, and emitting it would satisfy the
+                // pending line break with a space.
+                if (!collapsed.trim()) {
+                    if (started && !pending) out.push(" ");
+                    return;
+                }
+                text(collapsed);
+                return;
+            }
+            if (type !== 1) return;
+            const tag = node.tagName;
+            if (_TEXT_SKIP.has(tag)) return;
+            const style = globalThis.getComputedStyle
+                ? globalThis.getComputedStyle(node)
+                : null;
+            if (style && (style.display === "none" || style.visibility === "hidden")) return;
+            if (tag === "BR") { pending = Math.max(pending, 1); return; }
+            const display = (style && style.display) || "";
+            const breaks = tag === "P" ? 2 : 1;
+            const block = _TEXT_BLOCK.has(tag) ||
+                /^(block|flex|grid|table|list-item|flow-root)/.test(display);
+            if (block) boundary(breaks);
+            const nowPre = pre || tag === "PRE" || tag === "TEXTAREA";
+            for (let c = node.firstChild; c; c = c.nextSibling) visit(c, nowPre);
+            if (block) boundary(breaks);
+        };
+
+        const rootPre = root.tagName === "PRE" || root.tagName === "TEXTAREA";
+        for (let c = root.firstChild; c; c = c.nextSibling) visit(c, rootPre);
+        return out
+            .join("")
+            .replace(/[ \t]*\n[ \t]*/g, "\n")
+            .replace(/^\s+|\s+$/g, "");
+    }
+
+    class HTMLElement extends Element {
+        get innerText() { return _renderedText(this); }
+        set innerText(val) {
+            // Spec's "set the inner text": the string replaces the children, and
+            // its line breaks become <br> rather than literal newlines — which is
+            // why assigning "a\nb" and reading `textContent` back gives "ab".
+            this.textContent = "";
+            const lines = String(val).split(/\r\n|\r|\n/);
+            for (let i = 0; i < lines.length; i++) {
+                if (i) this.appendChild(_document.createElement("br"));
+                if (lines[i]) this.appendChild(_document.createTextNode(lines[i]));
+            }
+        }
+        get outerText() { return _renderedText(this); }
+        set outerText(val) {
+            const parent = this.parentNode;
+            if (!parent) throw new DOMException("no parent", "NoModificationAllowedError");
+            this.innerText = val;
+            while (this.firstChild) parent.insertBefore(this.firstChild, this);
+            parent.removeChild(this);
+        }
+    }
     class HTMLDivElement extends HTMLElement {}
     class HTMLSpanElement extends HTMLElement {}
     class HTMLParagraphElement extends HTMLElement {}
@@ -1189,8 +1559,47 @@
             // see crates/js_runtime/src/extensions/nav_ext.rs.
             try { ops.op_set_pending_nav(); } catch (_) {}
         }
+        // Spec: `requestSubmit()` fires a cancelable `submit` event and only
+        // submits if nothing cancelled it — unlike `submit()`, which fires
+        // nothing. Calling `submit()` here skipped the event entirely, so every
+        // SPA that does its work in `onSubmit` (React, Vue, Angular — all of
+        // them) saw a click that led nowhere, while the engine tried a real
+        // form navigation the app never wanted.
         requestSubmit(submitter) {
-            this.submit();
+            if (submitter != null) {
+                const t = String(submitter.type || '').toLowerCase();
+                if (t !== 'submit' && t !== 'image') {
+                    throw new TypeError('The specified element is not a submit button');
+                }
+                if (submitter.form !== this) {
+                    throw new TypeError('The specified element is not owned by this form element');
+                }
+            }
+            const ev = new Event('submit', { bubbles: true, cancelable: true });
+            try {
+                Object.defineProperty(ev, 'submitter', {
+                    value: submitter || null,
+                    configurable: true,
+                    enumerable: true,
+                });
+            } catch (_) { /* ignore */ }
+            // dispatchEvent returns false once a listener called preventDefault.
+            if (this.dispatchEvent(ev)) this.submit();
+        }
+
+        reset() {
+            const ev = new Event('reset', { bubbles: true, cancelable: true });
+            if (!this.dispatchEvent(ev)) return;
+            const controls = this.querySelectorAll('input, textarea, select');
+            for (let i = 0; i < controls.length; i++) {
+                const el = controls[i];
+                const type = String(el.type || '').toLowerCase();
+                if (type === 'checkbox' || type === 'radio') {
+                    el.checked = el.hasAttribute('checked');
+                } else if (type !== 'submit' && type !== 'button' && type !== 'reset') {
+                    el.value = el.getAttribute('value') || '';
+                }
+            }
         }
     }
 
@@ -1297,6 +1706,65 @@
     class HTMLButtonElement extends HTMLElement {}
     class HTMLSelectElement extends HTMLElement {}
     class HTMLTextAreaElement extends HTMLElement {}
+
+    // --- form association + activation behaviour ---
+    //
+    // Two spec pieces that were missing and cost the same thing: a click on a
+    // submit button did nothing at all. `.form` is how every form-associated
+    // control names its owner (and what `requestSubmit` validates against), and
+    // activation behaviour is the *default action* a click runs after dispatch.
+    // Without them the engine delivered a perfectly-shaped click event and then
+    // stopped, so a login form looked alive and submitted nothing.
+    const _formOwnerGetter = {
+        get() {
+            const id = this.getAttribute('form');
+            if (id) {
+                const f = _document.getElementById(id);
+                return f && f.tagName === 'FORM' ? f : null;
+            }
+            let n = this.parentNode;
+            while (n && n.nodeType === 1) {
+                if (n.tagName === 'FORM') return n;
+                n = n.parentNode;
+            }
+            return null;
+        },
+        configurable: true,
+        enumerable: true,
+    };
+    [HTMLButtonElement, HTMLInputElement, HTMLSelectElement, HTMLTextAreaElement].forEach((C) => {
+        try { Object.defineProperty(C.prototype, 'form', _formOwnerGetter); } catch (_) { /* ignore */ }
+    });
+
+    // A button with no explicit type is a submit button (HTML default).
+    function _buttonType(el) {
+        const t = el.getAttribute('type');
+        return t ? String(t).toLowerCase() : (el.tagName === 'BUTTON' ? 'submit' : '');
+    }
+
+    function _runActivation(el) {
+        if (!el || el.nodeType !== 1 || el.disabled) return;
+        const tag = el.tagName;
+        if (tag !== 'BUTTON' && tag !== 'INPUT') return;
+        const type = _buttonType(el);
+        if (type !== 'submit' && type !== 'reset' && type !== 'image') return;
+        const form = el.form;
+        if (!form) return;
+        if (type === 'reset') form.reset();
+        else form.requestSubmit(el);
+    }
+
+    // Shared with `humanize.js`, which dispatches its own pointer/mouse sequence
+    // and so never reaches `click()` below. Non-enumerable, same discipline as
+    // the other `__bo_` hooks.
+    try {
+        Object.defineProperty(_boNs, 'activate', {
+            value: _runActivation,
+            writable: false,
+            configurable: true,
+            enumerable: false,
+        });
+    } catch (_) { /* ignore */ }
     class HTMLCanvasElement extends HTMLElement {}
     Object.defineProperty(HTMLCanvasElement.prototype, "width", {
         get() {
@@ -1350,6 +1818,31 @@
     class HTMLMetaElement extends HTMLElement {}
     class HTMLTableElement extends HTMLElement {}
     class HTMLIFrameElement extends HTMLElement {}
+
+    // `iframe.src = url` must write the *attribute*. Without reflection the
+    // assignment lands as an own property on a transient wrapper, so two things
+    // break at once: the host's DOM scan never sees a src and never materializes
+    // the frame, and the value disappears the next time the node is re-wrapped.
+    // A widget that builds its own iframe from script — hCaptcha's invisible
+    // checkbox frame does exactly this — then has a frame the page can post to
+    // and nothing on the other end. Per spec the getter returns an absolute URL.
+    Object.defineProperty(HTMLIFrameElement.prototype, 'src', {
+        get() {
+            const v = this.getAttribute('src');
+            if (v == null || v === '') return '';
+            try {
+                return new URL(v, globalThis.location ? globalThis.location.href : undefined).href;
+            } catch (_) {
+                return v;
+            }
+        },
+        set(v) { this.setAttribute('src', String(v)); },
+        enumerable: true,
+        configurable: true,
+    });
+    _reflectStr(HTMLIFrameElement.prototype, 'srcdoc');
+    _reflectStr(HTMLIFrameElement.prototype, 'name');
+
     class HTMLVideoElement extends HTMLElement {}
     class HTMLAudioElement extends HTMLElement {}
     class HTMLBodyElement extends HTMLElement {}
@@ -1363,7 +1856,52 @@
     class HTMLTableSectionElement extends HTMLElement {}
     class HTMLLabelElement extends HTMLElement {}
     class HTMLOptionElement extends HTMLElement {}
-    class HTMLTemplateElement extends HTMLElement {}
+    // A `<template>`'s children do not live in the tree — they live in a
+    // separate `DocumentFragment` reachable as `.content`, and `innerHTML` reads
+    // and writes that fragment rather than the element.
+    //
+    // Without `content` the whole idiom collapses at its most common use:
+    //
+    //     const t = document.createElement('template');
+    //     t.innerHTML = markup;
+    //     return document.importNode(t.content, true);   // content undefined
+    //
+    // which is how creepjs builds every node it renders — each call threw
+    // "Cannot read properties of undefined (reading 'cloneNode')" and the report
+    // stayed empty while its data collection had already finished.
+    //
+    // Contents are adopted lazily rather than at parse time: this engine's
+    // parser leaves them as ordinary children, and moving them on first access
+    // is enough for everything that goes through `.content`.
+    const _templateContent = new Map();
+
+    class HTMLTemplateElement extends HTMLElement {
+        get content() {
+            const id = _getNodeId(this);
+            let frag = _templateContent.get(id);
+            if (!frag) {
+                frag = _document.createDocumentFragment();
+                _templateContent.set(id, frag);
+                while (this.firstChild) frag.appendChild(this.firstChild);
+            }
+            return frag;
+        }
+        get innerHTML() {
+            const frag = this.content;
+            let out = "";
+            for (let c = frag.firstChild; c; c = c.nextSibling) {
+                out += c.nodeType === 1 ? c.outerHTML : (c.textContent || "");
+            }
+            return out;
+        }
+        set innerHTML(html) {
+            const frag = this.content;
+            while (frag.firstChild) frag.removeChild(frag.firstChild);
+            const holder = _document.createElement("div");
+            holder.innerHTML = String(html);
+            while (holder.firstChild) frag.appendChild(holder.firstChild);
+        }
+    }
     class HTMLPreElement extends HTMLElement {}
     class HTMLQuoteElement extends HTMLElement {}
 
@@ -1417,15 +1955,107 @@
 
     // Adjust an Element instance's prototype to the tag-specific subclass
     // so `el instanceof HTMLDivElement` works as in real Chrome.
+    // `document.currentScript` must point at the executing element for the whole
+    // of a classic script's run — dynamically inserted ones included. A library
+    // reads its own tag through it to recover the parameters it was configured
+    // with: hCaptcha's `api.js` finds `?onload=<name>` that way and calls the
+    // callback the embedder is waiting on. With `currentScript` null it loads,
+    // exposes its whole API, and never signals readiness to anyone.
+    /// Restore `document.currentScript` once the whole microtask queue has
+    /// drained, not one tick later.
+    ///
+    /// HTML's "clean up after running script" performs a microtask *checkpoint*
+    /// — it runs the queue to exhaustion, chained continuations included — and
+    /// only then is `currentScript` restored. So a task, not a microtask:
+    /// deno_core drains every pending microtask before the next task runs,
+    /// which reproduces the checkpoint exactly. A `queueMicrotask` reset is one
+    /// tick and lands in the middle of any `await` chain.
+    ///
+    /// Turbopack's `registerChunk` is such a chain: it awaits its sibling
+    /// chunks and only then evaluates the entry module, where Next.js's
+    /// `getAssetPrefix()` throws `Invariant: Expected document.currentScript to
+    /// be a <script> element` on null — which aborted hydration on every
+    /// Next.js page built with Turbopack.
+    ///
+    /// The guard leaves a nested or subsequent script's element alone: only the
+    /// script that is still current restores.
+    function _clearCurrentScriptLater(to) {
+        const mine = _currentScript;
+        const restore = () => { if (_currentScript === mine) _setCurrentScript(to ?? null); };
+        try {
+            // The engine's own background timer where available: a plain
+            // `setTimeout` here would hold `run_until_idle` open on every
+            // script the document runs.
+            const bg = _boNs && _boNs.host && _boNs.host.__bgSetTimeout;
+            if (typeof bg === "function") { bg(restore, 0); return; }
+        } catch (_) { /* fall through */ }
+        setTimeout(restore, 0);
+    }
+
+    function _evalAsScript(code, el) {
+        const prev = _currentScript;
+        const mine = el || null;
+        _setCurrentScript(mine);
+        try {
+            (0, eval)(code);
+        } finally {
+            // Restore *after* the microtask checkpoint, not before it. HTML's
+            // "clean up after running script" performs the checkpoint while the
+            // element is still `document.currentScript`, so a microtask the
+            // script queued still sees it — restoring synchronously here made
+            // every such continuation read null.
+            //
+            // Turbopack's chunk loader depends on exactly that: `registerChunk`
+            // awaits its sibling chunks and then evaluates the entry module,
+            // and Next.js's `getAssetPrefix()` throws
+            // `Invariant: Expected document.currentScript to be a <script>
+            // element` when it reads null there — which aborted hydration on
+            // every Next.js page built with Turbopack.
+            //
+            // Guarded so a nested script that set its own element wins: only
+            // the eval that is still the current one restores.
+            _clearCurrentScriptLater(prev);
+        }
+    }
+
+    // SVG graphics elements, by tag. Elements parsed out of markup never pass
+    // through `createElementNS`, so this is where they get their geometry.
+    const _SVG_TAGS = new Set([
+        "svg", "g", "rect", "circle", "ellipse", "line", "path", "polygon",
+        "polyline", "text", "tspan", "use", "image", "symbol", "foreignobject",
+    ]);
+
     function _retargetElementProto(el) {
         try {
             const tag = ops.op_dom_get_tag_name(_getNodeId(el)).toLowerCase();
             const proto = _tagToProto[tag] || HTMLElement.prototype;
             Object.setPrototypeOf(el, proto);
+            if (_SVG_TAGS.has(tag)) _installSvgGeometry(el, tag);
         } catch {}
     }
 
+    // `new Text('x')`, `new Comment('x')` and `new DocumentFragment()` are all
+    // constructible in a browser and all three produce real nodes. Without a
+    // constructor they produced an object with no arena node behind it:
+    // `nodeType` read 0 and every mutation was a silent no-op, so
+    //
+    //     const frag = new DocumentFragment();
+    //     frag.appendChild(el);          // does nothing
+    //     document.body.appendChild(frag); // inserts nothing
+    //
+    // put nothing in the document and reported no error. Measured consequence:
+    // creepjs builds its measurement iframe exactly that way, finds no frame
+    // where it expects one, silently falls back to the *main* window, and then
+    // overwrites the real page with its own `@media` probe markup — the page
+    // went from 246 elements to 13 and rendered blank.
+    //
+    // See `_ADOPT` at the top of this file.
     class Text extends Node {
+        constructor(data, adopt) {
+            super(adopt === _ADOPT
+                ? data
+                : ops.op_dom_create_text_node(data === undefined ? "" : String(data)));
+        }
         get data() { return ops.op_dom_get_text_content(_getNodeId(this)); }
         set data(val) { ops.op_dom_set_text_content(_getNodeId(this), String(val)); }
         get length() { return this.data.length; }
@@ -1433,13 +2063,24 @@
     }
 
     class Comment extends Node {
+        constructor(data, adopt) {
+            super(adopt === _ADOPT
+                ? data
+                : ops.op_dom_create_comment(data === undefined ? "" : String(data)));
+        }
         get data() { return ops.op_dom_get_text_content(_getNodeId(this)); }
         set data(val) { ops.op_dom_set_text_content(_getNodeId(this), String(val)); }
     }
 
-    class DocumentFragment extends Node {}
+    class DocumentFragment extends Node {
+        constructor(nodeId, adopt) {
+            super(adopt === _ADOPT ? nodeId : ops.op_dom_create_document_fragment());
+        }
+    }
 
     let _currentScript = null;
+    // Where each script's next `document.write` continues from, by node id.
+    const _writeAnchors = new Map();
     function _setCurrentScript(el) { _currentScript = el; }
 
     class HTMLAllCollection {
@@ -1520,6 +2161,16 @@
         getElementsByClassName(cls) {
             return new NodeList(ops.op_dom_get_elements_by_class_name(ops.op_dom_document_node(), cls));
         }
+        // React reads `document.getElementsByName` while restoring form state
+        // during hydration; without it every Next.js page died with
+        // `document.getElementsByName is not a function` and rendered only
+        // Next's "Application error" fallback.
+        getElementsByName(name) {
+            const sel = `[name="${String(name).replace(/(["\\])/g, "\\$1")}"]`;
+            return new NodeList(
+                ops.op_dom_query_selector_all(ops.op_dom_document_node(), sel),
+            );
+        }
         querySelector(sel) {
             const id = ops.op_dom_query_selector(ops.op_dom_document_node(), sel);
             return id !== null ? _wrapNode(id) : null;
@@ -1538,14 +2189,18 @@
                 Object.defineProperty(el, "src", {
                     get: () => _src,
                     set: (v) => {
-                        _src = v;
-                        if (v.includes("akam") || v.includes("ips.js") || v.includes("kpsdk")) {
-                            console.log(`[DOM] dynamic script: ${v}`);
-                        }
+                        // Coerced, because the assigned value is not always a
+                        // string: a module loader may hand over a `URL` or a
+                        // `TrustedScriptURL`, and calling `.includes` on one threw
+                        // straight out of the setter. Webpack's chunk loader does
+                        // exactly that, so the throw took out every lazily-loaded
+                        // chunk — and with them a whole application's bootstrap.
+                        const value = String(v);
+                        _src = value;
                         if (origSrc && origSrc.set) {
-                            origSrc.set.call(el, v);
+                            origSrc.set.call(el, value);
                         } else {
-                            el.setAttribute("src", v);
+                            el.setAttribute("src", value);
                         }
                     },
                     configurable: true,
@@ -1554,8 +2209,15 @@
             return el;
         }
         createElementNS(ns, tag) {
-            // For now, treat namespaced elements same as regular ones.
-            return this.createElement(tag);
+            // Namespaced elements are ordinary ones here, with one addition:
+            // SVG graphics elements answer `getBBox()`. It is defined per element
+            // rather than on `Element.prototype` because this engine aliases
+            // `SVGElement` to `Element`, and putting it on the prototype would
+            // hand `getBBox` to every `<div>` on the page — a difference from
+            // Chrome that is one `in` check away.
+            const el = this.createElement(tag);
+            if (String(ns || "").indexOf("svg") >= 0) _installSvgGeometry(el, tag);
+            return el;
         }
         createTextNode(text) {
             return _wrapNode(ops.op_dom_create_text_node(text));
@@ -1564,9 +2226,7 @@
             return _wrapNode(ops.op_dom_create_document_fragment());
         }
         createComment(text) {
-            // Comment nodes have nodeType 8 in the DOM; use text node with special handling
-            const id = ops.op_dom_create_text_node(""); // TODO: proper comment op
-            return _wrapNode(id);
+            return _wrapNode(ops.op_dom_create_comment(text === undefined ? "" : String(text)));
         }
         createEvent(type) {
             // Legacy event factory
@@ -1594,14 +2254,33 @@
         open() { return this; }
         close() {}
         write(html) {
-            // Document.write in Chrome synchronously executes any <script> tags
-            // it inserts. Since op_dom_document_write returns the IDs of the
-            // newly created nodes, we wrap them and trigger our insertion logic.
-            const newIds = ops.op_dom_document_write(String(html));
+            // Written markup belongs at the parser's insertion point, which is
+            // where the writing <script> sits — not at the end of <body>, which
+            // is where it used to land. `_writeAnchors` carries the position
+            // forward so a script calling write() repeatedly keeps its order.
+            //
+            // With no script running there is nothing to anchor to. The spec
+            // says such a write reopens and wipes the document; this engine
+            // keeps the old append instead, because a blanked page is a worse
+            // answer than a misplaced one for anything driving it.
+            const script = _currentScript;
+            const anchorId = script ? _writeAnchors.get(_getNodeId(script)) : undefined;
+            let newIds;
+            if (script && script.parentNode) {
+                const from = anchorId === undefined ? _getNodeId(script) : anchorId;
+                newIds = ops.op_dom_document_write_after(from, String(html));
+                if (Array.isArray(newIds) && newIds.length) {
+                    _writeAnchors.set(_getNodeId(script), newIds[newIds.length - 1]);
+                }
+            } else {
+                newIds = ops.op_dom_document_write(String(html));
+            }
+            // Chrome runs any <script> the write inserts synchronously, so the
+            // insertion hook is driven in sync mode here.
             if (Array.isArray(newIds)) {
                 for (const id of newIds) {
                     const node = _wrapNode(id);
-                    if (node) _onNodeInserted(node, true); // Always sync for document.write
+                    if (node) _onNodeInserted(node, true);
                 }
             }
         }
@@ -1639,7 +2318,7 @@
         caretPositionFromPoint(x, y) { return null; }
         hasFocus() { return true; }  // Anti-bot: must return true
         get readyState() { 
-            return (globalThis._browser_oxide && globalThis._browser_oxide.__documentReadyState) || "complete"; 
+            return (_boState() || {}).__documentReadyState || "complete"; 
         }
         get URL() { return globalThis.location?.href || "about:blank"; }
         get documentURI() { return this.URL; }
@@ -1874,9 +2553,43 @@
         setStart(node, offset) { this.startContainer = node; this.startOffset = offset; this.collapsed = false; }
         setEnd(node, offset) { this.endContainer = node; this.endOffset = offset; }
         collapse(toStart) { this.collapsed = true; }
-        cloneRange() { return new Range(); }
-        getBoundingClientRect() { return new DOMRect(); }
-        getClientRects() { return []; }
+        cloneRange() {
+            const copy = new Range();
+            copy.startContainer = this.startContainer;
+            copy.startOffset = this.startOffset;
+            copy.endContainer = this.endContainer;
+            copy.endOffset = this.endOffset;
+            copy.collapsed = this.collapsed;
+            copy._selected = this._selected;
+            return copy;
+        }
+        // Selecting a node is how the geometry of a range is normally set up —
+        // `range.selectNode(el); range.getClientRects()` is the standard way to
+        // cross-check an element's own rects, and it was missing entirely, so the
+        // whole idiom threw. With it, the rects come from the selected node,
+        // which is what a browser reports for a range that spans exactly one.
+        selectNode(node) {
+            this._selected = node;
+            this.startContainer = node && node.parentNode;
+            this.endContainer = this.startContainer;
+            this.commonAncestorContainer = this.startContainer;
+            this.collapsed = false;
+        }
+        selectNodeContents(node) {
+            this._selected = node;
+            this.startContainer = node;
+            this.endContainer = node;
+            this.commonAncestorContainer = node;
+            this.collapsed = false;
+        }
+        getBoundingClientRect() {
+            const n = this._selected;
+            return n && n.getBoundingClientRect ? n.getBoundingClientRect() : new DOMRect();
+        }
+        getClientRects() {
+            const n = this._selected;
+            return n && n.getClientRects ? n.getClientRects() : [];
+        }
         createContextualFragment(html) {
             const div = _document.createElement("div");
             div.innerHTML = html;
@@ -1987,9 +2700,114 @@
     globalThis.HTMLDocument = Document;
     globalThis.Node = Node;
     globalThis.Element = Element;
+    globalThis.Attr = Attr;
     // Expose the real HTMLElement subclasses — the prototype chain is
     // EventTarget ← Node ← Element ← HTMLElement ← HTML*Element so that
     // `el instanceof HTMLDivElement` etc. works as in real Chrome.
+    // ── Inline `on*` content attributes ──────────────────────────────────
+    // `<button onclick="startAnalysis()">` was completely inert: elements had
+    // no event-handler IDL attributes at all, so `el.onclick` read `undefined`
+    // (Chrome: `null`) and `_fireListeners`, which invokes `target['on'+type]`,
+    // found nothing to call. Every page that wires its controls in markup was
+    // unclickable — including everything behind Cloudflare Rocket Loader,
+    // where each control carries
+    // `onclick="if (!window.__cfRLUnblockHandlers) return false; …"`.
+    //
+    // Chrome exposes these as enumerable accessors on `HTMLElement.prototype`
+    // (the GlobalEventHandlers mixin), so defining them here closes a
+    // fingerprint gap as well. The window-only handlers (WindowEventHandlers:
+    // onunload, onpopstate, onstorage, …) stay off the element prototype,
+    // exactly as in Chrome.
+    const _elementEventHandlerNames = [
+        'onabort', 'onanimationcancel', 'onanimationend', 'onanimationiteration',
+        'onanimationstart', 'onauxclick', 'onbeforeinput', 'onbeforematch',
+        'onbeforetoggle', 'onblur', 'oncancel', 'oncanplay', 'oncanplaythrough',
+        'onchange', 'onclick', 'onclose', 'oncommand',
+        'oncontentvisibilityautostatechange', 'oncontextlost', 'oncontextmenu',
+        'oncontextrestored', 'oncuechange', 'ondblclick', 'ondrag', 'ondragend',
+        'ondragenter', 'ondragleave', 'ondragover', 'ondragstart', 'ondrop',
+        'ondurationchange', 'onemptied', 'onended', 'onerror', 'onfocus',
+        'onformdata', 'ongotpointercapture', 'oninput', 'oninvalid', 'onkeydown',
+        'onkeypress', 'onkeyup', 'onload', 'onloadeddata', 'onloadedmetadata',
+        'onloadstart', 'onlostpointercapture', 'onmousedown', 'onmouseenter',
+        'onmouseleave', 'onmousemove', 'onmouseout', 'onmouseover', 'onmouseup',
+        'onmousewheel', 'onpause', 'onplay', 'onplaying', 'onpointercancel',
+        'onpointerdown', 'onpointerenter', 'onpointerleave', 'onpointermove',
+        'onpointerout', 'onpointerover', 'onpointerrawupdate', 'onpointerup',
+        'onprogress', 'onratechange', 'onreset', 'onresize', 'onscroll',
+        'onscrollend', 'onscrollsnapchange', 'onscrollsnapchanging', 'onsearch',
+        'onsecuritypolicyviolation', 'onseeked', 'onseeking', 'onselect',
+        'onselectionchange', 'onselectstart', 'onslotchange', 'onstalled',
+        'onsubmit', 'onsuspend', 'ontimeupdate', 'ontoggle', 'ontransitioncancel',
+        'ontransitionend', 'ontransitionrun', 'ontransitionstart',
+        'onvolumechange', 'onwaiting', 'onwebkitanimationend',
+        'onwebkitanimationiteration', 'onwebkitanimationstart',
+        'onwebkittransitionend', 'onwheel',
+    ];
+    const _windowOnly = new Set([
+        'onafterprint', 'onappinstalled', 'onbeforeinstallprompt', 'onbeforeprint',
+        'onbeforeunload', 'onbeforexrselect', 'ongamepadconnected',
+        'ongamepaddisconnected', 'onhashchange', 'onlanguagechange', 'onmessage',
+        'onmessageerror', 'onoffline', 'ononline', 'onpagehide', 'onpagereveal',
+        'onpageshow', 'onpageswap', 'onpopstate', 'onrejectionhandled',
+        'onstorage', 'onunhandledrejection', 'onunload',
+    ]);
+    // Explicitly assigned handlers (`el.onclick = fn`) win over the attribute.
+    const _onExplicit = new WeakMap();
+    // Compiled attribute sources, keyed by element, invalidated when the
+    // attribute text changes.
+    const _onCompiled = new WeakMap();
+
+    const _compileInlineHandler = (src) => {
+        let compiled;
+        try {
+            compiled = new Function("event", src);
+        } catch (_) {
+            // A syntactically broken attribute is a no-op in Chrome too.
+            return null;
+        }
+        // Returning false from an inline handler cancels the event
+        // (`<form onsubmit="return false">`); a listener added through
+        // addEventListener has no such rule, so it belongs here and not in
+        // the dispatch code.
+        return function (event) {
+            const r = compiled.call(this, event);
+            if (r === false && event && typeof event.preventDefault === "function") {
+                event.preventDefault();
+            }
+            return r;
+        };
+    };
+
+    for (const _name of _elementEventHandlerNames) {
+        if (_windowOnly.has(_name)) continue;
+        try {
+            Object.defineProperty(HTMLElement.prototype, _name, {
+                get() {
+                    const explicit = _onExplicit.get(this);
+                    if (explicit && _name in explicit) return explicit[_name];
+                    let src = null;
+                    try { src = this.getAttribute(_name); } catch (_) { /* detached */ }
+                    if (typeof src !== "string") return null;
+                    let cache = _onCompiled.get(this);
+                    if (!cache) { cache = Object.create(null); _onCompiled.set(this, cache); }
+                    const hit = cache[_name];
+                    if (hit && hit.src === src) return hit.fn;
+                    const fn = _compileInlineHandler(src);
+                    cache[_name] = { src, fn };
+                    return fn;
+                },
+                set(v) {
+                    let explicit = _onExplicit.get(this);
+                    if (!explicit) { explicit = Object.create(null); _onExplicit.set(this, explicit); }
+                    explicit[_name] = typeof v === "function" ? v : null;
+                },
+                enumerable: true,
+                configurable: true,
+            });
+        } catch (_) { /* ignore */ }
+    }
+
     globalThis.HTMLElement = HTMLElement;
     globalThis.HTMLDivElement = HTMLDivElement;
     globalThis.HTMLSpanElement = HTMLSpanElement;
@@ -2192,12 +3010,7 @@
                     get: function() { return _getIframeWindow(_appendedIframes[_fi]); },
                     configurable: true, enumerable: false,
                 });
-                // Update window.length (= number of child frames)
-                try {
-                    Object.defineProperty(globalThis, 'length', {
-                        value: _appendedIframes.length, configurable: true, writable: true,
-                    });
-                } catch (_) {}
+                // `window.length` is a live accessor now — see window_bootstrap.js.
             }
         } catch (_) {}
         if (_moObservers.length > 0) {
@@ -2580,18 +3393,7 @@
                 value: cw, writable: true, enumerable: true, configurable: true,
             });
         } catch (_) {}
-        // Update window.length
-        var _newLen = _fi + 1;
-        try {
-            const _ld = Object.getOwnPropertyDescriptor(globalThis, 'length');
-            if (_ld && _ld.writable) {
-                if (globalThis.length < _newLen) globalThis.length = _newLen;
-            } else {
-                Object.defineProperty(globalThis, 'length', {
-                    value: _newLen, writable: true, configurable: true, enumerable: true,
-                });
-            }
-        } catch (_) {}
+        // `window.length` counts the document's iframes directly — see window_bootstrap.js.
     }
 
     // Extract scheme+host+port from a URL without using new URL().
@@ -2653,6 +3455,21 @@
     }
 
     function _getIframeWindow(el) {
+        // A nested browsing context is created when the element is *inserted*,
+        // so a freshly created `<iframe>` has none and `contentWindow` is null.
+        // Handing one out anyway is a direct stealth signal: creepjs makes a
+        // detached iframe, reads `contentWindow`, and counts anything truthy as
+        // proof that the property has been proxied.
+        //
+        // The test is "has no parent at all", not `isConnected`: an iframe built
+        // *inside another frame's* document is connected to that realm's tree,
+        // and rejecting it broke the nested-iframe probe — which then fell back
+        // to the top window and let the page be overwritten. An iframe parented
+        // to a detached subtree still gets a window here; narrower than the spec,
+        // and the shape that actually gets probed is covered.
+        try {
+            if (el && !el.parentNode) return null;
+        } catch (_) { /* ignore */ }
         let state = _iframeState.get(el);
         if (state) {
             // Cross-origin transition: a script creates an iframe with no src, accesses
@@ -2735,25 +3552,39 @@
                 _srcdoc = el.srcdoc;
             }
         } catch (_) {}
-        const _mkHtmlMirror = (tag, inner) => ({
-            tagName: tag.toUpperCase(),
-            nodeType: 1,
-            innerHTML: inner,
-            outerHTML: "<" + tag + ">" + inner + "</" + tag + ">",
-            textContent: "",
-            children: [],
-            childNodes: [],
-            firstChild: null, lastChild: null,
-            parentNode: null,
-            getAttribute() { return null; },
-            setAttribute() {},
-            hasAttribute() { return false; },
-            appendChild(_c) {},
-            removeChild(_c) {},
-        });
-        const _docEl = _srcdoc ? _mkHtmlMirror("html", _srcdoc) : null;
-        const _body = _srcdoc ? _mkHtmlMirror("body", _srcdoc) : null;
-        const _head = _srcdoc ? _mkHtmlMirror("head", "") : null;
+        // Real elements, detached from the top document — not plain objects.
+        //
+        // The mirrors used to be object literals whose `appendChild` was a no-op
+        // and whose `innerHTML` was a bare string field, so everything a frame
+        // wrote into itself vanished: the markup was stored and then nothing
+        // could find it again, `getElementById` on that same document included.
+        // A widget that builds its probes inside a blank frame — which is how
+        // most of them measure fonts, rects and SVG geometry — got an empty
+        // answer and no error to explain it.
+        const _mkHtmlMirror = (tag, inner) => {
+            const el = _document.createElement(tag);
+            if (inner) {
+                try { el.innerHTML = inner; } catch (_) { /* ignore */ }
+            }
+            return el;
+        };
+        // An `about:blank` frame is not an empty object — it is a fully formed
+        // empty document, `<html><head></head><body></body></html>`, and
+        // `contentDocument.body` is an element there, never null. Gating these on
+        // `srcdoc` handed a blank frame a document with no body at all. Scripts
+        // reach for exactly that: a blank same-origin frame is the standard way
+        // to obtain untouched native objects, and the first thing such a probe
+        // does is look at `contentDocument.body`. Finding null, it waits for a
+        // document that is already as loaded as it will ever be.
+        const _docEl = _mkHtmlMirror("html", "");
+        const _head = _mkHtmlMirror("head", "");
+        // The frame's own markup belongs in its body, and the three are linked
+        // into one tree so a selector run from the document reaches all of it.
+        const _body = _mkHtmlMirror("body", _srcdoc);
+        try {
+            _docEl.appendChild(_head);
+            _docEl.appendChild(_body);
+        } catch (_) { /* ignore */ }
         const iframeDoc = {
             documentElement: _docEl,
             head: _head,
@@ -2763,26 +3594,110 @@
             visibilityState: "visible",
             hidden: false,
             hasFocus() { return false; },
-            querySelector() { return null; },
-            querySelectorAll() { return new NodeList([]); },
-            getElementById() { return null; },
+            // Searched for real, against the frame's own tree. These returned
+            // nothing unconditionally, which made the document contradict
+            // itself: markup went in through `body.innerHTML` and no query on
+            // the same document could see it.
+            querySelector(sel) {
+                try { return _docEl.querySelector(sel); } catch (_) { return null; }
+            },
+            querySelectorAll(sel) {
+                try { return _docEl.querySelectorAll(sel); } catch (_) { return new NodeList([]); }
+            },
+            getElementById(id) {
+                const quoted = String(id).replace(/["\\]/g, "\\$&");
+                try { return _docEl.querySelector('[id="' + quoted + '"]'); }
+                catch (_) { return null; }
+            },
             getElementsByTagName(tag) {
                 const t = String(tag).toLowerCase();
-                if (_srcdoc && t === "html" && _docEl) return new NodeList([_docEl]);
-                if (_srcdoc && t === "body" && _body) return new NodeList([_body]);
-                if (_srcdoc && t === "head" && _head) return new NodeList([_head]);
-                return new NodeList([]);
+                // The document's own three are not descendants of themselves.
+                // `NodeList` is built from node ids, not from node objects.
+                if (t === "html" && _docEl) return new NodeList([_getNodeId(_docEl)]);
+                if (t === "body" && _body) return new NodeList([_getNodeId(_body)]);
+                if (t === "head" && _head) return new NodeList([_getNodeId(_head)]);
+                try { return _docEl.getElementsByTagName(tag); }
+                catch (_) { return new NodeList([]); }
             },
+            // Collections of an empty document are empty, not absent. A missing
+            // method is not a smaller document — it is a different kind of
+            // object, and the first thing a script does with one is call it:
+            // `[...doc.getElementsByClassName('x')]` threw "not a function"
+            // inside a widget's own probe frame and took its whole collector
+            // down with it.
+            getElementsByClassName(cls) {
+                try { return _docEl.getElementsByClassName(cls); }
+                catch (_) { return new NodeList([]); }
+            },
+            getElementsByName(name) {
+                const quoted = String(name).replace(/["\\]/g, "\\$&");
+                try { return _docEl.querySelectorAll('[name="' + quoted + '"]'); }
+                catch (_) { return new NodeList([]); }
+            },
+            get forms() { return new NodeList([]); },
+            get images() { return new NodeList([]); },
+            get links() { return new NodeList([]); },
+            get scripts() { return new NodeList([]); },
+            get styleSheets() { return []; },
+            get activeElement() { return _body; },
+            // Derived, not assigned: the realm's window is wired up on more
+            // than one construction path and only some of them reach the
+            // assignment site.
+            get location() {
+                const view = iframeDoc.defaultView;
+                return (view && view.location) || null;
+            },
+            nodeType: 9,
+            nodeName: "#document",
+            characterSet: "UTF-8",
+            charset: "UTF-8",
+            inputEncoding: "UTF-8",
+            contentType: "text/html",
+            compatMode: "CSS1Compat",
+            doctype: null,
+            referrer: "",
+            cookie: "",
             createElement(tag) { return _document.createElement(tag); },
             createElementNS(ns, tag) { return _document.createElementNS(ns, tag); },
             createEvent(type) { return _document.createEvent(type); },
             createRange() { return _document.createRange(); },
             createTextNode(text) { return _document.createTextNode(text); },
+            createComment(text) { return _document.createComment(text); },
+            createDocumentFragment() { return _document.createDocumentFragment(); },
+            createAttribute(name) { return _document.createAttribute(name); },
+            importNode(node, deep) { return _document.importNode(node, deep); },
+            adoptNode(node) { return _document.adoptNode(node); },
+            elementFromPoint() { return null; },
+            elementsFromPoint() { return []; },
+            getSelection() { return null; },
             write(html) { return _document.write(html); },
             writeln(html) { return _document.writeln(html); },
             open() { return _document.open(); },
             close() { return _document.close(); },
+            // A document is an EventTarget. Listeners are kept here rather than
+            // forwarded to the parent document, which would let a frame's
+            // handlers fire on the top page's events.
+            addEventListener(type, fn) {
+                if (typeof fn !== "function") return;
+                (_docListeners[type] || (_docListeners[type] = [])).push(fn);
+            },
+            removeEventListener(type, fn) {
+                const list = _docListeners[type];
+                if (!list) return;
+                const at = list.indexOf(fn);
+                if (at >= 0) list.splice(at, 1);
+            },
+            dispatchEvent(ev) {
+                const list = ev && _docListeners[ev.type];
+                if (list) {
+                    for (const fn of list.slice()) {
+                        try { fn.call(iframeDoc, ev); } catch (_) { /* ignore */ }
+                    }
+                }
+                return true;
+            },
         };
+        const _docListeners = Object.create(null);
 
         // ── Screen mirror ─────────────────────────────────────────────────
         const _parentScreen = globalThis.screen || {};
@@ -2833,6 +3748,15 @@
 
             // iframeDoc back-reference to default view (set before _sp calls)
             try { iframeDoc.defaultView = cw; } catch (_) {}
+            // ...and the URL trio, which only make sense once the realm's own
+            // location exists. A document with no `URL` is not something a
+            // browser can produce.
+            try {
+                const href = (cw.location && cw.location.href) || "about:blank";
+                iframeDoc.URL = href;
+                iframeDoc.documentURI = href;
+                iframeDoc.baseURI = href;
+            } catch (_) { /* ignore */ }
 
             // Document
             _sp("document", iframeDoc);
@@ -3352,8 +4276,11 @@
         return iframeWindow;
     }
     function _getIframeDocument(el) {
-        _getIframeWindow(el); // ensure state is built
-        return _iframeState.get(el).contentDocument;
+        // Null for the same reason `contentWindow` is: no browsing context until
+        // the element is in a document.
+        if (_getIframeWindow(el) === null) return null;
+        const state = _iframeState.get(el);
+        return state ? state.contentDocument : null;
     }
 
     // Install on HTMLIFrameElement.prototype — covers parsed AND created iframes.
@@ -3382,6 +4309,12 @@
             get: function() { return _srcdocValues.get(this) || this.getAttribute('srcdoc') || ''; },
             set: function(v) {
                 _srcdocValues.set(this, String(v));
+                // Write the attribute too. Keeping the value only in the WeakMap
+                // made the assignment invisible to everything that reads the DOM:
+                // the host scans attributes to decide which frames exist, so a
+                // script-built srcdoc frame was never given a browsing context —
+                // and the frame lifecycle hook on `setAttribute` never fired.
+                try { this.setAttribute('srcdoc', String(v)); } catch (_) { /* detached */ }
                 const _st = _iframeState.get(this);
                 if (_st && _st._realmId !== undefined && v && String(v) !== _st._processedSrcdoc) {
                     _st._processedSrcdoc = String(v);
@@ -3578,7 +4511,7 @@
     // waiting on its embedder simply hangs forever. Non-enumerable, same discipline
     // as `__bo_input_api` and `__bo_mark_trusted`.
     try {
-        Object.defineProperty(globalThis, "__bo_frames", {
+        Object.defineProperty(_boNs, "frames", {
             value: {
                 postToParent(json) {
                     try { ops.op_iframe_post_to_parent(json); } catch (_) { /* no host */ }
@@ -3591,6 +4524,24 @@
                 },
                 takeChildMessages() {
                     try { return ops.op_iframe_take_child_messages(); } catch (_) { return []; }
+                },
+                // The `source` of a MessageEvent the host delivers up from a frame.
+                // A widget replies with `event.source.postMessage(...)`, so a null
+                // source silently ends the conversation at the embedder.
+                windowForNode(nodeId) {
+                    try {
+                        const el = _wrapNode(nodeId);
+                        return el ? el.contentWindow : null;
+                    } catch (_) {
+                        return null;
+                    }
+                },
+                // Inverse of `windowForNode`. Message routing keys on node ids that
+                // are otherwise invisible from script, so a frame that silently
+                // receives nothing cannot be told apart from one that was never
+                // registered without this.
+                nodeIdOf(el) {
+                    try { return _getNodeId(el); } catch (_) { return -1; }
                 },
             },
             writable: false,

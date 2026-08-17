@@ -17,6 +17,18 @@ pub struct ScriptInfo {
     /// which throws `SyntaxError: Cannot use import statement outside a module`
     /// and silently drops modern Vite/React/Vue bundles. (P2 / thin-render fix.)
     pub is_module: bool,
+    /// `defer` on an external classic script: run after parsing, in document
+    /// order, before `DOMContentLoaded`. Modules are deferred by default.
+    pub defer: bool,
+    /// `async` on an external classic script: run as soon as it is available,
+    /// out of document order, and *after* `DOMContentLoaded` in practice.
+    ///
+    /// Order is not cosmetic here. A page whose markup is built by an earlier
+    /// script on `DOMContentLoaded` — the common shape for JS-rendered pages —
+    /// hands an async third-party widget a fully built document. Running that
+    /// widget at its document position instead gives it an empty page, it finds
+    /// nothing to attach to, and it never scans again.
+    pub is_async: bool,
     /// Raw `NodeId` of the `<script>` element in the arena DOM. Used to set
     /// `document.currentScript` to this element's wrapper for the duration of
     /// the script's execution (the standard web-API contract). Scripts that
@@ -83,6 +95,11 @@ fn collect_scripts(dom: &Dom, node_id: NodeId, scripts: &mut Vec<ScriptInfo>) {
                     // token) routes to the ES-module path. `type="importmap"`
                     // is handled separately (skipped here, not executable code).
                     let is_module = script_type == Some("module");
+                    let has = |name: &str| elem.attrs.iter().any(|a| a.name.local == name);
+                    // Both present: `async` wins for classic scripts. Modules are
+                    // deferred unless explicitly async.
+                    let is_async = has("async");
+                    let defer = (has("defer") || is_module) && !is_async;
                     if script_type == Some("importmap") || script_type == Some("speculationrules") {
                         collect_scripts(dom, child_id, scripts);
                         continue;
@@ -95,6 +112,8 @@ fn collect_scripts(dom: &Dom, node_id: NodeId, scripts: &mut Vec<ScriptInfo>) {
                             src,
                             nonce,
                             is_module,
+                            defer,
+                            is_async,
                             node_id: child_id.to_raw(),
                         });
                     } else {
@@ -106,6 +125,9 @@ fn collect_scripts(dom: &Dom, node_id: NodeId, scripts: &mut Vec<ScriptInfo>) {
                                 src: None,
                                 nonce,
                                 is_module,
+                                // Inline scripts ignore both attributes.
+                                defer: false,
+                                is_async: false,
                                 node_id: child_id.to_raw(),
                             });
                         }
@@ -123,4 +145,58 @@ fn decode_html_entities(s: &str) -> String {
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scripts_of(html: &str) -> Vec<ScriptInfo> {
+        find_scripts(&crate::html_parser::parse_html(html))
+    }
+
+    /// Execution order is decided by these two attributes, and getting them
+    /// wrong is silent: an `async` third-party widget run at its document
+    /// position sees a page its predecessors have not built yet.
+    #[test]
+    fn defer_and_async_are_read_from_the_tag() {
+        let s = scripts_of(
+            r#"<html><head>
+                 <script src="/a.js"></script>
+                 <script src="/b.js" defer></script>
+                 <script src="/c.js" async></script>
+                 <script src="/d.js" async defer></script>
+                 <script type="module" src="/e.js"></script>
+                 <script>var inline = 1;</script>
+               </head><body></body></html>"#,
+        );
+        let by_src = |name: &str| {
+            s.iter()
+                .find(|x| x.src.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("нет скрипта {name}"))
+        };
+
+        assert!(
+            !by_src("/a.js").defer && !by_src("/a.js").is_async,
+            "обычный"
+        );
+        assert!(by_src("/b.js").defer && !by_src("/b.js").is_async, "defer");
+        assert!(by_src("/c.js").is_async && !by_src("/c.js").defer, "async");
+        // Both present: async wins for classic scripts.
+        assert!(
+            by_src("/d.js").is_async && !by_src("/d.js").defer,
+            "async defer → async"
+        );
+        // Modules are deferred by default.
+        assert!(
+            by_src("/e.js").defer && by_src("/e.js").is_module,
+            "модуль отложен по умолчанию"
+        );
+
+        let inline = s.iter().find(|x| x.src.is_none()).expect("инлайн");
+        assert!(
+            !inline.defer && !inline.is_async,
+            "инлайн игнорирует оба атрибута"
+        );
+    }
 }

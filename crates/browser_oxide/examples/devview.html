@@ -72,6 +72,9 @@
                padding:5px 7px; border-radius:4px; font:inherit; }
   #bar button { background:var(--acc); border:0; color:#0b0c0e; padding:5px 11px; border-radius:4px;
                 cursor:pointer; font:inherit; font-weight:600; }
+  /* Frame substitution in the mirror (see frameBox). */
+  .bo-frame { display:inline-block; overflow:auto; vertical-align:top; position:relative; }
+  .bo-frame-body { }
   #sel { padding:4px 9px; border-top:1px solid var(--line); color:var(--dim); word-break:break-all; font-size:11px; }
   #status, #counts { padding:3px 10px; border-bottom:1px solid var(--line); font-size:11px; word-break:break-all; }
   #chalbadge { font-size:11px; }
@@ -130,6 +133,8 @@
 
 <script>
   let picked = null, lastHtml = '';
+  let lastFrameDocs = [];
+  let framesDirty = false;
   let trail = [], t0 = Date.now();
   const $ = (id) => document.getElementById(id);
 
@@ -142,12 +147,26 @@
   let ws = null;
   function connect() {
     ws = new WebSocket('ws://127.0.0.1:__WS_PORT__');
-    ws.onopen = () => { $('conn').className = 'on'; $('conn').textContent = '● связь'; };
+    ws.onopen = () => {
+      $('conn').className = 'on'; $('conn').textContent = '● связь';
+      // Frame documents are streamed change-only, so a view that just opened —
+      // or reloaded, or reconnected after the engine restarted — would be told
+      // "unchanged" about markup it has never seen. Ask for the record to be
+      // dropped so the next snapshot carries every frame in full.
+      lastFrameDocs.length = 0;
+      send({ action: 'resync' });
+    };
     ws.onclose = () => {
       $('conn').className = 'off'; $('conn').textContent = '● нет связи';
       setTimeout(connect, 1000);
     };
-    ws.onmessage = (e) => { try { handle(JSON.parse(e.data)); } catch (_) {} };
+    // A swallowed exception here is indistinguishable from "the engine sent
+    // nothing": the view just stops updating, with an empty console to explain
+    // it. Report it in the console drawer the same way an engine error is.
+    ws.onmessage = (e) => {
+      try { handle(JSON.parse(e.data)); }
+      catch (err) { log('ошибка в devview: ' + (err && err.message || err), 'bad'); }
+    };
   }
   const send = (o) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
   connect();
@@ -219,6 +238,20 @@
     if (msg.kind !== 'snapshot') return;
     if (msg.net && msg.net.length) addNet(msg.net);
     if (msg.console && msg.console.length) addConsole(msg.console);
+    // `null` for a frame means "unchanged" — keep what we already have.
+    if (msg.frameDocs) {
+      // A frame's document arrives in its own snapshot, after the one that
+      // carried the page markup — and the page markup then stops changing. Without
+      // marking the mirror dirty the frame box renders once, empty, forever.
+      msg.frameDocs.forEach(function (d, i) {
+        if (d !== null && d !== lastFrameDocs[i]) { lastFrameDocs[i] = d; framesDirty = true; }
+      });
+      // Deliberately not truncated to the incoming length. `null` means "unchanged",
+      // so this array is the only copy — and the engine will not resend a document
+      // it has already decided is unchanged. One short array (a frame momentarily
+      // out of the tree) would drop a document permanently, leaving a box that
+      // reads "пусто" for the rest of the session.
+    }
     paint(msg.data);
   }
 
@@ -308,12 +341,58 @@
     }
   }
 
+  // Turns one serialised <iframe …data-bo-frame="N"…> into a box carrying the
+  // child realm's own document.
+  function frameBox(tag) {
+    const m = /data-bo-frame="(\d+)"/.exec(tag);
+    const i = m ? Number(m[1]) : -1;
+    const meta = (lastFrames && lastFrames[i]) || null;
+    const w = meta ? meta.box[0] : 0, h = meta ? meta.box[1] : 0;
+    const src = meta ? meta.src : 'iframe';
+    // Parse the role from the *unmodified* src: stripping `&` first glued the
+    // next parameter onto it ("checkbox" + "id" → "checkboxid").
+    // Computed before the hidden-frame branch below, which reads it too — a
+    // `const` used above its declaration is a ReferenceError, and a captcha's
+    // frames are hidden most of the time, so that path is the common one.
+    const raw = String(src);
+    const role = (/#frame=([a-z-]+)/i.exec(raw) || [])[1] || '';
+    let host = '';
+    try { host = new URL(raw).hostname; } catch (_) {}
+    const label = (role || host || raw.slice(0, 40)).replace(/[<>&"]/g, '');
+    // Hidden frames contribute nothing: the engine keeps their document alive
+    // (that is how the challenge stays ready), but drawing it would paste the
+    // captcha's text over the page.
+    if (meta && meta.shown === false) {
+      return '<div class="bo-frame" data-bo-idx="' + i + '" title="frame ' + i + ' · ' +
+             label + ' · скрыт" style="width:' + w + 'px;height:' + h + 'px"></div>';
+    }
+    let inner = lastFrameDocs[i] || '';
+    // The child document gets the same treatment as the top one, recursively:
+    // no scripts, no nested frames.
+    inner = String(inner)
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi, '')
+      .replace(/<iframe\b[^>]*>/gi, '')
+      .replace(/<noscript[\s\S]*?<\/noscript>/gi, '');
+    const size = (w && h) ? (w + '×' + h) : 'без размера';
+    // No visible label: the index is only needed by the click router (it rides in
+    // the attribute) and the role/size are already shown in the selector line when
+    // you click. A caption over the frame is just noise on top of the captcha.
+    return '<div class="bo-frame" data-bo-idx="' + i + '" title="frame ' + i + ' · ' +
+           label + ' · ' + size + '" style="width:' + (w || 300) +
+           'px;height:' + (h || 150) + 'px">' +
+           '<div class="bo-frame-body">' + (inner || '<i>пусто</i>') + '</div></div>';
+  }
+
+  let lastFrames = [];
+
   function paint(s) {
+    lastFrames = s.frames || [];
     $('counts').textContent = s.counts
       ? `${s.counts.elements} эл · ${s.counts.inputs} input · ${s.counts.buttons} button` : '';
 
-    if (s.html && s.html !== lastHtml) {
-      lastHtml = s.html;
+    if (s.html && (s.html !== lastHtml || framesDirty)) {
+      framesDirty = false;
       // Author CSS now reaches the mirror, so no cosmetic overrides are needed.
       // These two compensate for state the engine leaves unfinished: MUI writes
       // `opacity: 0` inline and animates it from JS that never completes here, and
@@ -334,8 +413,13 @@
         //  · preload hints for assets nothing will consume warn on every load
         //  · crossorigin on fonts fails CORS from 127.0.0.1
         .replace(/<noscript[\s\S]*?<\/noscript>/gi, '')
-        .replace(/<iframe[\s\S]*?<\/iframe>/gi, '')
-        .replace(/<iframe[^>]*>/gi, '')
+        // Frames are substituted, not dropped. A real <iframe> here cannot help:
+        // the mirror runs without allow-scripts, so it would render blank, and
+        // allowing scripts would re-run the third party inside the viewer's own
+        // browser — showing Chrome's result instead of the engine's. So each frame
+        // becomes a labelled box holding the document the engine built for it.
+        .replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi, frameBox)
+        .replace(/<iframe\b[^>]*>/gi, frameBox)
         .replace(/<script[\s\S]*?<\/script>/gi, '')
         .replace(/<script[^>]*\/?>/gi, '')
         .replace(/<link[^>]+rel=["']?(?:module)?preload["']?[^>]*>/gi, '')
@@ -345,11 +429,32 @@
         // mirror fall back to system faces — metrics shift slightly, layout does not.
         .replace(/@font-face\s*\{[^}]*\}/gi, '')
         .replace(/<head([^>]*)>/i, `<head$1><base href="${s.url}">${unfinished}`);
+      // Only once the transform above has survived. Marking the markup as drawn
+      // before doing the drawing means one throw in `frameBox` retires the
+      // mirror for good: every later snapshot carries the same html, compares
+      // equal, and skips the render — a blank pane with nothing in the console.
+      lastHtml = s.html;
       const f = $('mirror');
       f.srcdoc = html;
       f.onload = () => {
         const d = f.contentDocument; if (!d) return;
-        d.addEventListener('click', ev => { ev.preventDefault(); pick(selectorFor(ev.target)); }, true);
+        d.addEventListener('click', ev => {
+          ev.preventDefault();
+          // A click landing inside a frame box belongs to that frame's realm —
+          // the mirror is a copy, so the click has to be replayed in the engine,
+          // and replaying it against the top document would miss entirely.
+          const box = ev.target.closest && ev.target.closest('.bo-frame');
+          if (box) {
+            const idx = box.getAttribute('data-bo-idx');
+            const body = box.querySelector('.bo-frame-body');
+            const sel = selectorWithin(body, ev.target);
+            $('sel').textContent = 'frame ' + idx + ' → ' + sel;
+            picked = null;
+            send({ action: 'frameclick', index: String(idx), sel: sel, text: '' });
+            return;
+          }
+          pick(selectorFor(ev.target));
+        }, true);
         d.addEventListener('submit', ev => ev.preventDefault(), true);
       };
     }
@@ -381,6 +486,20 @@
   function pick(sel) {
     picked = sel;
     $('sel').textContent = sel;
+  }
+
+  // Same as selectorFor, but stops at `root` — the frame body — so the result is
+  // a selector valid inside the child realm's own document.
+  function selectorWithin(root, el) {
+    if (el.id) return '#' + CSS.escape(el.id);
+    const parts = [];
+    while (el && el.nodeType === 1 && el !== root) {
+      const p = el.parentNode; if (!p) break;
+      const same = [...p.children].filter(c => c.tagName === el.tagName);
+      parts.unshift(el.tagName.toLowerCase() + (same.length > 1 ? `:nth-of-type(${same.indexOf(el) + 1})` : ''));
+      el = p;
+    }
+    return parts.join(' > ');
   }
 
   function selectorFor(el) {

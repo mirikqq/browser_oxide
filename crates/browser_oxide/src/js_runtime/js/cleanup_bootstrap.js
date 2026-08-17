@@ -1,5 +1,7 @@
 ((globalThis) => {
     const ops = Deno && Deno.core && Deno.core.ops;
+    // Captured before the internals purge below removes the global.
+    const _maskRef = globalThis._maskFunction;
     // -- Per-page secure-context gating (Phase 7) --------------------
     // The V8 snapshot bootstraps with is_secure_context=true so all
     // [SecureContext]-only Web Platform APIs are baked in. On insecure
@@ -7,8 +9,18 @@
     // Chrome.
     try {
         const _ops = Deno && Deno.core && Deno.core.ops;
-        const _isSecure = _ops && _ops.op_is_secure_context && _ops.op_is_secure_context();
-        if (!_isSecure) {
+        // Live, not a snapshot: a pooled page is built blank and navigated
+        // afterwards, so anything that must track the document has to ask each
+        // time. (The deletions below are one-shot by nature — a stripped global
+        // cannot be un-stripped — but the crypto mask is re-evaluated per access.)
+        const _isSecure = () => {
+            try {
+                return !!(_ops && _ops.op_is_secure_context && _ops.op_is_secure_context());
+            } catch (_e) {
+                return false;
+            }
+        };
+        if (!_isSecure()) {
             // Methods + globals registered as values in the snapshot.
             // Navigator getters (mediaDevices, clipboard, ...) gate
             // themselves lazily so they don't need stripping.
@@ -24,9 +36,21 @@
             // DedicatedWorkerGlobalScope, WorkerGlobalScope, CSSPseudoElement
             // are absent from Chrome 147's globalThis on insecure pages —
             // verified against a real browser.
+            // …but not inside a worker, where `WorkerGlobalScope` and
+            // `DedicatedWorkerGlobalScope` are the realm's own interfaces and
+            // must be present: `!self.document && self.WorkerGlobalScope` is how
+            // a script decides it is in a worker at all, and stripping them made
+            // libraries run their window path there and produce nothing. The
+            // rule above is about a *window* on an insecure page, which is where
+            // Chrome really does hide them.
+            //
+            // Read off the prototype rather than the global, because that is
+            // what this loop is in the middle of deleting.
+            const _inWorkerRealm =
+                Object.prototype.toString.call(globalThis) === "[object DedicatedWorkerGlobalScope]";
             for (const k of [
                 "SharedArrayBuffer", "webkitAudioContext",
-                "DedicatedWorkerGlobalScope", "WorkerGlobalScope",
+                ...(_inWorkerRealm ? [] : ["DedicatedWorkerGlobalScope", "WorkerGlobalScope"]),
                 "CSSPseudoElement",
                 "ApplePaySession", "AuthenticatorAssertionResponse",
                 "AuthenticatorAttestationResponse", "AuthenticatorResponse",
@@ -49,38 +73,49 @@
             ]) {
                 try { delete globalThis[k]; } catch (_e) {}
             }
-            // crypto.subtle + crypto.randomUUID are [SecureContext]. They
-            // come from deno_core's crypto extension and are non-configurable
-            // own properties. `delete` fails — replace `globalThis.crypto`
-            // with a Proxy that hides those two keys.
-            if (globalThis.crypto) {
-                const _origCrypto = globalThis.crypto;
-                const _maskedCrypto = new Proxy(_origCrypto, {
-                    get(target, prop, receiver) {
-                        if (prop === 'subtle' || prop === 'randomUUID') return undefined;
-                        const v = Reflect.get(target, prop, receiver);
-                        return typeof v === 'function' ? v.bind(target) : v;
-                    },
-                    has(target, prop) {
-                        if (prop === 'subtle' || prop === 'randomUUID') return false;
-                        return Reflect.has(target, prop);
-                    },
-                    ownKeys(target) {
-                        return Reflect.ownKeys(target).filter(
-                            (k) => k !== 'subtle' && k !== 'randomUUID',
-                        );
-                    },
-                    getOwnPropertyDescriptor(target, prop) {
-                        if (prop === 'subtle' || prop === 'randomUUID') return undefined;
-                        return Reflect.getOwnPropertyDescriptor(target, prop);
-                    },
+        }
+
+        // crypto.subtle + crypto.randomUUID are [SecureContext]. They
+        // come from deno_core's crypto extension and are non-configurable
+        // own properties. `delete` fails — replace `globalThis.crypto`
+        // with a Proxy that hides those two keys.
+        if (globalThis.crypto) {
+            const _origCrypto = globalThis.crypto;
+            // The mask has to track the *document*, not the moment this
+            // bootstrap ran. A pooled page is built on a blank document and
+            // then navigated, so a decision frozen here outlives the context
+            // it was made for: the page ends up on https reporting
+            // `isSecureContext === true` while these two stay hidden. No real
+            // browser shows that combination, and code that branches on
+            // secure context then takes the branch and finds nothing.
+            const _hidden = (prop) =>
+                (prop === 'subtle' || prop === 'randomUUID') && !_isSecure();
+            const _maskedCrypto = new Proxy(_origCrypto, {
+                get(target, prop, receiver) {
+                    if (_hidden(prop)) return undefined;
+                    const v = Reflect.get(target, prop, receiver);
+                    return typeof v === 'function' ? v.bind(target) : v;
+                },
+                has(target, prop) {
+                    if (_hidden(prop)) return false;
+                    return Reflect.has(target, prop);
+                },
+                ownKeys(target) {
+                    const keys = Reflect.ownKeys(target);
+                    return _isSecure()
+                        ? keys
+                        : keys.filter((k) => k !== 'subtle' && k !== 'randomUUID');
+                },
+                getOwnPropertyDescriptor(target, prop) {
+                    if (_hidden(prop)) return undefined;
+                    return Reflect.getOwnPropertyDescriptor(target, prop);
+                },
+            });
+            try {
+                Object.defineProperty(globalThis, 'crypto', {
+                    value: _maskedCrypto, configurable: true, enumerable: true, writable: true,
                 });
-                try {
-                    Object.defineProperty(globalThis, 'crypto', {
-                        value: _maskedCrypto, configurable: true, enumerable: true, writable: true,
-                    });
-                } catch (_e) {}
-            }
+            } catch (_e) {}
         }
     } catch (_e) { /* secure-context cleanup is best-effort */ }
 
@@ -457,9 +492,75 @@
             // so `String(webkitAudioContext)` is
             // `function AudioContext() { [native code] }`. Masking them
             // to their prefixed key would itself be a divergence.
+            // Chrome's legacy webkit-prefixed globals. Their absence is not a
+            // subtle statistical signal: a public detector rejected this engine
+            // outright with "Chrome UA but webkitRequestAnimationFrame absent"
+            // and marked the browser tampered on that single line.
+            //
+            // Shapes verified against Chrome: the constructors are the *same
+            // object* as their unprefixed form, while the two animation-frame
+            // functions are separate wrappers carrying their own prefixed names.
+            // `webkitAudioContext` is deliberately not here — Chrome removed it.
+            for (const [alias, base] of [
+                ['webkitURL', 'URL'],
+                ['webkitMediaStream', 'MediaStream'],
+                ['webkitURL', 'URL'],
+                ['WebKitMutationObserver', 'MutationObserver'],
+                ['webkitSpeechRecognition', 'SpeechRecognition'],
+                ['webkitRTCPeerConnection', 'RTCPeerConnection'],
+                ['WebKitMutationObserver', 'MutationObserver'],
+                ['webkitSpeechRecognition', 'SpeechRecognition'],
+                ['webkitSpeechGrammar', 'SpeechGrammar'],
+                ['webkitSpeechGrammarList', 'SpeechGrammarList'],
+                ['webkitSpeechRecognitionError', 'SpeechRecognitionErrorEvent'],
+                ['webkitSpeechRecognitionEvent', 'SpeechRecognitionEvent'],
+            ]) {
+                try {
+                    // Overwrites an existing stub on purpose: the interface table
+                    // creates these names as separate constructors, and in Chrome
+                    // the prefixed name IS the unprefixed object. Two distinct
+                    // constructors where a browser has one is the tell.
+                    if (globalThis[base] !== undefined) {
+                        Object.defineProperty(globalThis, alias, {
+                            value: globalThis[base],
+                            writable: true, enumerable: false, configurable: true,
+                        });
+                    }
+                } catch (_e) {}
+            }
+            for (const [alias, base] of [
+                ['webkitRequestAnimationFrame', 'requestAnimationFrame'],
+                ['webkitCancelAnimationFrame', 'cancelAnimationFrame'],
+            ]) {
+                try {
+                    if (globalThis[alias] !== undefined) continue;
+                    const target = globalThis[base];
+                    if (typeof target !== 'function') continue;
+                    // Method shorthand: no `prototype`, not constructible — the
+                    // shape of a native function.
+                    const wrapper = ({ [alias](...args) { return target.apply(this, args); } })[alias];
+                    // Enumerable, like every other window *method* in Chrome —
+                    // its prefixed constructors are hidden but these two are not,
+                    // and a detector that reads their descriptors compares the
+                    // flags, not just the presence.
+                    // Arity mirrors the function it forwards to; Chrome reports 1
+                    // for both prefixed animation-frame aliases.
+                    try {
+                        Object.defineProperty(wrapper, 'length', {
+                            value: target.length || 1, configurable: true,
+                        });
+                    } catch (_e) {}
+                    Object.defineProperty(globalThis, alias, {
+                        value: wrapper, writable: true, enumerable: true, configurable: true,
+                    });
+                    if (typeof globalThis._maskFunction === 'function') {
+                        globalThis._maskFunction(wrapper, alias);
+                    }
+                } catch (_e) {}
+            }
+
             const _sfcNames = [
                 ['webkitMediaStream', 'MediaStream'],
-                ['webkitAudioContext', 'AudioContext'],
                 ['webkitRTCPeerConnection', 'RTCPeerConnection'],
                 'fetch', 'clearTimeout', 'clearInterval', 'setTimeout',
                 'setInterval', 'TouchEvent', 'AudioContext', 'OffscreenCanvas',
@@ -765,5 +866,130 @@
             }
         });
     }
+
+    // -- Every engine-provided function reports as native ------------
+    //
+    // Masking used to be a hand-kept list, and the list drifted: 25 interfaces —
+    // `Navigator`, `Location`, `History`, `Screen`, `Performance` among them —
+    // stringified as their own JS class source. `String(window.Navigator)` is one
+    // line, every browser answers `function Navigator() { [native code] }`, and a
+    // public detector reports the difference as tampered functions.
+    //
+    // A sweep instead of a list, run here: this bootstrap is the last thing
+    // before the page's own scripts, so everything reachable is the engine's and
+    // nothing of the page's can be caught by mistake.
+    try {
+        const mask = _maskRef;
+        if (typeof mask === 'function') {
+            const seen = new Set();
+            const isNative = (fn) => {
+                try { return String(Function.prototype.toString.call(fn)).indexOf('[native code]') >= 0; }
+                catch (_e) { return true; }
+            };
+            const sweep = (obj, depth) => {
+                if (!obj || depth > 1) return;
+                let names;
+                try { names = Object.getOwnPropertyNames(obj); } catch (_e) { return; }
+                for (const key of names) {
+                    if (key === 'caller' || key === 'callee' || key === 'arguments') continue;
+                    let d;
+                    try { d = Object.getOwnPropertyDescriptor(obj, key); } catch (_e) { continue; }
+                    if (!d) continue;
+                    for (const fn of [d.value, d.get, d.set]) {
+                        if (typeof fn !== 'function' || seen.has(fn)) continue;
+                        seen.add(fn);
+                        if (isNative(fn)) continue;
+                        const label = fn.name || key;
+                        try { mask(fn, label); } catch (_e) {}
+                    }
+                    // One level down: a constructor's prototype carries the
+                    // methods scripts actually reach for.
+                    if (depth === 0 && typeof d.value === 'function' && d.value.prototype) {
+                        sweep(d.value.prototype, 1);
+                    }
+                }
+            };
+            sweep(globalThis, 0);
+        }
+    } catch (_e) { /* best effort */ }
+
+    // -- Arity of window methods, as Chrome reports it ----------------
+    //
+    // `Function.length` is a configurable own property and a bot check reads it
+    // next to the name and the source: `setTimeout` declared as `(...args)`
+    // reports 0 where every browser reports 1. Applied here because these are
+    // defined across several bootstraps and some are replaced after their own.
+    try {
+        for (const [name, len] of [
+            ['setTimeout', 1], ['setInterval', 1],
+            ['clearTimeout', 0], ['clearInterval', 0],
+            ['requestAnimationFrame', 1], ['cancelAnimationFrame', 1],
+            ['requestIdleCallback', 1], ['cancelIdleCallback', 1],
+            ['fetch', 1], ['queueMicrotask', 1], ['structuredClone', 1],
+            ['atob', 1], ['btoa', 1], ['getComputedStyle', 1], ['matchMedia', 1],
+        ]) {
+            const fn = globalThis[name];
+            if (typeof fn === 'function' && fn.length !== len) {
+                try {
+                    Object.defineProperty(fn, 'length', { value: len, configurable: true });
+                } catch (_e) {}
+            }
+        }
+    } catch (_e) { /* best effort */ }
+
+    // -- Interfaces that belong to other realms or other browsers -----
+    //
+    // `WorkerGlobalScope`/`DedicatedWorkerGlobalScope` are a *worker's* own
+    // interfaces and are not on a window; `ApplePaySession` is Safari's, not
+    // Chrome's. Both were reachable here, and a global this engine has that the
+    // browser it claims to be does not is exactly what a namespace comparison
+    // reports as an unusual property. Verified against a real Chrome.
+    try {
+        const _inWorker =
+            Object.prototype.toString.call(globalThis) === '[object DedicatedWorkerGlobalScope]';
+        if (!_inWorker) {
+            for (const k of ['WorkerGlobalScope', 'DedicatedWorkerGlobalScope', 'ApplePaySession']) {
+                try { delete globalThis[k]; } catch (_e) {}
+            }
+        }
+    } catch (_e) { /* best effort */ }
+
+    // -- Host hooks off the global namespace --------------------------
+    //
+    // The engine's own state and the callbacks the host drives it through were
+    // plain named globals: `_browser_oxide`, `__resetPageGlobals`,
+    // `__pendingNavigation` and the rest. `Object.getOwnPropertyNames(window)`
+    // listed all ten, one of them spelling out the engine's name, and comparing
+    // that list against a real Chrome's is a standard check — a public bot
+    // detector reports it as "unusual window properties".
+    //
+    // They move onto the symbol-keyed namespace, which no enumeration reaches,
+    // and the host reaches them the same way it reaches `setCurrentScript`.
+    try {
+        const _ns = (function () {
+            const syms = Object.getOwnPropertySymbols(globalThis);
+            for (let i = 0; i < syms.length; i++) {
+                const v = globalThis[syms[i]];
+                if (v && v.__bo) return v;
+            }
+            return null;
+        })();
+        if (_ns) {
+            const host = { bo: globalThis._browser_oxide || null };
+            for (const name of [
+                '__bgSetTimeout', '__boResult', '__cancelAllListeners',
+                '__cancelAllTimers', '__markGlobalsBaseline', '__pendingNavigation',
+                '__resetCustomElements', '__resetDomRegistries', '__resetPageGlobals',
+                '__ifAppendCount', '__jsCookies',
+            ]) {
+                if (name in globalThis) host[name] = globalThis[name];
+                try { delete globalThis[name]; } catch (_e) {}
+            }
+            try { delete globalThis._browser_oxide; } catch (_e) {}
+            Object.defineProperty(_ns, 'host', {
+                value: host, writable: true, enumerable: false, configurable: true,
+            });
+        }
+    } catch (_e) { /* best effort */ }
 
 })(globalThis);

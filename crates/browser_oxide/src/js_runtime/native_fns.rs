@@ -28,7 +28,7 @@
 use deno_core::v8;
 use std::collections::HashMap;
 
-const NATIVE_TAG: &str = "__browser_oxide_native__";
+pub(crate) const NATIVE_TAG: &str = "__browser_oxide_native__";
 
 /// Per-runtime storage for child iframe realms (genuine v8::Context instances).
 ///
@@ -159,10 +159,45 @@ fn fp_to_string_cb<'s>(
         tag_sym = None;
     }
 
-    // Masked host fn? Check via the JS-global-registry Symbol before the
-    // is_function() guard, so Proxy-wrapped tagged objects also stringify.
-    // stealth_bootstrap.js sets `fn[Symbol.for('__browser_oxide_native__')] = name`.
-    if let Ok(this_obj) = v8::Local::<v8::Object>::try_from(this) {
+    // Masked host fn? `stealth_bootstrap.js` sets
+    // `fn[Symbol.for('__browser_oxide_native__')] = name`.
+    //
+    // The tag must be an OWN property of something callable. A plain object that
+    // merely inherits it — `Object.create(maskedFn)` — has to reach the genuine
+    // `Function.prototype.toString` and throw "requires that 'this' be a
+    // Function", which is precisely the probe fingerprinters use to find a
+    // patched `toString`: answering it marked every masked accessor as a lie.
+    // Proxies stay in scope deliberately (a Proxy wrapping a tagged function
+    // forwards the own-property check to its target).
+    // Private symbol first: that is where `op_stealth_mark_native` puts the tag
+    // now. It is invisible to `Object.getOwnPropertySymbols` / `Reflect.ownKeys`,
+    // unlike the JS-registry symbol this used to rely on, which handed every
+    // script the engine's own name off any masked function.
+    if this.is_function() {
+        if let Ok(obj) = v8::Local::<v8::Object>::try_from(this) {
+            if let Some(key) = v8::String::new(scope, NATIVE_TAG) {
+                let private = v8::Private::for_api(scope, Some(key));
+                if let Some(tagv) = obj.get_private(scope, private) {
+                    if tagv.is_string() {
+                        let tag = tagv.to_rust_string_lossy(scope);
+                        let s = format!("function {tag}() {{ [native code] }}");
+                        if let Some(out) = v8::String::new(scope, &s) {
+                            rv.set(out.into());
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let tag_receiver_ok = this.is_function() || this.is_proxy();
+    let this_obj_for_tag = if tag_receiver_ok {
+        v8::Local::<v8::Object>::try_from(this).ok()
+    } else {
+        None
+    };
+    if let Some(this_obj) = this_obj_for_tag {
         // Resolve which symbol to use for the tag lookup.
         // Primary path: the JS-registry symbol from Array data.
         // Fallback: v8::Symbol::for_global (V8 API registry, won't find

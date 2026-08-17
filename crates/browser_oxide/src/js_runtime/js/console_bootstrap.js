@@ -22,6 +22,28 @@
         return undefined;
     }
 
+    // `stack` is an accessor, and `_safeOwn` deliberately never invokes getters
+    // so that formatting a console argument cannot run page code. The result was
+    // that no logged error ever carried a stack — a frame reporting
+    // "Cannot read properties of undefined" gave a message and nothing to locate
+    // it by. Reading it directly is safe for a genuine Error: the getter is V8's.
+    /// V8 materialises `stack` as an own *data* property on the error, so the
+    /// real one can be read off the descriptor. A page-installed `stack`
+    /// *getter* is left uncalled on purpose: eagerly previewing an error's
+    /// stack is precisely the CDP/inspector tell fingerprinters probe for
+    /// (`console.debug(errWithStackGetter)` → `descriptionForError()`), and a
+    /// non-CDP engine must not fire it. Reading `err.stack` directly, as an
+    /// earlier revision did, made every logged error trip that probe.
+    function _errStack(err) {
+        try {
+            const d = Object.getOwnPropertyDescriptor(err, "stack");
+            if (d && typeof d.value === "string") return d.value;
+            return undefined;
+        } catch (_) {
+            return undefined;
+        }
+    }
+
     function _stringify(arg) {
         try {
             if (arg === undefined) return "[undefined]";
@@ -36,7 +58,7 @@
             if (arg instanceof Error) {
                 const nm = _safeOwn(arg, "name");
                 const msg = _safeOwn(arg, "message");
-                const stk = _safeOwn(arg, "stack");
+                const stk = _errStack(arg);
                 return `[Error:${ctor}] ${nm}: ${msg}` +
                     (stk !== undefined ? `\n${stk}` : "");
             }
@@ -44,7 +66,7 @@
                 const nm = _safeOwn(arg, "name");
                 const code = _safeOwn(arg, "code");
                 const msg = _safeOwn(arg, "message");
-                const stk = _safeOwn(arg, "stack");
+                const stk = _errStack(arg);
                 return `[DOMException] ${nm} (${code}): ${msg}` +
                     (stk !== undefined ? `\n${stk}` : "");
             }

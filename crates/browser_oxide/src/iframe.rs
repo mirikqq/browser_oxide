@@ -26,10 +26,11 @@ pub struct IframeInfo {
 /// its embedder never leaves the child isolate.
 const INSTALL_PARENT_BRIDGE: &str = r#"
 (function () {
-    // `__bo_frames`, not `Deno.core.ops`: this runs after cleanup_bootstrap has
-    // removed `Deno`, so the ops lookup would be null and every postMessage from
-    // this frame would silently vanish.
-    var frames = globalThis.__bo_frames || null;
+    // The engine's symbol-keyed namespace, not `Deno.core.ops`: this runs after
+    // cleanup_bootstrap has removed `Deno`, so the ops lookup would be null and
+    // every postMessage from this frame would silently vanish.
+    var ns = (function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})();
+    var frames = (ns && ns.frames) || null;
     var bridge = {
         postMessage: function (data, targetOrigin) {
             if (!frames) return;
@@ -51,8 +52,8 @@ const INSTALL_PARENT_BRIDGE: &str = r#"
         get window() { return bridge; },
         blur: function () {}, focus: function () {}, close: function () {},
     };
-    try { globalThis.__bo_set_frame_links(bridge, bridge); } catch (_) {}
-    try { delete globalThis.__bo_set_frame_links; } catch (_) {}
+    try { ns.setFrameLinks(bridge, bridge); } catch (_) {}
+    try { delete ns.setFrameLinks; } catch (_) {}
 })()
 "#;
 
@@ -60,6 +61,15 @@ const INSTALL_PARENT_BRIDGE: &str = r#"
 pub struct ChildIframe {
     pub node_id: NodeId,
     pub event_loop: BrowserEventLoop,
+    /// The `src` or `srcdoc` value this realm was built from, exactly as the
+    /// attribute held it.
+    ///
+    /// A DOM mutation says the frame *may* have navigated, not that it did:
+    /// widgets re-append and re-attribute their own frames constantly, and
+    /// rebuilding on every such signal is an unbounded fetch loop that starves
+    /// the event loop. Comparing against this decides whether the realm is
+    /// actually stale.
+    pub source: String,
 }
 
 impl ChildIframe {
@@ -109,6 +119,7 @@ impl ChildIframe {
         Ok(Self {
             node_id,
             event_loop,
+            source: html.to_string(),
         })
     }
 
@@ -286,6 +297,7 @@ impl ChildIframe {
         Ok(Self {
             node_id,
             event_loop,
+            source: url.to_string(),
         })
     }
 

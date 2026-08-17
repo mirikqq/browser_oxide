@@ -425,6 +425,67 @@
         return !event.defaultPrevented;
     };
 
+    /// Surface an exception nobody caught, the way a browser does: fire a
+    /// cancelable `error` event on the window, and log it if no handler
+    /// cancelled it.
+    ///
+    /// The engine used to swallow these completely — a throw from a timer
+    /// callback, an injected `<script>`, or a page's own top-level code
+    /// reached neither `window.onerror` nor the console. Pages that report
+    /// errors through `window.onerror` saw nothing, and every silent failure
+    /// (a framework bailing out mid-hydration, say) was invisible from the
+    /// outside, which is both a behavioural difference from Chrome and the
+    /// reason such failures were undiagnosable here.
+    function _reportUncaught(err, source, lineno, colno) {
+        let handled = false;
+        try {
+            const msg = (err && err.message)
+                ? `Uncaught ${(err.name || "Error")}: ${err.message}`
+                : `Uncaught ${String(err)}`;
+            let event = null;
+            try {
+                event = new ErrorEvent("error", {
+                    message: msg,
+                    filename: source || "",
+                    lineno: lineno || 0,
+                    colno: colno || 0,
+                    error: err,
+                    cancelable: true,
+                });
+            } catch (_) { /* ErrorEvent not up yet */ }
+            if (event) {
+                _dispatchEvent.call(globalThis, event);
+                handled = !!event.defaultPrevented;
+            }
+            if (!handled) {
+                try { console.error(err); } catch (_) { /* ignore */ }
+            }
+        } catch (_) { /* reporting must never throw */ }
+        return handled;
+    }
+
+    /// An exception out of an event handler, with enough context to find it:
+    /// the message alone says nothing about which dispatch it came from.
+    function _reportListenerError(err, event, target, handler) {
+        let where = "";
+        try {
+            const type = (event && event.type) || "?";
+            const tag = target && target.tagName
+                ? target.tagName.toLowerCase()
+                : (target === globalThis ? "window" : (target && target.nodeName) || "?");
+            let src = "";
+            try {
+                if (typeof handler === "function") {
+                    src = " | обработчик: " + String(handler).replace(/\s+/g, " ").slice(0, 200);
+                }
+            } catch (_) { /* ignore */ }
+            where = ` [событие ${type} на ${tag}]${src}`;
+        } catch (_) { /* ignore */ }
+        try {
+            console.error(err, where);
+        } catch (_) { /* ignore */ }
+    }
+
     function _fireListeners(target, event, capturePhase) {
         // --- 1. Fire on* handler (Target phase only, not capture phase) ---
         if (!capturePhase && !event._stoppedImmediate) {
@@ -432,9 +493,23 @@
             const handler = target[handlerName];
             if (typeof handler === "function") {
                 try {
-                    handler.call(target, event);
+                    // `window.onerror` is the one OnErrorEventHandler: for an
+                    // ErrorEvent on the window it takes
+                    // (message, source, lineno, colno, error), not the event,
+                    // and cancels by returning true rather than by
+                    // preventDefault.
+                    if (target === globalThis && event.type === "error"
+                        && typeof event.message === "string") {
+                        const r = handler.call(
+                            target, event.message, event.filename,
+                            event.lineno, event.colno, event.error,
+                        );
+                        if (r === true) event.preventDefault();
+                    } else {
+                        handler.call(target, event);
+                    }
                 } catch (e) {
-                    console.error(e);
+                    _reportListenerError(e, event, target, handler);
                 }
             }
         }
@@ -446,10 +521,19 @@
             const l = listeners[i];
             if (l.capture !== capturePhase) continue;
             if (event._stoppedImmediate) break;
-            if (typeof l.callback === "function") {
-                l.callback.call(target, event);
-            } else if (l.callback && typeof l.callback.handleEvent === "function") {
-                l.callback.handleEvent(event);
+            // Each listener is isolated. Letting one throw out of the loop
+            // aborted the whole dispatch: every listener after it — and the rest
+            // of `dispatchEvent` — was skipped, so one widget's bad handler took
+            // down handlers that had nothing to do with it. The spec says report
+            // the exception and carry on.
+            try {
+                if (typeof l.callback === "function") {
+                    l.callback.call(target, event);
+                } else if (l.callback && typeof l.callback.handleEvent === "function") {
+                    l.callback.handleEvent(event);
+                }
+            } catch (e) {
+                _reportListenerError(e, event, target, l.callback);
             }
             if (l.once) toRemove.push(i);
         }
@@ -560,6 +644,21 @@
     globalThis.TouchEvent = TouchEvent;
     globalThis.MessageEvent = MessageEvent;
     globalThis.ErrorEvent = ErrorEvent;
+    // Only a name in the interface list until now, so `new
+    // PromiseRejectionEvent(...)` produced something without `.reason` /
+    // `.promise` — useless for the `unhandledrejection` delivery below.
+    class PromiseRejectionEvent extends Event {
+        constructor(type, init) {
+            super(type, init || {});
+            const i = init || {};
+            this.promise = i.promise;
+            this.reason = i.reason;
+        }
+    }
+    Object.defineProperty(PromiseRejectionEvent.prototype, Symbol.toStringTag, {
+        value: "PromiseRejectionEvent", configurable: true,
+    });
+    globalThis.PromiseRejectionEvent = PromiseRejectionEvent;
     globalThis.ProgressEvent = ProgressEvent;
     globalThis.AnimationEvent = AnimationEvent;
     globalThis.TransitionEvent = TransitionEvent;
@@ -585,6 +684,48 @@
             configurable: true,
             enumerable: false,
             writable: false,
+        });
+    } catch (_) { /* ignore */ }
+
+    // Timers and the host both need the uncaught-error reporter, and both run
+    // long after this file: park it on the engine's symbol-keyed namespace
+    // rather than adding a named global the page could enumerate.
+    try {
+        const _ns = (function () {
+            try {
+                const syms = Object.getOwnPropertySymbols(globalThis);
+                for (let i = 0; i < syms.length; i++) {
+                    const v = globalThis[syms[i]];
+                    if (v && v.__bo) return v;
+                }
+            } catch (_e) { /* ignore */ }
+            return null;
+        })();
+        if (_ns) _ns.reportUncaught = _reportUncaught;
+    } catch (_) { /* ignore */ }
+
+    // Unhandled promise rejections reach `window.onunhandledrejection` /
+    // `unhandledrejection` listeners, as in a browser. Without this hook
+    // deno_core drains them into its own default (a process-level
+    // exception this engine ignores), so a page whose async bootstrap
+    // rejected simply stopped, reporting nothing anywhere.
+    //
+    // Returning `true` tells deno_core the rejection is accounted for; we
+    // return it only when a page handler actually cancelled the event, so a
+    // genuinely unhandled rejection still reaches the console.
+    try {
+        Deno.core.setUnhandledPromiseRejectionHandler((promise, reason) => {
+            try {
+                const event = new PromiseRejectionEvent("unhandledrejection", {
+                    promise, reason, cancelable: true,
+                });
+                _dispatchEvent.call(globalThis, event);
+                if (event.defaultPrevented) return true;
+            } catch (_) { /* fall through to the log */ }
+            try {
+                console.error("Uncaught (in promise)", reason);
+            } catch (_) { /* ignore */ }
+            return true;
         });
     } catch (_) { /* ignore */ }
 })(globalThis);

@@ -92,7 +92,7 @@ pub fn chrome_148_windows() -> StealthProfile {
         conditional_mediation: true,
         allow_http3: false,
 
-        prefers_color_scheme: "light".into(),
+        prefers_color_scheme: "dark".into(),
         color_gamut: "srgb".into(),
         pointer_type: "fine".into(),
         hover_capability: "hover".into(),
@@ -100,7 +100,7 @@ pub fn chrome_148_windows() -> StealthProfile {
         inner_width: 1920,
         inner_height: 969,
         outer_width: 1920,
-        outer_height: 1080,
+        outer_height: 1040,
 
         proxy: None,
         media_devices: default_media_devices("win10"),
@@ -184,7 +184,7 @@ pub fn chrome_148_macos() -> StealthProfile {
         conditional_mediation: true,
         allow_http3: false,
 
-        prefers_color_scheme: "light".into(),
+        prefers_color_scheme: "dark".into(),
         color_gamut: "p3".into(),
         pointer_type: "fine".into(),
         hover_capability: "hover".into(),
@@ -193,7 +193,7 @@ pub fn chrome_148_macos() -> StealthProfile {
         inner_width: 1512,
         inner_height: 871,
         outer_width: 1512,
-        outer_height: 982,
+        outer_height: 949,
 
         proxy: None,
         media_devices: default_media_devices("macos"),
@@ -259,7 +259,7 @@ pub fn chrome_148_linux() -> StealthProfile {
         conditional_mediation: true,
         allow_http3: false,
 
-        prefers_color_scheme: "light".into(),
+        prefers_color_scheme: "dark".into(),
         color_gamut: "srgb".into(),
         pointer_type: "fine".into(),
         hover_capability: "hover".into(),
@@ -267,7 +267,7 @@ pub fn chrome_148_linux() -> StealthProfile {
         inner_width: 1920,
         inner_height: 969,
         outer_width: 1920,
-        outer_height: 1080,
+        outer_height: 1053,
 
         proxy: None,
         media_devices: default_media_devices("linux"),
@@ -312,11 +312,11 @@ pub fn chrome_148_ru() -> StealthProfile {
         canvas_seed: 0xaaaa_bbbb_cccc_dddd, audio_seed: 0xdddd_cccc_bbbb_aaaa,
         audio_sample_rate: 44100,
         has_platform_authenticator: true, conditional_mediation: true, allow_http3: false,
-        prefers_color_scheme: "light".into(),
+        prefers_color_scheme: "dark".into(),
         color_gamut: "srgb".into(),
         pointer_type: "fine".into(), hover_capability: "hover".into(),
         inner_width: 1920, inner_height: 969,
-        outer_width: 1920, outer_height: 1080,
+        outer_width: 1920, outer_height: 1040,
         proxy: None,
         media_devices: default_media_devices("ru"),
         gpu_profile: crate::stealth::gpu::nvidia_rtx_3060_windows(),
@@ -360,11 +360,11 @@ pub fn chrome_148_cn() -> StealthProfile {
         canvas_seed: 0x1122_3344_5566_7788, audio_seed: 0x8877_6655_4433_2211,
         audio_sample_rate: 44100,
         has_platform_authenticator: true, conditional_mediation: true, allow_http3: false,
-        prefers_color_scheme: "light".into(),
+        prefers_color_scheme: "dark".into(),
         color_gamut: "srgb".into(),
         pointer_type: "fine".into(), hover_capability: "hover".into(),
         inner_width: 1920, inner_height: 969,
-        outer_width: 1920, outer_height: 1080,
+        outer_width: 1920, outer_height: 1040,
         proxy: None,
         media_devices: default_media_devices("cn"),
         gpu_profile: crate::stealth::gpu::nvidia_rtx_3060_windows(),
@@ -484,7 +484,7 @@ pub fn firefox_135_macos() -> StealthProfile {
         conditional_mediation: true,
         allow_http3: false,
 
-        prefers_color_scheme: "light".into(),
+        prefers_color_scheme: "dark".into(),
         color_gamut: "p3".into(),
         pointer_type: "fine".into(),
         hover_capability: "hover".into(),
@@ -492,7 +492,7 @@ pub fn firefox_135_macos() -> StealthProfile {
         inner_width: 1440,
         inner_height: 789,
         outer_width: 1440,
-        outer_height: 900,
+        outer_height: 875,
 
         proxy: None,
         media_devices: default_media_devices("macos"),
@@ -560,7 +560,7 @@ pub fn firefox_135_windows() -> StealthProfile {
         conditional_mediation: true,
         allow_http3: false,
 
-        prefers_color_scheme: "light".into(),
+        prefers_color_scheme: "dark".into(),
         color_gamut: "srgb".into(),
         pointer_type: "fine".into(),
         hover_capability: "hover".into(),
@@ -568,7 +568,7 @@ pub fn firefox_135_windows() -> StealthProfile {
         inner_width: 1920,
         inner_height: 969,
         outer_width: 1920,
-        outer_height: 1080,
+        outer_height: 1040,
 
         proxy: None,
         media_devices: default_media_devices("windows"),
@@ -633,7 +633,7 @@ pub fn firefox_135_linux() -> StealthProfile {
         conditional_mediation: true,
         allow_http3: false,
 
-        prefers_color_scheme: "light".into(),
+        prefers_color_scheme: "dark".into(),
         color_gamut: "srgb".into(),
         pointer_type: "fine".into(),
         hover_capability: "hover".into(),
@@ -641,7 +641,7 @@ pub fn firefox_135_linux() -> StealthProfile {
         inner_width: 1920,
         inner_height: 969,
         outer_width: 1920,
-        outer_height: 1080,
+        outer_height: 1053,
 
         proxy: None,
         media_devices: default_media_devices("linux"),
@@ -909,7 +909,7 @@ pub fn pixel_9_pro_chrome_148() -> StealthProfile {
         conditional_mediation: true,
         allow_http3: false,
 
-        prefers_color_scheme: "light".into(),
+        prefers_color_scheme: "dark".into(),
         color_gamut: "srgb".into(),
         // Touch pointer on phones, not fine mouse
         pointer_type: "coarse".into(),
@@ -1016,7 +1016,7 @@ pub fn iphone_15_pro_safari_18() -> StealthProfile {
         conditional_mediation: true,
         allow_http3: false,
 
-        prefers_color_scheme: "light".into(),
+        prefers_color_scheme: "dark".into(),
         color_gamut: "p3".into(),
         pointer_type: "coarse".into(),
         hover_capability: "none".into(),

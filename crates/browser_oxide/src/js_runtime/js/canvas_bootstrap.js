@@ -684,14 +684,37 @@
     // Simulates the pipeline commonly used for audio fingerprinting:
     //   OscillatorNode → DynamicsCompressorNode → destination
     
+    // Every node knows the context that made it, and carries the channel
+    // properties the spec gives it. Audio fingerprinting reads them one by one —
+    // `AnalyserNode.context.sampleRate`, `.channelCount`, `.channelCountMode`
+    // and so on — and a node without them answers `undefined` to each, which
+    // both throws on the `context` hop and leaves a profile no browser produces.
     class AudioNode extends EventTarget {
-        constructor() { super(); }
-        connect() {}
+        constructor(context, opts) {
+            super();
+            const o = opts || {};
+            this._context = context || null;
+            this._numberOfInputs = o.inputs === undefined ? 1 : o.inputs;
+            this._numberOfOutputs = o.outputs === undefined ? 1 : o.outputs;
+            this._channelCount = o.channelCount === undefined ? 2 : o.channelCount;
+            this._channelCountMode = o.channelCountMode || "max";
+            this._channelInterpretation = "speakers";
+        }
+        get context() { return this._context; }
+        get numberOfInputs() { return this._numberOfInputs; }
+        get numberOfOutputs() { return this._numberOfOutputs; }
+        get channelCount() { return this._channelCount; }
+        set channelCount(v) { this._channelCount = v | 0; }
+        get channelCountMode() { return this._channelCountMode; }
+        set channelCountMode(v) { this._channelCountMode = String(v); }
+        get channelInterpretation() { return this._channelInterpretation; }
+        set channelInterpretation(v) { this._channelInterpretation = String(v); }
+        connect(dest) { return dest; }
         disconnect() {}
     }
 
     class AudioScheduledSourceNode extends AudioNode {
-        constructor() { super(); }
+        constructor(context, opts) { super(context, opts); }
         start() {}
         stop() {}
     }
@@ -699,8 +722,7 @@
     class OscillatorNode extends AudioScheduledSourceNode {
         _type = "sine";
         constructor(context) {
-            super();
-            this._context = context;
+            super(context, { inputs: 0, outputs: 1 });
             this.frequency = {
                 _value: 440,
                 get value() { return this._value; },
@@ -710,6 +732,64 @@
         }
         get type() { return this._type; }
         set type(v) { this._type = v; if (this._context._setOscType) this._context._setOscType(v); }
+    }
+
+    // `new AudioBuffer({length, sampleRate})` is constructible in a browser and
+    // was only a name here, so it threw "Illegal constructor". Fingerprinters
+    // build one to compare `getChannelData` against `copyFromChannel`: the two
+    // must return the same samples, and a browser where the constructor throws
+    // cannot answer at all.
+    class AudioBuffer {
+        #channels;
+        #length;
+        #sampleRate;
+        constructor(options) {
+            if (!options || typeof options !== "object") {
+                throw new TypeError(
+                    "Failed to construct 'AudioBuffer': parameter 1 is not of type 'AudioBufferOptions'.");
+            }
+            const length = options.length | 0;
+            const sampleRate = +options.sampleRate;
+            if (!(length > 0)) {
+                throw new TypeError(
+                    "Failed to construct 'AudioBuffer': The number of frames provided (0) is less than or equal to the minimum bound (0).");
+            }
+            if (!(sampleRate > 0)) {
+                throw new TypeError(
+                    "Failed to construct 'AudioBuffer': required member sampleRate is undefined.");
+            }
+            const count = options.numberOfChannels === undefined
+                ? 1 : Math.max(1, options.numberOfChannels | 0);
+            this.#channels = [];
+            for (let i = 0; i < count; i++) this.#channels.push(new Float32Array(length));
+            this.#length = length;
+            this.#sampleRate = sampleRate;
+        }
+        get numberOfChannels() { return this.#channels.length; }
+        get length() { return this.#length; }
+        get sampleRate() { return this.#sampleRate; }
+        get duration() { return this.#length / this.#sampleRate; }
+        getChannelData(channel) {
+            const data = this.#channels[channel | 0];
+            if (!data) {
+                throw new DOMException(
+                    "Failed to execute 'getChannelData' on 'AudioBuffer': channel index out of range",
+                    "IndexSizeError");
+            }
+            return data;
+        }
+        copyFromChannel(destination, channel, bufferOffset) {
+            const src = this.getChannelData(channel);
+            const start = bufferOffset | 0;
+            const n = Math.min(destination.length, Math.max(0, src.length - start));
+            for (let i = 0; i < n; i++) destination[i] = src[start + i];
+        }
+        copyToChannel(source, channel, bufferOffset) {
+            const dst = this.getChannelData(channel);
+            const start = bufferOffset | 0;
+            const n = Math.min(source.length, Math.max(0, dst.length - start));
+            for (let i = 0; i < n; i++) dst[start + i] = source[i];
+        }
     }
 
     class AudioParam {
@@ -730,30 +810,39 @@
     }
 
     class GainNode extends AudioNode {
-        constructor() {
-            super();
-            this.gain = new AudioParam(1);
+        constructor(context) {
+            super(context);
+            this.gain = new AudioParam(1, context);
         }
     }
 
     class DynamicsCompressorNode extends AudioNode {
         constructor(context) {
-            super();
+            super(context, { channelCount: 2, channelCountMode: "clamped-max" });
             this.threshold = new AudioParam(-24, context, v => { if (context._setCompThreshold) context._setCompThreshold(v); });
             this.knee = new AudioParam(30, context, v => { if (context._setCompKnee) context._setCompKnee(v); });
             this.ratio = new AudioParam(12, context, v => { if (context._setCompRatio) context._setCompRatio(v); });
             this.attack = new AudioParam(0.003, context, v => { if (context._setCompAttack) context._setCompAttack(v); });
             this.release = new AudioParam(0.25, context, v => { if (context._setCompRelease) context._setCompRelease(v); });
         }
+        // Readonly float in dB, 0 until a render has happened — Chrome's shape.
+        // It used to be missing entirely, and hCaptcha's audio probe reads
+        // `node.reduction.value || node.reduction` (the legacy-AudioParam
+        // compat form) from its `complete` handler, so the whole handler threw
+        // `Cannot read properties of undefined (reading 'value')`.
+        get reduction() {
+            const c = this._context;
+            return (c && typeof c._compReduction === "number") ? c._compReduction : 0;
+        }
     }
 
     class BiquadFilterNode extends AudioNode {
-        constructor() {
-            super();
+        constructor(context) {
+            super(context);
             this.type = "lowpass";
-            this.frequency = new AudioParam(350);
-            this.detune = new AudioParam(0);
-            this.Q = new AudioParam(1);
+            this.frequency = new AudioParam(350, context);
+            this.detune = new AudioParam(0, context);
+            this.Q = new AudioParam(1, context);
             this.gain = new AudioParam(0);
         }
         getFrequencyResponse(freqArr, magOut, phaseOut) {
@@ -780,8 +869,8 @@
     }
 
     class AnalyserNode extends AudioNode {
-        constructor() {
-            super();
+        constructor(context) {
+            super(context);
             this.fftSize = 2048;
             this.smoothingTimeConstant = 0.8;
             this.minDecibels = -100;
@@ -1006,18 +1095,68 @@
                         self._compAttack, self._compRelease,
                     );
                     data = new Float32Array(bytes.buffer, bytes.byteOffset, len);
+                    // One trailing f32: the compressor's metering gain in dB.
+                    self._compReduction = new Float32Array(
+                        bytes.buffer, bytes.byteOffset, len + 1,
+                    )[len];
                 } catch (e) {
                     data = new Float32Array(len);
                 }
 
-                const buf = {
-                    numberOfChannels: self._channels,
-                    length: len,
-                    sampleRate: sr,
-                    duration: len / sr,
-                    getChannelData() { return data; },
-                };
+                // A real `AudioBuffer`, not a look-alike object: fingerprinters
+                // compare `getChannelData` against `copyFromChannel` on the
+                // rendered buffer and read `AudioBuffer.prototype` to see which
+                // methods exist. A plain object answers neither.
+                let buf;
+                try {
+                    buf = new AudioBuffer({
+                        length: len, sampleRate: sr, numberOfChannels: self._channels,
+                    });
+                    buf.copyToChannel(data, 0, 0);
+                } catch (_) {
+                    buf = {
+                        numberOfChannels: self._channels,
+                        length: len,
+                        sampleRate: sr,
+                        duration: len / sr,
+                        getChannelData() { return data; },
+                    };
+                }
                 resolve(buf);
+
+                // Completion is also an *event* — `complete`, carrying the
+                // rendered buffer — and a script may wait on either. Resolving
+                // only the promise leaves the listener-based half hanging: the
+                // audio fingerprint is one entry in creepjs's `Promise.all` over
+                // nineteen collectors, so the whole report stayed at
+                // "Computing..." forever with nothing logged.
+                //
+                // Dispatched in a microtask so a listener attached right after
+                // `startRendering()` returns — which is what the idiom looks
+                // like — is already in place.
+                queueMicrotask(() => {
+                    let ev;
+                    try {
+                        ev = new Event("complete");
+                    } catch (_) {
+                        ev = null;
+                    }
+                    if (ev) {
+                        try {
+                            Object.defineProperty(ev, "renderedBuffer", {
+                                value: buf, enumerable: true, configurable: true,
+                            });
+                        } catch (_) { /* ignore */ }
+                        try { self.dispatchEvent(ev); } catch (_) { /* ignore */ }
+                    }
+                    // `dispatchEvent` here does not run `on…` handler attributes,
+                    // so the attribute form is invoked explicitly.
+                    try {
+                        if (typeof self.oncomplete === "function") {
+                            self.oncomplete(ev || { type: "complete", renderedBuffer: buf });
+                        }
+                    } catch (_) { /* ignore */ }
+                });
             });
         }
     }
@@ -1165,7 +1304,21 @@
     globalThis.AudioContext = AudioContext;
     globalThis.OfflineAudioContext = OfflineAudioContext;
     globalThis.BaseAudioContext = BaseAudioContext;
-    globalThis.webkitAudioContext = AudioContext;
+    // No `webkitAudioContext`: Chrome dropped the prefixed alias, and a global
+    // this engine has and the browser it claims to be does not is a
+    // difference in the direction that matters — verified against Chrome,
+    // where both it and `webkitOfflineAudioContext` are undefined.
+    // These were names in the interface table only, so `instanceof` was false
+    // for every node this engine hands out and `new AudioBuffer(...)` threw.
+    globalThis.AudioNode = AudioNode;
+    globalThis.AudioScheduledSourceNode = AudioScheduledSourceNode;
+    globalThis.AudioParam = AudioParam;
+    globalThis.AudioBuffer = AudioBuffer;
+    globalThis.AnalyserNode = AnalyserNode;
+    globalThis.OscillatorNode = OscillatorNode;
+    globalThis.GainNode = GainNode;
+    globalThis.BiquadFilterNode = BiquadFilterNode;
+    globalThis.DynamicsCompressorNode = DynamicsCompressorNode;
     // Symbol.toStringTag for audio contexts — some scripts probe these.
     try {
         Object.defineProperty(AudioContext.prototype, Symbol.toStringTag, {

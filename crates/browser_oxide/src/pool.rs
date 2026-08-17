@@ -59,8 +59,22 @@ impl PagePool {
             return Ok(page);
         }
 
-        // Create a new one if pool is empty
-        Page::from_html("<html><head></head><body></body></html>", profile).await
+        // Create a new one if pool is empty.
+        //
+        // The placeholder URL is https, not about:blank, because bootstrap decides
+        // the secure-context surface *once* and does so destructively: on an
+        // insecure document `cleanup_bootstrap` deletes `caches`, `cookieStore`,
+        // `WebTransport`, `getBattery` and friends outright, and nothing can put
+        // them back. A pooled page exists to be navigated — almost always to
+        // https — so amputating them for a placeholder leaves every page this
+        // pool ever serves claiming a secure context it cannot back up. The real
+        // per-document value is applied by `navigate_warm`.
+        Page::from_html_with_url(
+            "<html><head></head><body></body></html>",
+            "https://localhost/",
+            profile,
+        )
+        .await
     }
 
     /// Return a page to the pool.
@@ -96,8 +110,21 @@ impl PagePool {
         url: &str,
         profile: StealthProfile,
     ) -> Result<Page, deno_core::error::AnyError> {
+        self.navigate_with_init(url, profile, &[]).await
+    }
+
+    /// [`Self::navigate`] with scripts that run before the page's own.
+    ///
+    /// The only window in which a caller can observe or replace something before
+    /// the page sees it — instrumentation, shims, seeded state.
+    pub async fn navigate_with_init(
+        &self,
+        url: &str,
+        profile: StealthProfile,
+        init_scripts: &[String],
+    ) -> Result<Page, deno_core::error::AnyError> {
         let mut page = self.acquire(Some(profile.clone())).await?;
-        page.navigate_warm(url).await?;
+        page.navigate_warm_with_init(url, init_scripts).await?;
 
         // The warm path skips the cold path's init scripts, so a pooled page ran with
         // no humanized input at all: no ambient pointer activity, and — the part that

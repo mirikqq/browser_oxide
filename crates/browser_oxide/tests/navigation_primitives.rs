@@ -3,8 +3,13 @@
 //!
 //! Each primitive (`location.reload()`, `location.href = ...`,
 //! `location.replace()`, `<meta http-equiv="refresh">`) must set
-//! `globalThis.__pendingNavigation` to a `{url, kind}` object. The
-//! driver loop in `Page::navigate` watches this flag to re-navigate.
+//! `__pendingNavigation` to a `{url, kind}` object. The driver loop in
+//! `Page::navigate` watches this flag to re-navigate.
+//!
+//! It used to live on `globalThis`. Chrome's window has no such property, so
+//! the cleanup pass now moves the engine's globals onto the symbol-keyed
+//! namespace and deletes the named ones — these tests read it where the
+//! driver reads it, through that namespace.
 
 use browser_oxide::Page;
 use std::time::Duration;
@@ -22,7 +27,16 @@ fn read_pending_navigation(page: &mut Page) -> (String, String) {
     let s = page
         .evaluate(
             "(function(){\
-                const p = globalThis.__pendingNavigation;\
+                const ns = (function(){\
+                    const s = Object.getOwnPropertySymbols(globalThis);\
+                    for (let i = 0; i < s.length; i++) {\
+                        const v = globalThis[s[i]];\
+                        if (v && v.__bo) return v;\
+                    }\
+                    return null;\
+                })();\
+                const bo = ((ns || {}).host || {}).bo;\
+                const p = bo && bo.__pendingNavigation;\
                 if (!p) return '';\
                 return String(p.url || '') + '|' + String(p.kind || '');\
              })()",
@@ -129,7 +143,16 @@ async fn meta_refresh_sets_pending_navigation() {
                     const delay = parseInt(match[1], 10) || 0;
                     const target = ((match[2] || '').trim()).replace(/^['"]|['"]$/g, '') || location.href;
                     setTimeout(() => {
-                        globalThis.__pendingNavigation = { url: target, kind: 'assign' };
+                        const ns = (function(){
+                            const s = Object.getOwnPropertySymbols(globalThis);
+                            for (let i = 0; i < s.length; i++) {
+                                const v = globalThis[s[i]];
+                                if (v && v.__bo) return v;
+                            }
+                            return null;
+                        })();
+                        (((ns || {}).host || {}).bo || {}).__pendingNavigation =
+                            { url: target, kind: 'assign' };
                     }, delay * 1000);
                     break;
                 }

@@ -80,12 +80,15 @@ pub fn op_offline_audio_render(
 
     let fp = AudioFingerprint::from_params(seed_u64, params);
 
-    // Pack Float32 samples as little-endian bytes. JS side reconstructs via
-    // `new Float32Array(new Uint8Array(bytes).buffer)`.
-    let mut bytes = Vec::with_capacity(fp.data.len() * 4);
+    // Pack Float32 samples as little-endian bytes, then one extra f32 holding
+    // `DynamicsCompressorNode.reduction`. The JS side builds its channel view
+    // with an explicit `length`, so the trailing value is invisible to it
+    // until read at index `length`.
+    let mut bytes = Vec::with_capacity((fp.data.len() + 1) * 4);
     for s in &fp.data {
         bytes.extend_from_slice(&s.to_le_bytes());
     }
+    bytes.extend_from_slice(&fp.reduction.to_le_bytes());
     bytes
 }
 

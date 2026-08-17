@@ -178,9 +178,19 @@ async fn reset_preserves_engine_installed_on_handlers() {
 
     // Stand in for the engine's own install, then re-mark the baseline the
     // same way the cold build does after installing its instrumentation.
+    // `__markGlobalsBaseline` used to be a named global; the cleanup pass now
+    // moves the engine's hooks onto the symbol-keyed namespace and deletes the
+    // named ones, so reach it where the engine itself does.
     page.evaluate(
         "window.onerror = function engineHandler() { return true; }; \
-         globalThis.__markGlobalsBaseline(); 'ok'",
+         (function(){ \
+            const s = Object.getOwnPropertySymbols(globalThis); \
+            for (let i = 0; i < s.length; i++) { \
+                const v = globalThis[s[i]]; \
+                if (v && v.__bo) { v.host.__markGlobalsBaseline(); return; } \
+            } \
+            throw new Error('неймспейс движка не найден'); \
+         })(); 'ok'",
     )
     .unwrap();
 

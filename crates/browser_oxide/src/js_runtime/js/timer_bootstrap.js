@@ -71,6 +71,30 @@
           }
         : () => {};
 
+    // A throw out of a timer callback lands in the internal promise this file
+    // uses to drive timers, where it became an unobservable rejection: the
+    // page's own `window.onerror` never saw it and nothing reached the
+    // console. Route it to the shared reporter instead.
+    const _runTimerCallback = (fn, args) => {
+        try {
+            fn(...args);
+        } catch (e) {
+            try {
+                const ns = (function () {
+                    try {
+                        const syms = Object.getOwnPropertySymbols(globalThis);
+                        for (let i = 0; i < syms.length; i++) {
+                            const v = globalThis[syms[i]];
+                            if (v && v.__bo) return v;
+                        }
+                    } catch (_e) { /* ignore */ }
+                    return null;
+                })();
+                if (ns && typeof ns.reportUncaught === "function") ns.reportUncaught(e);
+            } catch (_) { /* reporting must never throw */ }
+        }
+    };
+
     globalThis.setTimeout = function setTimeout(callback, delay = 0, ...args) {
         if (typeof callback !== "function") {
             callback = new Function(String(callback));
@@ -84,7 +108,7 @@
         p.then(() => {
             if (myGen !== _timerGen) return; // post `__cancelAllTimers`, drop
             if (!_cancelledTimers.has(id)) {
-                callback(...args);
+                _runTimerCallback(callback, args);
             }
         });
         return id;
@@ -112,7 +136,7 @@
         p.then(() => {
             if (myGen !== _timerGen) return;
             if (!_cancelledTimers.has(id)) {
-                callback(...args);
+                _runTimerCallback(callback, args);
             }
         });
         return id;
@@ -135,7 +159,7 @@
             p.then(() => {
                 if (myGen !== _timerGen) return;
                 if (!_cancelledTimers.has(id)) {
-                    callback(...args);
+                    _runTimerCallback(callback, args);
                     tick();
                 }
             });
@@ -162,7 +186,7 @@
     // shows scheduler noise. Sourced from the seeded RNG (the
     // Symbol-keyed slot installed by stealth_bootstrap) so the cadence
     // is deterministic per session.
-    const _behaviorRandSym = Symbol.for('__browser_oxide_behavior_rand__');
+    const _behaviorRandSym = 'rand';
     const _rand = globalThis[_behaviorRandSym] || Math.random;
     let _gaussSpare = null;
     const _gauss = () => {
@@ -185,18 +209,27 @@
     const _RAF_SIGMA_MS = 0.5;
     const _rafDelayMs = () => Math.max(1, _RAF_MEAN_MS + _gauss() * _RAF_SIGMA_MS);
 
-    // Symbol-keyed exposure so chrome_compat.rs raf_cadence_jitter test
-    // can sample the actual delay generator (1000 callbacks ≈ 16 s wall —
-    // too slow to drive via real setTimeout) without triggering RAF.
+    // Exposed on the engine's internal namespace so the cadence test can sample
+    // the delay generator directly (1000 callbacks ≈ 16 s of wall clock is too
+    // slow to drive through real timers). It used to be its own symbol on
+    // `globalThis`, i.e. a test hook the page could enumerate.
     try {
-        const _rafJitterSym = Symbol.for('__browser_oxide_raf_jitter_ms__');
-        Object.defineProperty(globalThis, _rafJitterSym, {
-            value: _rafDelayMs,
-            writable: false, configurable: true, enumerable: false,
-        });
+        const _ns = (function () {
+            try {
+                const syms = Object.getOwnPropertySymbols(globalThis);
+                for (let i = 0; i < syms.length; i++) {
+                    const v = globalThis[syms[i]];
+                    if (v && v.__bo) return v;
+                }
+            } catch (_e) {}
+            return null;
+        })();
+        if (_ns) _ns.rafDelayMs = _rafDelayMs;
     } catch (e) {}
 
-    globalThis.requestAnimationFrame = function requestAnimationFrame(callback) {
+    // Method shorthand: a native function has no `prototype` and cannot be
+    // constructed, and both are one property read away.
+    globalThis.requestAnimationFrame = ({ requestAnimationFrame(callback) {
         const id = ++_rafId;
         _rafCallbacks.set(id, callback);
         // Fire near 60 Hz via real timer, not microtask. Some scripts
@@ -206,15 +239,15 @@
             const cb = _rafCallbacks.get(id);
             if (cb) {
                 _rafCallbacks.delete(id);
-                cb(performance.now());
+                _runTimerCallback(cb, [performance.now()]);
             }
         }, _rafDelayMs());
         return id;
-    };
+    } }).requestAnimationFrame;
 
-    globalThis.cancelAnimationFrame = function cancelAnimationFrame(id) {
+    globalThis.cancelAnimationFrame = ({ cancelAnimationFrame(id) {
         _rafCallbacks.delete(id);
-    };
+    } }).cancelAnimationFrame;
 
     if (!globalThis.performance) {
         globalThis.performance = {};

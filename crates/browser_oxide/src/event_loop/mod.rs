@@ -272,7 +272,7 @@ impl BrowserEventLoop {
     /// (no timers, no unresolved promises, no pending async ops).
     ///
     /// **Nav short-circuit (gap: challenge-vendor 5-second retry window):** if JS
-    /// sets `globalThis.__pendingNavigation` (via `location.href = ...`,
+    /// sets `(((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).__pendingNavigation` (via `location.href = ...`,
     /// `location.reload()`, form.submit, meta-refresh, etc.), the JS
     /// bootstrap calls `op_set_pending_nav` which flips an atomic flag
     /// shared with this loop. We detect it on the next tick boundary,
@@ -395,6 +395,16 @@ impl BrowserEventLoop {
         self.runtime.execute_script(code, None)
     }
 
+    /// Async work still outstanding: `(ops, timers, intervals, resources)`.
+    ///
+    /// "Did all the JavaScript finish?" is not answerable from the script log —
+    /// a page that compiled everything can still be parked on a pending fetch or
+    /// a timer that has not fired. This is V8's own activity accounting, the same
+    /// numbers the loop uses to decide it is idle.
+    pub fn pending_work(&mut self) -> (u32, u32, u32, u32) {
+        capture_pending(&mut self.runtime)
+    }
+
     /// Execute a script in the runtime with a given source name.
     pub fn execute_script_with_name(
         &mut self,
@@ -451,7 +461,7 @@ impl BrowserEventLoop {
     pub fn reset_nav_pending(&mut self) {
         self.runtime.reset_nav_pending();
         let _ = self.runtime.execute_script(
-            "globalThis._browser_oxide && (globalThis._browser_oxide.__pendingNavigation = null);",
+            "(((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo && ((((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__pendingNavigation = null);",
             None,
         );
     }

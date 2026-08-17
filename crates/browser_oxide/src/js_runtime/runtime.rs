@@ -162,6 +162,20 @@ fn ensure_tokio_context() -> Option<tokio::runtime::EnterGuard<'static>> {
     Some(rt.enter())
 }
 
+/// Pass V8 flags from `BROWSER_OXIDE_V8_FLAGS` (e.g. `--trace-gc --trace-deopt`).
+///
+/// Diagnostics only: V8 reads flags once, before the first isolate exists, so
+/// this runs at most once per process and is a no-op when the variable is unset.
+fn apply_v8_flags_from_env() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if let Ok(flags) = std::env::var("BROWSER_OXIDE_V8_FLAGS") {
+            deno_core::v8::V8::set_flags_from_string(&flags);
+            tracing::info!(%flags, "applied V8 flags from env");
+        }
+    });
+}
+
 pub fn create_runtime(dom: Dom, options: BrowserRuntimeOptions) -> JsRuntime {
     create_runtime_with_signals(dom, options).0
 }
@@ -228,6 +242,8 @@ pub fn create_runtime_with_signals(
     let (heap_initial, heap_max) = heap_limits();
     let create_params = deno_core::v8::CreateParams::default().heap_limits(heap_initial, heap_max);
 
+    apply_v8_flags_from_env();
+
     // Must outlive the `JsRuntime::new` call below — deno_core captures the
     // current tokio handle during isolate registration. See
     // `ensure_tokio_context`.
@@ -254,6 +270,9 @@ pub fn create_runtime_with_signals(
         ],
         startup_snapshot: options.startup_snapshot,
         create_params: Some(create_params),
+        // Decided with the isolate: a session cannot attach to a runtime that
+        // was built without it. Off unless this process asked for the tap.
+        inspector: crate::js_runtime::inspect::enabled_for_process(),
         // Enables postMessage transfer of SharedArrayBuffer between isolates.
         // The SAB *constructor* is always exposed by V8; we gate transfer
         // separately on `cross_origin_isolated`.

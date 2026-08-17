@@ -3,6 +3,7 @@
 //! MIT/Apache-2.0 licensed. Part of the browser_oxide project.
 
 pub mod extensions;
+pub mod inspect;
 pub mod module_loader;
 pub mod native_fns;
 pub mod runtime;
@@ -18,9 +19,20 @@ use extensions::nav_ext::NavSignal;
 use runtime::{create_runtime_with_signals, BrowserRuntimeOptions};
 use state::{ConsoleMessage, DomState};
 
+/// Upper bound on how long one `<script type="module">` may take to settle
+/// before the document moves on without it.
+///
+/// Only a module blocked on an unresolved top-level await reaches this; a
+/// normal bundle settles in milliseconds. See `eval_module`.
+const MODULE_EVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// A V8 JavaScript runtime with browser DOM bindings.
 pub struct BrowserJsRuntime {
     inner: JsRuntime,
+    /// Attached only when [`inspect::enabled_for_process`] was true at
+    /// construction — `RuntimeOptions::inspector` is decided with the isolate and
+    /// cannot be turned on afterwards.
+    inspector_tap: Option<inspect::InspectorTap>,
     /// Per-runtime navigation-pending signal. JS sets it via
     /// `op_set_pending_nav` (called from window_bootstrap.js whenever
     /// `__pendingNavigation` is assigned). The event loop polls it to
@@ -66,11 +78,35 @@ impl Drop for IsolateEnterGuard {
 }
 
 impl BrowserJsRuntime {
+    /// Attach the inspector tap if this process asked for it, then assemble.
+    ///
+    /// Attaching here rather than in each constructor keeps the decision in one
+    /// place: an isolate built without `RuntimeOptions::inspector` has no
+    /// inspector to attach to, and that flag is set by the same predicate.
+    fn assemble(mut inner: JsRuntime, nav_signal: NavSignal) -> Self {
+        let inspector_tap = if inspect::enabled_for_process() {
+            Some(inspect::InspectorTap::attach(&mut inner))
+        } else {
+            None
+        };
+        Self {
+            inner,
+            nav_signal,
+            inspector_tap,
+        }
+    }
+
+    /// What V8 reports about the JavaScript this runtime has compiled and run.
+    /// `None` when the tap is off.
+    pub fn inspect_snapshot(&self) -> Option<inspect::InspectLog> {
+        self.inspector_tap.as_ref().map(|t| t.snapshot())
+    }
+
     /// Create a new runtime with the given DOM (no stealth profile).
     pub fn new(dom: Dom) -> Self {
         let (inner, nav_signal) =
             create_runtime_with_signals(dom, BrowserRuntimeOptions::default());
-        Self { inner, nav_signal }
+        Self::assemble(inner, nav_signal)
     }
 
     /// Create with a stealth profile.
@@ -82,7 +118,7 @@ impl BrowserJsRuntime {
                 ..Default::default()
             },
         );
-        Self { inner, nav_signal }
+        Self::assemble(inner, nav_signal)
     }
 
     /// Create with full options.
@@ -98,7 +134,7 @@ impl BrowserJsRuntime {
             options.startup_snapshot = Some(snapshot::get_snapshot());
         }
         let (inner, nav_signal) = create_runtime_with_signals(dom, options);
-        Self { inner, nav_signal }
+        Self::assemble(inner, nav_signal)
     }
 
     /// Returns true iff JS has set a pending navigation since the last
@@ -284,9 +320,19 @@ impl BrowserJsRuntime {
         // v8-149: see `run_event_loop` — module loading drives V8 and must
         // target this runtime's isolate, not a more-recently-entered child's.
         let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
+        // A *side* module, not a main one. deno_core allows exactly one "main"
+        // module per runtime, and a document routinely has several
+        // `<script type="module">` tags: the second and every one after it failed
+        // with `Trying to create "main" module … when one already exists`.
+        //
+        // The failure was invisible — the error went to `tracing`, which a host
+        // with no subscriber drops — so a page's whole application bundle was
+        // skipped while the load looked successful. Nothing in a browser
+        // distinguishes a document's module scripts this way; none of them is
+        // "the" main module.
         let mod_id = self
             .inner
-            .load_main_es_module_from_code(&spec, code)
+            .load_side_es_module_from_code(&spec, code)
             .await?;
         self.eval_module(mod_id).await
     }
@@ -299,14 +345,43 @@ impl BrowserJsRuntime {
         // this runtime's isolate; re-enter it in case a child is current.
         let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
         let eval = self.inner.mod_evaluate(mod_id);
-        // Drive the loop so the loader's async fetches + any top-level await
-        // resolve, THEN await the module's evaluation result.
-        self.inner
-            .run_event_loop(deno_core::PollEventLoopOptions::default())
-            .await
-            .map_err(|e| deno_core::error::AnyError::msg(e.to_string()))?;
-        eval.await
-            .map_err(|e| deno_core::error::AnyError::msg(e.to_string()))
+
+        // Drive the loop so the loader's async fetches and any top-level await
+        // resolve — but only until this module's own evaluation settles.
+        //
+        // `run_event_loop` returns when the loop has *no* pending work left,
+        // which is the right shape for a standalone program and the wrong one
+        // for a document: a real page always has something pending (timers,
+        // polling fetches, our own `humanize.js` interval), so awaiting it
+        // parked here until the V8 deadline watcher terminated execution.
+        // Measured on a live login page: a 2.8 MB module bundle "executed" for
+        // 24.7 s with the process idle in `kevent` the whole time, which put
+        // `DOMContentLoaded` past the 15 s watchdogs third-party SDKs arm on
+        // themselves. A browser does not wait for the page to go quiet before
+        // considering a module script done, and neither do we now.
+        let inner = &mut self.inner;
+        let mut eval = std::pin::pin!(eval);
+        let settled = std::future::poll_fn(|cx| {
+            // Ignore the loop's own readiness: it reports "still pending" for
+            // work that outlives this module, and its errors surface through
+            // the evaluation result.
+            let _ = inner.poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
+            std::future::Future::poll(eval.as_mut(), cx)
+        });
+
+        match tokio::time::timeout(MODULE_EVAL_TIMEOUT, settled).await {
+            Ok(result) => result.map_err(|e| deno_core::error::AnyError::msg(e.to_string())),
+            Err(_) => {
+                // A module whose top-level await never resolves does not block
+                // the document in a browser either; leave it running and let
+                // later event-loop turns settle it.
+                tracing::warn!(
+                    timeout_ms = MODULE_EVAL_TIMEOUT.as_millis(),
+                    "module evaluation did not settle; continuing"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Get console output captured so far.

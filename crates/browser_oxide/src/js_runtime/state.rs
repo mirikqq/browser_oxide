@@ -22,6 +22,17 @@ pub struct DomState {
     pub messages_to_children: Vec<(u32, String)>,
     /// `parent.postMessage` payloads from a child realm, awaiting delivery upward.
     pub messages_to_parent: Vec<String>,
+    /// Node ids of `<iframe>` elements whose browsing context is no longer valid:
+    /// the element was attached, detached, or had its `src`/`srcdoc` rewritten.
+    ///
+    /// A browsing context belongs to an *element*, and the events that create or
+    /// destroy one are DOM mutations. Deriving that from a periodic rescan instead
+    /// is unsound in both directions: a frame the page replaced keeps a live realm
+    /// nobody can address, and a frame that is briefly out of the tree during a
+    /// re-parent looks deleted. `Page::rematerialize_iframes` drains this and drops
+    /// the affected realms; whatever is still in the tree is then rebuilt from its
+    /// current attributes.
+    pub invalidated_frames: Vec<u32>,
     pub stealth_profile: Option<crate::stealth::StealthProfile>,
     /// Active Content Security Policy. Built from the response
     /// `Content-Security-Policy` header(s) plus any
@@ -76,6 +87,7 @@ impl DomState {
             cached_rules: Vec::new(),
             messages_to_children: Vec::new(),
             messages_to_parent: Vec::new(),
+            invalidated_frames: Vec::new(),
             stealth_profile: None,
             csp_policy: None,
             csp_origin: None,

@@ -78,7 +78,7 @@ has_platform_authenticator: true
 conditional_mediation: true
 
 # ---- Media features ----
-prefers_color_scheme: "light"
+prefers_color_scheme: "dark"
 color_gamut: "p3"
 pointer_type: "fine"
 hover_capability: "hover"
@@ -87,4 +87,4 @@ hover_capability: "hover"
 inner_width: 1512
 inner_height: 871
 outer_width: 1512
-outer_height: 982
+outer_height: 949

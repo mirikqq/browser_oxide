@@ -136,18 +136,27 @@ pub fn op_blob_revoke(#[string] url: String) {
 /// a network error and throws.
 #[op2]
 #[string]
-pub fn op_worker_sync_fetch(#[string] url: String) -> String {
-    // Clone this worker thread's fetch client (seeded by op_worker_spawn
-    // from the page's profile + shared cookie jar — F3) so the helper
-    // thread inherits the correct identity + cookies. The chrome_148_linux
-    // fallback is now only reached if the worker was spawned with no
-    // profile at all (it used to be the common case, leaking a Linux UA).
-    let client = match crate::js_runtime::extensions::fetch_ext::fetch_client() {
-        Some(c) => c,
-        None => match crate::net::HttpClient::new(&crate::stealth::chrome_148_linux()) {
-            Ok(c) => c,
-            Err(_) => return String::new(),
-        },
+pub fn op_worker_sync_fetch(state: &mut OpState, #[string] url: String) -> String {
+    // A *fresh* client for this one fetch, built from the same stealth profile.
+    //
+    // Reusing the ambient one looked cheaper and was wrong: its connection pool
+    // belongs to the runtime that created it, and the helper thread below runs
+    // its own. Polled from there the request never completes, so the call sat
+    // out its full 30 s timeout and returned "" — reported to the page as
+    // "Worker script could not be resolved", with no request ever reaching the
+    // network. Measured with `new Worker('./worker.js')` on a live page.
+    let profile = state
+        .try_borrow::<StealthState>()
+        .and_then(|s| s.profile.clone())
+        .or_else(|| {
+            state
+                .try_borrow::<crate::js_runtime::state::DomState>()
+                .and_then(|d| d.stealth_profile.clone())
+        })
+        .unwrap_or_else(crate::stealth::chrome_148_linux);
+    let client = match crate::net::HttpClient::new(&profile) {
+        Ok(c) => c,
+        Err(_) => return String::new(),
     };
 
     let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -226,6 +235,36 @@ thread_local! {
 // Ops — parent side.
 // ============================================================================
 
+/// Deliver an uncaught worker error to the owning document.
+///
+/// A worker that throws used to be silent: the failure was written to the trace
+/// log and nowhere else, so from the page's side a worker that died on its first
+/// line and one that is merely slow looked exactly alike. A browser fires
+/// `error` on the `Worker` object with the message, and scripts that pick a
+/// worker strategy by trying one and watching for failure hang forever without
+/// it.
+///
+/// Rides the existing parent channel — the JS side tells the two apart by the
+/// `error` key, since ordinary messages carry `data`.
+fn report_worker_error(worker_id: u32, message: &str, filename: &str) {
+    let payload = serde_json::json!({
+        "error": {
+            "message": message,
+            "filename": filename,
+            "lineno": 0,
+            "colno": 0,
+        }
+    })
+    .to_string();
+    WORKER_SELF.with(|w| {
+        if let Some(ws) = w.borrow().as_ref() {
+            let _ = ws.to_parent.send(payload);
+            ws.notify_parent.notify_waiters();
+        }
+    });
+    tracing::debug!(worker_id, "worker error reported to parent");
+}
+
 #[op2(fast)]
 #[smi]
 pub fn op_worker_spawn(
@@ -259,6 +298,7 @@ pub fn op_worker_spawn(
     // UA leak on a macOS/Windows page, and a window<->worker fetch-identity
     // mismatch — real Chrome's worker shares the document's network identity.
     let parent_fetch_client = crate::js_runtime::extensions::fetch_ext::fetch_client();
+    let error_filename = url.clone();
     let (to_worker_tx, to_worker_rx) = std::sync::mpsc::channel::<String>();
     let (to_parent_tx, to_parent_rx) = std::sync::mpsc::channel::<String>();
     let terminate = Arc::new(AtomicBool::new(false));
@@ -366,14 +406,17 @@ pub fn op_worker_spawn(
                                 tracing::warn!(
                                     worker_id = worker_id, error = %e, "worker module eval error"
                                 );
+                                report_worker_error(worker_id, &e.to_string(), &error_filename);
                             }
                         }
                         Err(e) => {
                             tracing::error!(worker_id = worker_id, error = %e, "worker module load error");
+                            report_worker_error(worker_id, &e.to_string(), &error_filename);
                         }
                     }
                 } else if let Err(e) = runtime.execute_script("<anonymous>", script) {
                     tracing::warn!(worker_id = worker_id, error = %e, "worker script error");
+                    report_worker_error(worker_id, &e.to_string(), &error_filename);
                 }
 
                 // Drive the event loop until terminated. A small polling
