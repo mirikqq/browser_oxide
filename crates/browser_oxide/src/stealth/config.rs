@@ -154,9 +154,9 @@ mod tests {
         let profile = StealthProfile::load_from_file(&path)
             .unwrap_or_else(|e| panic!("load {:?}: {e}", path));
         assert_eq!(profile.browser_name, "Chrome");
-        assert_eq!(profile.browser_version, "148.0.7778.168");
+        assert_eq!(profile.browser_version, "147.0.7727.117");
         assert_eq!(profile.os_name, "macOS");
-        assert!(profile.user_agent.contains("Chrome/148.0.0.0"));
+        assert!(profile.user_agent.contains("Chrome/147.0.0.0"));
     }
 
     #[test]
@@ -164,16 +164,16 @@ mod tests {
         // We do not set `deny_unknown_fields`, so extra keys are tolerated —
         // assert that current behavior, so a future change is a conscious one.
         let yaml = r#"
-user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
 browser_name: Chrome
-browser_version: "148.0.7778.168"
+browser_version: "147.0.7727.117"
 os_name: macOS
 os_version: "15.2"
 platform: MacIntel
 vendor: "Google Inc."
 vendor_sub: ""
 product_sub: "20030107"
-app_version: "5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+app_version: "5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
 screen_width: 2560
 screen_height: 1440
 screen_avail_width: 2560
@@ -207,7 +207,7 @@ outer_width: 2560
 outer_height: 1440
 "#;
         let p = StealthProfile::from_yaml_str(yaml).expect("loads");
-        assert!(p.user_agent.contains("148.0.0.0"));
+        assert!(p.user_agent.contains("147.0.0.0"));
         assert_eq!(p.os_name, "macOS");
     }
 }

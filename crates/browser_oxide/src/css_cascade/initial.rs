@@ -18,6 +18,9 @@ pub fn initial_value(property: &PropertyId) -> CssValue {
         PropertyId::MaxWidth | PropertyId::MaxHeight => {
             CssValue::LengthPercentageAuto(LengthPercentageAuto::Auto)
         }
+        PropertyId::Top | PropertyId::Right | PropertyId::Bottom | PropertyId::Left => {
+            CssValue::LengthPercentageAuto(LengthPercentageAuto::Auto)
+        }
         PropertyId::MarginTop
         | PropertyId::MarginRight
         | PropertyId::MarginBottom
@@ -30,6 +33,10 @@ pub fn initial_value(property: &PropertyId) -> CssValue {
         | PropertyId::PaddingLeft => {
             CssValue::LengthPercentage(LengthPercentage::Length(Length::Zero))
         }
+        PropertyId::BorderTopStyle
+        | PropertyId::BorderRightStyle
+        | PropertyId::BorderBottomStyle
+        | PropertyId::BorderLeftStyle => CssValue::BorderStyle(BorderStyle::None),
         PropertyId::BorderTopWidth
         | PropertyId::BorderRightWidth
         | PropertyId::BorderBottomWidth

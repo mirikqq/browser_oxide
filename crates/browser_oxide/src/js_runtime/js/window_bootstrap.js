@@ -1092,9 +1092,6 @@
         configurable: true
     });
     _defNav('doNotTrack', () => null);
-    _defNav('msDoNotTrack', () => undefined);
-    _defNav('loadPurpose', () => undefined);
-    _defNav('sayswho', () => undefined);
 
     // Object getters — stable references.
     // navigator.connection (NetworkInformation API) — Chrome-only. Real
@@ -1646,8 +1643,32 @@
     // Window metrics must resolve LAZILY — bootstrap runs at V8-snapshot
     // build time with no profile installed; eager values get baked as
     // defaults and never update when the profile loads.
-    Object.defineProperty(globalThis, 'innerWidth',  { get: () => _pInt("inner_width", 1920),   configurable: true, enumerable: true });
-    Object.defineProperty(globalThis, 'innerHeight', { get: () => _pInt("inner_height", 1080),  configurable: true, enumerable: true });
+    // A frame's viewport is the frame's own box, not the top-level window's.
+    //
+    // Every realm read `inner_width`/`inner_height` straight off the profile, so
+    // a widget inside a 302x76 iframe was told it had the full 1536x713 window
+    // to lay itself out in — and laid out for a window it did not have. The
+    // engine writes the frame's measured box into the namespace (see
+    // `ChildIframe::set_frame_geometry`); the top-level realm has none and falls
+    // through to the profile.
+    const _frameBox = () => {
+        try {
+            const syms = Object.getOwnPropertySymbols(globalThis);
+            for (let i = 0; i < syms.length; i++) {
+                const v = globalThis[syms[i]];
+                if (v && v.__bo) return v.frame || null;
+            }
+        } catch (_e) { /* ignore */ }
+        return null;
+    };
+    Object.defineProperty(globalThis, 'innerWidth', {
+        get: () => { const f = _frameBox(); return f ? f.w : _pInt("inner_width", 1920); },
+        configurable: true, enumerable: true,
+    });
+    Object.defineProperty(globalThis, 'innerHeight', {
+        get: () => { const f = _frameBox(); return f ? f.h : _pInt("inner_height", 1080); },
+        configurable: true, enumerable: true,
+    });
     Object.defineProperty(globalThis, 'outerWidth',  { get: () => _pInt("outer_width", 1920),   configurable: true, enumerable: true });
     Object.defineProperty(globalThis, 'outerHeight', { get: () => _pInt("outer_height", 1080),  configurable: true, enumerable: true });
     Object.defineProperty(globalThis, 'devicePixelRatio', { get: _maskFunction(function() { return _pFloat("device_pixel_ratio", 2.0); }, 'get devicePixelRatio'), configurable: true, enumerable: true });
@@ -1689,13 +1710,22 @@
         set: function(_v) {},
         enumerable: true, configurable: true,
     });
+    // The virtual window sits in the screen's available area, which is where a
+    // real one opens: flush left, below whatever the OS reserves at the top.
+    // Pinning both to 0 contradicted a profile whose `screen.availTop` is not
+    // zero — a menu bar the window would have to be sitting under.
     Object.defineProperty(globalThis, 'screenX', {
         get: function() { return 0; },
         set: function(_v) {},
         enumerable: true, configurable: true,
     });
     Object.defineProperty(globalThis, 'screenY', {
-        get: function() { return 0; },
+        get: function() {
+            try {
+                const t = globalThis.screen && globalThis.screen.availTop;
+                return typeof t === 'number' ? t : 0;
+            } catch (_e) { return 0; }
+        },
         set: function(_v) {},
         enumerable: true, configurable: true,
     });
@@ -1816,54 +1846,7 @@
             },
             csi: _chromeCsi,
             loadTimes: _chromeLoadTimes,
-            // `chrome.runtime` is present on ordinary pages in desktop Chrome —
-            // it is how a page talks to `externally_connectable` extensions —
-            // and historically absent in headless. `!!window.chrome &&
-            // !window.chrome.runtime` is therefore a standard headless probe,
-            // and pixelscan.dev's "Headless Mode" signal is exactly that
-            // expression; without `runtime` we answered it truthfully.
-            //
-            // `id` is `undefined` off an extension page, and the enums below
-            // are the ones Chrome exposes verbatim.
-            runtime: {
-                id: undefined,
-                connect: function connect() { return undefined; },
-                sendMessage: function sendMessage() { return undefined; },
-                OnInstalledReason: {
-                    CHROME_UPDATE: "chrome_update", INSTALL: "install",
-                    SHARED_MODULE_UPDATE: "shared_module_update", UPDATE: "update",
-                },
-                OnRestartRequiredReason: {
-                    APP_UPDATE: "app_update", OS_UPDATE: "os_update", PERIODIC: "periodic",
-                },
-                PlatformArch: {
-                    ARM: "arm", ARM64: "arm64", MIPS: "mips", MIPS64: "mips64",
-                    X86_32: "x86-32", X86_64: "x86-64",
-                },
-                PlatformNaclArch: {
-                    ARM: "arm", MIPS: "mips", MIPS64: "mips64",
-                    X86_32: "x86-32", X86_64: "x86-64",
-                },
-                PlatformOs: {
-                    ANDROID: "android", CROS: "cros", FUCHSIA: "fuchsia",
-                    LINUX: "linux", MAC: "mac", OPENBSD: "openbsd", WIN: "win",
-                },
-                RequestUpdateCheckStatus: {
-                    NO_UPDATE: "no_update", THROTTLED: "throttled",
-                    UPDATE_AVAILABLE: "update_available",
-                },
-                ContextType: {
-                    BACKGROUND: "BACKGROUND", OFFSCREEN_DOCUMENT: "OFFSCREEN_DOCUMENT",
-                    POPUP: "POPUP", SIDE_PANEL: "SIDE_PANEL", TAB: "TAB",
-                },
-            },
         };
-        // `chrome.runtime.connect.toString()` must read as native, like every
-        // other engine-provided function.
-        if (typeof _maskFunction === 'function') {
-            _maskFunction(globalThis.chrome.runtime.connect, 'connect');
-            _maskFunction(globalThis.chrome.runtime.sendMessage, 'sendMessage');
-        }
     }
 
     // --- Document visibility/hidden stubs ---
@@ -2432,18 +2415,151 @@
         };
     }
 
-    if (!globalThis.ImageBitmap) {
-        globalThis.ImageBitmap = class ImageBitmap {
-            constructor() { this.width = 0; this.height = 0; }
-            close() {}
+    // ── ImageBitmap / createImageBitmap.
+    //
+    // These used to be stubs: `createImageBitmap()` resolved with an empty
+    // `ImageBitmap` carrying no pixels at all. Nothing threw, so a page saw a
+    // successful decode — and every later `ctx.drawImage(bitmap, …)` hit
+    // drawImage's "unknown source" branch and silently drew nothing. A captcha
+    // that decodes its challenge tiles through `createImageBitmap` therefore
+    // painted its surface hundreds of times and left it fully transparent.
+    //
+    // The bitmap is backed by a real canvas surface, so `drawImage` reaches it
+    // through the ordinary canvas-source path (`_canvasId`) with no new op.
+    {
+        const _bmp = new WeakMap();
+
+        const ImageBitmap = class ImageBitmap {
+            constructor() { throw new TypeError("Illegal constructor"); }
+            get width() { const s = _bmp.get(this); return s ? s.w : 0; }
+            get height() { const s = _bmp.get(this); return s ? s.h : 0; }
+            close() { const s = _bmp.get(this); if (s) { s.w = 0; s.h = 0; s.canvas = null; } }
         };
-    }
-    if (!globalThis.createImageBitmap) {
-        globalThis.createImageBitmap = ({ createImageBitmap() { return Promise.resolve(new globalThis.ImageBitmap()); } }).createImageBitmap;
-        _maskFunction(globalThis.createImageBitmap, 'createImageBitmap');
+        Object.defineProperty(ImageBitmap.prototype, Symbol.toStringTag, {
+            value: "ImageBitmap", configurable: true,
+        });
+        // Read by CanvasRenderingContext2D.prototype.drawImage to find the
+        // backing surface. Non-enumerable, like the canvas element's own.
+        Object.defineProperty(ImageBitmap.prototype, "_canvasId", {
+            get() { const s = _bmp.get(this); return s && s.canvas ? s.canvas._canvasId : undefined; },
+            configurable: true,
+        });
+        globalThis.ImageBitmap = ImageBitmap;
+        if (typeof _maskFunction === "function") _maskFunction(ImageBitmap, "ImageBitmap");
+
+        const _newCanvas = (w, h) => {
+            let c = null;
+            if (typeof document !== "undefined" && document && typeof document.createElement === "function") {
+                c = document.createElement("canvas");
+            } else if (typeof globalThis.OffscreenCanvas === "function") {
+                try { c = new globalThis.OffscreenCanvas(w, h); } catch (_) { c = null; }
+            }
+            if (!c) return null;
+            c.width = w; c.height = h;
+            return c;
+        };
+
+        const _newImage = () => {
+            if (typeof globalThis.Image === "function") return new globalThis.Image();
+            if (typeof document !== "undefined" && document && typeof document.createElement === "function") {
+                return document.createElement("img");
+            }
+            return null;
+        };
+
+        // Resolve any accepted source into something drawImage understands:
+        // a decoded <img> or a canvas surface.
+        const _drawable = async (src) => {
+            if (!src || (typeof src !== "object" && typeof src !== "function")) {
+                throw new TypeError(
+                    "Failed to execute 'createImageBitmap' on 'Window': The provided value is not of type '(HTMLImageElement or SVGImageElement or HTMLVideoElement or HTMLCanvasElement or Blob or ImageData or ImageBitmap or OffscreenCanvas)'");
+            }
+            if (src._canvasId !== undefined) return src;
+            if (src._decodedImageId !== undefined && src._decodedImageId >= 0) return src;
+            // An <img> still in flight.
+            if (typeof src.decode === "function" && "src" in src) {
+                await src.decode();
+                return src;
+            }
+            // ImageData.
+            if (src.data && (src.width | 0) > 0 && (src.height | 0) > 0) {
+                const c = _newCanvas(src.width | 0, src.height | 0);
+                const cx = c && c.getContext("2d");
+                if (!cx) throw new DOMException("The source image could not be decoded.", "InvalidStateError");
+                cx.putImageData(src, 0, 0);
+                return c;
+            }
+            // Blob / File — decoded by loading it through an <img>.
+            if (typeof src.arrayBuffer === "function" || typeof src.size === "number") {
+                const img = _newImage();
+                if (!img || typeof URL === "undefined" || typeof URL.createObjectURL !== "function") {
+                    throw new DOMException("The source image could not be decoded.", "InvalidStateError");
+                }
+                const url = URL.createObjectURL(src);
+                try {
+                    img.src = url;
+                    if (typeof img.decode === "function") await img.decode();
+                    else await new Promise((res, rej) => { img.onload = res; img.onerror = rej; });
+                } finally {
+                    try { URL.revokeObjectURL(url); } catch (_) {}
+                }
+                return img;
+            }
+            throw new TypeError(
+                "Failed to execute 'createImageBitmap' on 'Window': The provided value is not of type '(HTMLImageElement or SVGImageElement or HTMLVideoElement or HTMLCanvasElement or Blob or ImageData or ImageBitmap or OffscreenCanvas)'");
+        };
+
+        const _makeBitmap = async (args) => {
+            const source = args[0];
+            // (image[, options]) and (image, sx, sy, sw, sh[, options]).
+            const cropped = args.length >= 5;
+            const opts = (cropped ? args[5] : args[1]) || {};
+
+            const d = await _drawable(source);
+            const nw = d.naturalWidth || d.width || 0;
+            const nh = d.naturalHeight || d.height || 0;
+            if (!nw || !nh) {
+                throw new DOMException("The source image could not be decoded.", "InvalidStateError");
+            }
+
+            let sx = cropped ? (args[1] | 0) : 0;
+            let sy = cropped ? (args[2] | 0) : 0;
+            let sw = cropped ? (args[3] | 0) : nw;
+            let sh = cropped ? (args[4] | 0) : nh;
+            if (sw < 0) { sx += sw; sw = -sw; }
+            if (sh < 0) { sy += sh; sh = -sh; }
+            if (!sw || !sh) {
+                throw new RangeError(
+                    "Failed to execute 'createImageBitmap' on 'Window': The crop rect width is 0.");
+            }
+
+            let ow = opts.resizeWidth | 0;
+            let oh = opts.resizeHeight | 0;
+            if (ow && !oh) oh = Math.max(1, Math.round(sh * (ow / sw)));
+            else if (oh && !ow) ow = Math.max(1, Math.round(sw * (oh / sh)));
+            else if (!ow && !oh) { ow = sw; oh = sh; }
+
+            const c = _newCanvas(ow, oh);
+            const cx = c && c.getContext("2d");
+            if (!cx) throw new DOMException("The source image could not be decoded.", "InvalidStateError");
+            if (opts.imageOrientation === "flipY") { cx.translate(0, oh); cx.scale(1, -1); }
+            cx.drawImage(d, sx, sy, sw, sh, 0, 0, ow, oh);
+
+            const bm = Object.create(ImageBitmap.prototype);
+            _bmp.set(bm, { w: ow, h: oh, canvas: c });
+            return bm;
+        };
+
+        // Chrome's is a plain native function of length 1 that returns a
+        // promise — not an async function, whose prototype would give it away.
+        const createImageBitmap = function createImageBitmap(image) {
+            try { return _makeBitmap(arguments); } catch (e) { return Promise.reject(e); }
+        };
+        globalThis.createImageBitmap = createImageBitmap;
+        if (typeof _maskFunction === "function") _maskFunction(createImageBitmap, "createImageBitmap");
     }
 
-    if (!globalThis.DOMPoint) {
+    {
         globalThis.DOMPoint = class DOMPoint {
             constructor(x, y, z, w) {
                 this.x = x || 0;
@@ -2458,32 +2574,105 @@
         globalThis.DOMPointReadOnly = globalThis.DOMPoint;
     }
 
-    if (!globalThis.DOMMatrix) {
-        globalThis.DOMMatrix = class DOMMatrix {
-            constructor(init) {
-                this.a = 1; this.b = 0; this.c = 0; this.d = 1; this.e = 0; this.f = 0;
-                this.m11 = 1; this.m12 = 0; this.m13 = 0; this.m14 = 0;
-                this.m21 = 0; this.m22 = 1; this.m23 = 0; this.m24 = 0;
-                this.m31 = 0; this.m32 = 0; this.m33 = 1; this.m34 = 0;
-                this.m41 = 0; this.m42 = 0; this.m43 = 0; this.m44 = 1;
-                this.is2D = true;
-                this.isIdentity = true;
-            }
-            multiply() { return new DOMMatrix(); }
-            translate() { return new DOMMatrix(); }
-            scale() { return new DOMMatrix(); }
-            rotate() { return new DOMMatrix(); }
-            inverse() { return new DOMMatrix(); }
-            transformPoint(p) { return new DOMPoint(p?.x, p?.y, p?.z, p?.w); }
-            toString() { return "matrix(1, 0, 0, 1, 0, 0)"; }
-            toFloat32Array() { return new Float32Array(16); }
-            toFloat64Array() { return new Float64Array(16); }
-            static fromMatrix(m) { return new DOMMatrix(); }
-            static fromFloat32Array() { return new DOMMatrix(); }
-            static fromFloat64Array() { return new DOMMatrix(); }
+    // ── DOMMatrix — real 2D math.
+    //
+    // The stub here ignored its constructor argument and every operation
+    // returned a fresh identity, so `inverse()` and `transformPoint()` were
+    // pure noise. Canvas code maps pointer coordinates into canvas space with
+    // exactly that pair, so a page doing hit-testing against its own transform
+    // got answers unrelated to where the pointer actually was.
+    // Installed unconditionally: an earlier bootstrap may already have put a
+    // name here, and a guarded install silently loses to it.
+    {
+        const _sync = (m) => {
+            m.m11 = m.a; m.m12 = m.b; m.m21 = m.c; m.m22 = m.d; m.m41 = m.e; m.m42 = m.f;
+            m.isIdentity = m.a === 1 && m.b === 0 && m.c === 0
+                && m.d === 1 && m.e === 0 && m.f === 0;
+            return m;
         };
-        globalThis.DOMMatrixReadOnly = globalThis.DOMMatrix;
-        globalThis.WebKitCSSMatrix = globalThis.DOMMatrix;
+        const _from = (a, b, c, d, e, f) => {
+            const m = Object.create(DOMMatrix.prototype);
+            m.a = a; m.b = b; m.c = c; m.d = d; m.e = e; m.f = f;
+            m.m13 = 0; m.m14 = 0; m.m23 = 0; m.m24 = 0;
+            m.m31 = 0; m.m32 = 0; m.m33 = 1; m.m34 = 0; m.m43 = 0; m.m44 = 1;
+            m.is2D = true;
+            return _sync(m);
+        };
+        class DOMMatrix {
+            constructor(init) {
+                let v = [1, 0, 0, 1, 0, 0];
+                if (typeof init === "string") {
+                    const nums = init.match(/-?[\d.eE+]+/g);
+                    if (nums && nums.length >= 6) v = nums.slice(0, 6).map(Number);
+                } else if (init && typeof init.length === "number") {
+                    if (init.length >= 16) {
+                        v = [init[0], init[1], init[4], init[5], init[12], init[13]];
+                    } else if (init.length >= 6) {
+                        v = [init[0], init[1], init[2], init[3], init[4], init[5]];
+                    }
+                } else if (init && typeof init === "object") {
+                    v = [init.a ?? 1, init.b ?? 0, init.c ?? 0, init.d ?? 1, init.e ?? 0, init.f ?? 0];
+                }
+                this.a = v[0]; this.b = v[1]; this.c = v[2];
+                this.d = v[3]; this.e = v[4]; this.f = v[5];
+                this.m13 = 0; this.m14 = 0; this.m23 = 0; this.m24 = 0;
+                this.m31 = 0; this.m32 = 0; this.m33 = 1; this.m34 = 0;
+                this.m43 = 0; this.m44 = 1;
+                this.is2D = true;
+                _sync(this);
+            }
+            multiply(o) {
+                if (!o) return _from(this.a, this.b, this.c, this.d, this.e, this.f);
+                return _from(
+                    this.a * o.a + this.c * o.b,
+                    this.b * o.a + this.d * o.b,
+                    this.a * o.c + this.c * o.d,
+                    this.b * o.c + this.d * o.d,
+                    this.a * o.e + this.c * o.f + this.e,
+                    this.b * o.e + this.d * o.f + this.f,
+                );
+            }
+            translate(tx, ty) { return this.multiply(_from(1, 0, 0, 1, tx || 0, ty || 0)); }
+            scale(sx, sy) {
+                const x = sx === undefined ? 1 : sx;
+                return this.multiply(_from(x, 0, 0, sy === undefined ? x : sy, 0, 0));
+            }
+            rotate(deg) {
+                const r = ((deg || 0) * Math.PI) / 180;
+                const c = Math.cos(r), s = Math.sin(r);
+                return this.multiply(_from(c, s, -s, c, 0, 0));
+            }
+            inverse() {
+                const det = this.a * this.d - this.b * this.c;
+                if (!det || !isFinite(det)) return _from(NaN, NaN, NaN, NaN, NaN, NaN);
+                return _from(
+                    this.d / det, -this.b / det, -this.c / det, this.a / det,
+                    (this.c * this.f - this.d * this.e) / det,
+                    (this.b * this.e - this.a * this.f) / det,
+                );
+            }
+            transformPoint(p) {
+                const x = (p && p.x) || 0, y = (p && p.y) || 0;
+                return new DOMPoint(
+                    this.a * x + this.c * y + this.e,
+                    this.b * x + this.d * y + this.f,
+                    (p && p.z) || 0,
+                    p && p.w === undefined ? 1 : (p && p.w),
+                );
+            }
+            toString() {
+                return "matrix(" + [this.a, this.b, this.c, this.d, this.e, this.f].join(", ") + ")";
+            }
+            toFloat32Array() { return new Float32Array(this.toFloat64Array()); }
+            toFloat64Array() {
+                return new Float64Array([
+                    this.a, this.b, 0, 0, this.c, this.d, 0, 0,
+                    0, 0, 1, 0, this.e, this.f, 0, 1,
+                ]);
+            }
+        }
+        globalThis.DOMMatrix = DOMMatrix;
+        if (typeof _maskFunction === "function") _maskFunction(DOMMatrix, "DOMMatrix");
     }
 
     // Path2D DELIBERATELY NOT STUBBED. Our JS-class stub creates non-native
@@ -4214,6 +4403,11 @@
     Object.defineProperty(globalThis.XMLHttpRequest.prototype, Symbol.toStringTag, { value: "XMLHttpRequest", configurable: true });
 
     // WebSocket — real connections via tokio-tungstenite ops
+    // Every event goes through `dispatchEvent`, which also invokes the matching
+    // `on*` attribute. Calling `this.onmessage(...)` directly — as this class used
+    // to — meant `ws.addEventListener('message', fn)` received nothing at all,
+    // so any library that registers listeners instead of assigning `onmessage`
+    // (which is most of them) saw a socket that opened and then went silent.
     globalThis.WebSocket = class WebSocket extends EventTarget {
         static CONNECTING = 0;
         static OPEN = 1;
@@ -4223,6 +4417,11 @@
             super();
             this.url = url;
             this.readyState = WebSocket.CONNECTING;
+            // `MessageEvent.origin` for the socket's own origin, as a browser
+            // reports it.
+            try {
+                this._origin = new URL(String(url)).origin.replace(/^ws/, "http");
+            } catch (_) { this._origin = ""; }
             this.onopen = null;
             this.onmessage = null;
             this.onclose = null;
@@ -4234,17 +4433,17 @@
                 if (result.ok) {
                     this._wsId = result.id;
                     this.readyState = WebSocket.OPEN;
-                    if (this.onopen) this.onopen(new Event("open"));
+                    this.dispatchEvent(new Event("open"));
                     // Start receive loop
                     this._pollMessages();
                 } else {
                     this.readyState = WebSocket.CLOSED;
-                    if (this.onerror) this.onerror(new Event("error"));
-                    if (this.onclose) this.onclose(new CloseEvent("close", { code: 1006, reason: result.error }));
+                    this.dispatchEvent(new Event("error"));
+                    this.dispatchEvent(new CloseEvent("close", { code: 1006, reason: result.error, wasClean: false }));
                 }
             }).catch((e) => {
                 this.readyState = WebSocket.CLOSED;
-                if (this.onerror) this.onerror(new Event("error"));
+                this.dispatchEvent(new Event("error"));
             });
         }
         async _pollMessages() {
@@ -4254,15 +4453,17 @@
                     if (!msg && msg !== "") {
                         // Connection closed
                         this.readyState = WebSocket.CLOSED;
-                        if (this.onclose) this.onclose(new CloseEvent("close", { code: 1000 }));
+                        this.dispatchEvent(new CloseEvent("close", { code: 1000 }));
                         break;
                     }
-                    if (msg !== "" && this.onmessage) {
-                        this.onmessage(new MessageEvent("message", { data: msg }));
+                    if (msg !== "") {
+                        this.dispatchEvent(new MessageEvent("message", {
+                            data: msg, origin: this._origin,
+                        }));
                     }
                 } catch (e) {
                     this.readyState = WebSocket.CLOSED;
-                    if (this.onerror) this.onerror(new Event("error"));
+                    this.dispatchEvent(new Event("error"));
                     break;
                 }
             }
@@ -4278,7 +4479,9 @@
                 this._wsId = -1;
             }
             this.readyState = WebSocket.CLOSED;
-            if (this.onclose) this.onclose(new CloseEvent("close", { code: code || 1000, reason: reason || "" }));
+            this.dispatchEvent(new CloseEvent("close", {
+                code: code || 1000, reason: reason || "",
+            }));
         }
         get bufferedAmount() { return 0; }
         get extensions() { return ""; }
@@ -4747,7 +4950,14 @@
         globalThis.URL = class URL {
             constructor(url, base) {
                 let full = String(url);
-                if (base && !full.match(/^[a-z]+:\/\//i)) {
+                // Any string that starts with a scheme is already absolute and
+                // the base is ignored — including the schemes without `//`:
+                // `data:`, `blob:`, `mailto:`, `about:`. Matching only
+                // `scheme://` turned `new URL('data:image/png;base64,…', base)`
+                // into `https://host/data:image/png;base64,…`, so every inline
+                // image and every `URL.createObjectURL` result was corrupted the
+                // moment it was resolved against the document.
+                if (base && !full.match(/^[a-z][a-z0-9+.-]*:/i)) {
                     const b = String(base);
                     if (full.startsWith('//')) {
                         const proto = b.match(/^([a-z]+:)/i);
@@ -4771,9 +4981,21 @@
                     this.origin = this.protocol + '//' + this.host;
                     this.href = this.origin + this.pathname + this.search + this.hash;
                 } else {
+                    // A scheme without an authority (`data:`, `blob:`,
+                    // `mailto:`): the protocol is still reported, the rest is
+                    // the path, and the origin is opaque.
+                    const nm = full.match(/^([a-z][a-z0-9+.-]*):([^?#]*)(\?[^#]*)?(#.*)?$/i);
                     this.href = full;
-                    this.protocol = ''; this.hostname = ''; this.port = '';
-                    this.pathname = full; this.search = ''; this.hash = '';
+                    if (nm) {
+                        this.protocol = nm[1].toLowerCase() + ':';
+                        this.pathname = nm[2] || '';
+                        this.search = nm[3] || '';
+                        this.hash = nm[4] || '';
+                    } else {
+                        this.protocol = ''; this.pathname = full;
+                        this.search = ''; this.hash = '';
+                    }
+                    this.hostname = ''; this.port = '';
                     this.host = ''; this.origin = 'null';
                 }
                 this.username = ''; this.password = '';
@@ -7535,9 +7757,10 @@
     })();
 
     globalThis.clientInformation = globalThis.navigator;
-    globalThis.offscreenBuffering = true;
-    // No `defaultStatus`: Chrome removed it, and a global we have that the
-    // browser we claim to be does not is the worse direction to differ in.
+    // No `offscreenBuffering` and no `defaultStatus`: Chrome removed both, and a
+    // global we have that the browser we claim to be does not is the worse
+    // direction to differ in. Measured against a real-browser capture, this was
+    // the last own window property we had and it did not.
     globalThis.name = "";
     globalThis.status = "";
     

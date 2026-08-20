@@ -492,6 +492,12 @@ impl Drop for Page {
 /// than a `__bo_*` global because `Object.getOwnPropertyNames(window)` — the
 /// standard fingerprinting sweep — lists non-enumerable string keys but never
 /// symbols.
+/// Starts the fetch for every `<img>` the parser produced, just before the
+/// document announces it is ready — the point a browser has already issued
+/// those requests. Markup images never pass through `setAttribute`, so this
+/// is the only thing that gets them loaded.
+const IMG_SCAN: &str = "(function(){var ns=null;try{var y=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<y.length;i++){var v=globalThis[y[i]];if(v&&v.__bo){ns=v;break;}}}catch(e){}try{if(ns&&ns.images)ns.images.scan();}catch(e){}})();";
+
 const NS_RESOLVE: &str = "(function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()";
 
 /// Tell the DOM which script the host is about to run.
@@ -524,6 +530,21 @@ fn clear_current_script_js() -> String {
 }
 
 impl Page {
+    /// Point the ES-module loader at the document's base URL.
+    ///
+    /// Dynamic `import()` from a classic script has no URL referrer, so
+    /// without this every `import('/dist/chunk.js')` failed with "relative URL
+    /// without a base". Vue Router / Nuxt load their route components that way,
+    /// and the rejection surfaced nowhere: the app simply never mounted.
+    fn set_module_base_url(&mut self, url: &str) {
+        let op_state = self.event_loop.runtime_mut().op_state();
+        let state = op_state.borrow();
+        if let Some(base) = state.try_borrow::<crate::js_runtime::module_loader::DocumentBaseUrl>()
+        {
+            base.set(url);
+        }
+    }
+
     /// Simulate a user switching to another tab and then coming back.
     /// This defeats macro-behavioral heuristics that flag sessions
     /// without visibility/focus changes as automated.
@@ -685,6 +706,7 @@ impl Page {
 
         // Update URL (URL-state setup, not a real navigation).
         self.url = url.to_string();
+        self.set_module_base_url(url);
         let url_js = url.replace('\\', "\\\\").replace('\'', "\\'");
         self.event_loop
             .execute_script(&format!("location.href = '{}';", url_js))
@@ -860,7 +882,7 @@ impl Page {
         // Fire DOMContentLoaded and load events — many scripts wait for these
         event_loop
             .execute_script(
-                "document.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true}));",
+                &format!("{IMG_SCAN}document.dispatchEvent(new Event('DOMContentLoaded', {{bubbles: true}}));"),
             )
             .ok();
 
@@ -953,6 +975,46 @@ impl Page {
     /// Get a child iframe by index.
     pub fn child_iframe(&mut self, index: usize) -> Option<&mut iframe::ChildIframe> {
         self.children.get_mut(index)
+    }
+
+    /// Push each child frame's measured box into its realm.
+    ///
+    /// A realm has no way to measure its own frame — `window.frameElement` is
+    /// null across the boundary and `parent` is unreachable — so the embedder,
+    /// which is the side that did the layout, hands the numbers over. Without
+    /// them a framed widget reported the top-level viewport as its own and
+    /// placed every event in the wrong coordinate space. Cheap to call after
+    /// each layout: a realm whose box has not moved is not re-entered.
+    pub fn sync_frame_geometry(&mut self) {
+        let boxes: Vec<(usize, f64, f64, f64, f64)> = {
+            let op_state = self.event_loop.runtime_mut().op_state();
+            let mut state = op_state.borrow_mut();
+            let Some(dom_state) = state.try_borrow_mut::<crate::js_runtime::state::DomState>()
+            else {
+                return;
+            };
+            let ids: Vec<(usize, crate::dom::node::NodeId)> = self
+                .children
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (i, c.node_id))
+                .collect();
+            ids.into_iter()
+                .map(|(i, node_id)| {
+                    let dom = &dom_state.dom;
+                    let r = dom_state.layout_engine.get_bounding_rect(dom, node_id);
+                    (i, r.x, r.y, r.width, r.height)
+                })
+                .collect()
+        };
+        for (i, x, y, w, h) in boxes {
+            if w <= 0.0 || h <= 0.0 {
+                continue;
+            }
+            if let Some(child) = self.children.get_mut(i) {
+                child.set_frame_geometry(x, y, w, h);
+            }
+        }
     }
 
     /// Get the number of child iframes.
@@ -1127,7 +1189,11 @@ impl Page {
                 .try_borrow::<crate::js_runtime::extensions::stealth_ext::StealthState>()
                 .and_then(|s| s.profile.clone())
         }?;
-        Some(self.rematerialize_iframes(&url, &client, &profile).await)
+        let n = self.rematerialize_iframes(&url, &client, &profile).await;
+        // Fresh realms start without a box; give them one before any script in
+        // them reads `innerWidth` or places an event.
+        self.sync_frame_geometry();
+        Some(n)
     }
 
     /// FP-E1: post-JS DOM rescan — materialize **script-injected**
@@ -1611,10 +1677,8 @@ impl Page {
             .await
     }
 
-    /// Pure navigation — no humanization, no synthetic events. Use for
-    /// deterministic snapshot tests, layout dump captures, or any
-    /// scenario where the test wants to assert about the page's *own*
-    /// behavior without injected mousemove/click activity.
+    /// Pure navigation — no input runtime. Use for deterministic snapshot
+    /// tests and layout captures that do not need coordinate input.
     pub async fn navigate_pure(
         url: &str,
         profile: crate::stealth::StealthProfile,
@@ -2280,6 +2344,7 @@ impl Page {
         self.event_loop.runtime_mut().replace_dom(dom, stylesheets);
         self.children.clear();
         self.url = resp_url.clone();
+        self.set_module_base_url(&resp_url);
         for t in all_timings {
             self.event_loop.runtime_mut().record_resource_timing(t);
         }
@@ -2350,7 +2415,10 @@ impl Page {
         let _ = self
             .event_loop
             .execute_and_run(
-                "globalThis.__syncCookiesFromNet && globalThis.__syncCookiesFromNet();",
+                &format!(
+                    "(function(){{var h=({NS_RESOLVE}||{{}}).host;\
+                      if(h&&h.__syncCookiesFromNet)h.__syncCookiesFromNet();}})()"
+                ),
                 Duration::from_millis(50),
             )
             .await;
@@ -2493,6 +2561,11 @@ impl Page {
         let _ = self
             .event_loop
             .execute_script(include_str!("js/humanize.js"));
+        if std::env::var_os("BROWSER_OXIDE_STRICT_API").is_some() {
+            let _ = self
+                .event_loop
+                .execute_script(include_str!("js/strict_api.js"));
+        }
 
         // DOMContentLoaded + load events — same setTimeout(0) trick the
         // cold build uses so dispatched handlers run inside the event
@@ -2506,6 +2579,7 @@ impl Page {
         let _ = self.event_loop.execute_script(
             r#"setTimeout(() => {
                 (((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__documentReadyState = 'interactive';
+                (function(){var ns=null;try{var y=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<y.length;i++){var v=globalThis[y[i]];if(v&&v.__bo){ns=v;break;}}}catch(e){}try{if(ns&&ns.images)ns.images.scan();}catch(e){}})();
                 document.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true}));
                 window.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true}));
                 (((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__documentReadyState = 'complete';
@@ -4212,7 +4286,10 @@ impl Page {
         // where the budget is correctly allocated.
         let _ = event_loop
             .execute_and_run(
-                "globalThis.__syncCookiesFromNet && globalThis.__syncCookiesFromNet();",
+                &format!(
+                    "(function(){{var h=({NS_RESOLVE}||{{}}).host;\
+                      if(h&&h.__syncCookiesFromNet)h.__syncCookiesFromNet();}})()"
+                ),
                 Duration::from_millis(50),
             )
             .await;
@@ -4593,6 +4670,7 @@ impl Page {
                 document.dispatchEvent(new Event('readystatechange'));
                 // Each dispatch is isolated: one framework's throwing DOMContentLoaded
                 // handler must not skip the transition to 'complete' below.
+                try { (function(){var ns=null;try{var y=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<y.length;i++){var v=globalThis[y[i]];if(v&&v.__bo){ns=v;break;}}}catch(e){}try{if(ns&&ns.images)ns.images.scan();}catch(e){}})(); } catch (_e) {}
                 try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true})); } catch (_e) {}
                 try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true})); } catch (_e) {}
             }, 0);

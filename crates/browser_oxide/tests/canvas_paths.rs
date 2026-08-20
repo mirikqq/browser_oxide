@@ -317,3 +317,210 @@ async fn complex_path_scene_produces_pixels() {
     .await;
     assert_eq!(r, "true");
 }
+
+/// `createImageBitmap` has to produce a bitmap a later `drawImage` can
+/// actually paint. It used to resolve with an empty stub carrying no pixels,
+/// so every `drawImage(bitmap, …)` silently drew nothing — a page decoding its
+/// images that way painted a fully transparent surface and never noticed.
+#[tokio::test]
+async fn create_image_bitmap_is_drawable() {
+    let mut page = Page::from_html(
+        "<!DOCTYPE html><html><body></body></html>",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+    page.evaluate_async(
+        "
+        globalThis.__bmr = 'не завершилось';
+        (async () => {
+            try {
+                const src = document.createElement('canvas');
+                src.width = 40; src.height = 20;
+                const sx = src.getContext('2d');
+                sx.fillStyle = '#f00';
+                sx.fillRect(0, 0, 40, 20);
+
+                const bm = await createImageBitmap(src);
+                if (!(bm instanceof ImageBitmap)) { globalThis.__bmr = 'не ImageBitmap'; return; }
+                if (bm.width !== 40 || bm.height !== 20) {
+                    globalThis.__bmr = 'размер ' + bm.width + 'x' + bm.height; return;
+                }
+
+                const dst = document.createElement('canvas');
+                dst.width = 40; dst.height = 20;
+                const dx = dst.getContext('2d');
+                dx.drawImage(bm, 0, 0);
+                const d = dx.getImageData(0, 0, 40, 20).data;
+                let opaque = 0;
+                for (let i = 3; i < d.length; i += 4) if (d[i] > 0) opaque++;
+                if (opaque !== 800) { globalThis.__bmr = 'непрозрачных ' + opaque + ' из 800'; return; }
+
+                const crop = await createImageBitmap(src, 0, 0, 20, 10);
+                if (crop.width !== 20 || crop.height !== 10) {
+                    globalThis.__bmr = 'обрезка ' + crop.width + 'x' + crop.height; return;
+                }
+                globalThis.__bmr = 'ok';
+            } catch (e) {
+                globalThis.__bmr = 'исключение: ' + e;
+            }
+        })();
+        ",
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    let r = page
+        .evaluate("globalThis.__bmr")
+        .unwrap_or_else(|e| format!("ERROR: {e}"));
+    assert_eq!(r, "ok");
+}
+
+/// A decoded `<img>` has to survive into a `drawImage` with its alpha intact.
+#[tokio::test]
+async fn decoded_image_draws_opaque() {
+    let mut page = Page::from_html(
+        "<!DOCTYPE html><html><body></body></html>",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+    page.evaluate_async(
+        "
+        globalThis.__imr = 'не завершилось';
+        (async () => {
+            try {
+                const s = document.createElement('canvas');
+                s.width = 40; s.height = 20;
+                const sx = s.getContext('2d');
+                sx.fillStyle = '#00aa00';
+                sx.fillRect(0, 0, 40, 20);
+                const url = s.toDataURL();
+
+                const im = new Image();
+                im.src = url;
+                await im.decode();
+                if (im.naturalWidth !== 40 || im.naturalHeight !== 20) {
+                    globalThis.__imr = 'декод ' + im.naturalWidth + 'x' + im.naturalHeight; return;
+                }
+
+                const dst = document.createElement('canvas');
+                dst.width = 40; dst.height = 20;
+                const dx = dst.getContext('2d');
+                dx.drawImage(im, 0, 0, 40, 20);
+                const d = dx.getImageData(0, 0, 40, 20).data;
+                let opaque = 0;
+                for (let i = 3; i < d.length; i += 4) if (d[i] > 0) opaque++;
+                globalThis.__imr = opaque === 800
+                    ? 'ok'
+                    : 'непрозрачных ' + opaque + ' из 800, первый пиксель rgba('
+                        + d[0] + ',' + d[1] + ',' + d[2] + ',' + d[3] + ')';
+            } catch (e) {
+                globalThis.__imr = 'исключение: ' + e;
+            }
+        })();
+        ",
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    let r = page
+        .evaluate("globalThis.__imr")
+        .unwrap_or_else(|e| format!("ERROR: {e}"));
+    assert_eq!(r, "ok");
+}
+
+/// Assigning `canvas.width` resets the context state, `getTransform` reports
+/// the live matrix, and `DOMMatrix` does real 2D math.
+#[tokio::test]
+async fn resize_resets_state_and_transform_is_readable() {
+    let r = evaluate(
+        "
+        const c = document.createElement('canvas');
+        c.width = 200; c.height = 200;
+        const ctx = c.getContext('2d');
+        const out = [];
+
+        ctx.scale(4, 4);
+        const t = ctx.getTransform();
+        if (t.a !== 4 || t.d !== 4) out.push('масштаб не виден: a=' + t.a + ' d=' + t.d);
+
+        // Per spec this resets the transform, so the fill lands at 0,0 unscaled.
+        c.width = 200;
+        const t2 = ctx.getTransform();
+        if (t2.a !== 1 || t2.d !== 1 || t2.e !== 0) {
+            out.push('после width= матрица ' + t2.a + ',' + t2.d + ',' + t2.e);
+        }
+        ctx.fillStyle = '#f00';
+        ctx.fillRect(0, 0, 10, 10);
+        const d = ctx.getImageData(0, 0, 20, 20).data;
+        let opaque = 0;
+        for (let i = 3; i < d.length; i += 4) if (d[i] > 0) opaque++;
+        if (opaque !== 100) out.push('после сброса непрозрачных ' + opaque + ' вместо 100');
+
+        const m = new DOMMatrix([2, 0, 0, 2, 10, 20]);
+        if (m.a !== 2 || m.e !== 10) out.push('DOMMatrix не принял аргумент');
+        const p = m.inverse().transformPoint({ x: 30, y: 40 });
+        if (Math.round(p.x) !== 10 || Math.round(p.y) !== 10) {
+            out.push('inverse().transformPoint → ' + p.x + ',' + p.y + ' вместо 10,10');
+        }
+        out.length ? out.join(' | ') : 'ok'
+        ",
+    )
+    .await;
+    assert_eq!(r, "ok");
+}
+
+/// The context's readable state: every property reports a value, survives
+/// `save`/`restore`, resets when the canvas is resized, and the canvas hands
+/// out one context rather than a new one per call.
+#[tokio::test]
+async fn context_state_is_readable() {
+    let r = evaluate(
+        "
+        const c = document.createElement('canvas');
+        c.width = 100; c.height = 100;
+        const ctx = c.getContext('2d');
+        const out = [];
+
+        if (c.getContext('2d') !== ctx) out.push('getContext отдаёт новый объект');
+
+        const defaults = {
+            fillStyle: '#000000', strokeStyle: '#000000', globalAlpha: 1,
+            globalCompositeOperation: 'source-over', lineWidth: 1, lineCap: 'butt',
+            lineJoin: 'miter', miterLimit: 10, font: '10px sans-serif',
+            textAlign: 'start', textBaseline: 'alphabetic',
+            shadowBlur: 0, shadowColor: 'rgba(0, 0, 0, 0)', shadowOffsetX: 0,
+            filter: 'none', imageSmoothingEnabled: true,
+        };
+        for (const k of Object.keys(defaults)) {
+            if (ctx[k] !== defaults[k]) out.push(k + ' по умолчанию ' + ctx[k]);
+        }
+
+        ctx.fillStyle = '#ff0000';
+        ctx.globalAlpha = 0.5;
+        ctx.globalCompositeOperation = 'multiply';
+        ctx.shadowBlur = 4;
+        if (ctx.fillStyle !== '#ff0000') out.push('fillStyle не читается');
+        if (ctx.globalAlpha !== 0.5) out.push('globalAlpha не читается');
+        if (ctx.globalCompositeOperation !== 'multiply') out.push('composite не читается');
+
+        ctx.save();
+        ctx.fillStyle = '#00ff00';
+        ctx.restore();
+        if (ctx.fillStyle !== '#ff0000') out.push('restore не вернул fillStyle: ' + ctx.fillStyle);
+
+        c.width = 100;
+        if (ctx.fillStyle !== '#000000' || ctx.globalAlpha !== 1 || ctx.shadowBlur !== 0) {
+            out.push('после width= состояние не сброшено: ' + ctx.fillStyle + ' ' + ctx.globalAlpha);
+        }
+
+        const proto = Object.getOwnPropertyNames(CanvasRenderingContext2D.prototype);
+        if (proto.some((n) => n.startsWith('_bo'))) out.push('на прототипе видны служебные имена');
+
+        out.length ? out.join(' | ') : 'ok'
+        ",
+    )
+    .await;
+    assert_eq!(r, "ok");
+}

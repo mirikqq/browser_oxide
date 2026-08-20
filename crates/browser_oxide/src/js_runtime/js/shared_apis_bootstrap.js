@@ -304,7 +304,14 @@
         globalThis.URL = class URL {
             constructor(url, base) {
                 let full = String(url);
-                if (base && !full.match(/^[a-z]+:\/\//i)) {
+                // Any string that starts with a scheme is already absolute and
+                // the base is ignored — including the schemes without `//`:
+                // `data:`, `blob:`, `mailto:`, `about:`. Matching only
+                // `scheme://` turned `new URL('data:image/png;base64,…', base)`
+                // into `https://host/data:image/png;base64,…`, so every inline
+                // image and every `URL.createObjectURL` result was corrupted the
+                // moment it was resolved against the document.
+                if (base && !full.match(/^[a-z][a-z0-9+.-]*:/i)) {
                     const b = String(base);
                     if (full.startsWith('//')) { const proto = b.match(/^([a-z]+:)/i); full = (proto ? proto[1] : 'https:') + full; }
                     else if (full.startsWith('/')) { const m = b.match(/^([a-z]+:\/\/[^/]+)/i); full = m ? m[1] + full : full; }

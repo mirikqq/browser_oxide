@@ -791,6 +791,19 @@ impl Canvas2D {
         self.state.transform = m;
     }
 
+    /// The current transform as Canvas 2D's `[a, b, c, d, e, f]`.
+    pub fn transform(&self) -> [f32; 6] {
+        let m = &self.state.transform;
+        [
+            m.scale_x(),
+            m.skew_y(),
+            m.skew_x(),
+            m.scale_y(),
+            m.translate_x(),
+            m.translate_y(),
+        ]
+    }
+
     pub fn reset_transform(&mut self) {
         self.state.transform = Matrix::new_identity();
     }
@@ -946,6 +959,94 @@ impl Canvas2D {
     }
 
     /// Write RGBA pixel data (non-premultiplied) at a position.
+    /// Resize the backing bitmap in place, clearing it.
+    ///
+    /// Assigning `canvas.width`/`height` resets the bitmap but keeps the same
+    /// canvas — so the surface has to be reallocated *under its existing id*.
+    /// Handing out a fresh id instead orphans every context already created
+    /// from that canvas: the page keeps drawing into the old surface while
+    /// everything else reads the new, empty one.
+    /// Assigning either dimension also resets the context to its default
+    /// state — transform, alpha, styles and the save stack. Keeping the old
+    /// state is what broke a captcha's challenge surface: it sizes the canvas
+    /// for the display each frame and then calls `ctx.scale(dpr, dpr)`,
+    /// expecting the assignment to have put the matrix back to identity. With
+    /// the state carried over, that scale compounded once per frame until
+    /// everything it drew landed far outside the bitmap, and the surface stayed
+    /// transparent while every draw call reported success.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        self.width = width;
+        self.height = height;
+        self.pixels = vec![0; (width as usize) * (height as usize) * 4];
+        self.state = CanvasState::default();
+        self.state_stack.clear();
+    }
+
+    /// `drawImage`: crop a source rectangle and paint it into a destination
+    /// rectangle, under the current transform.
+    ///
+    /// Goes through the same Skia canvas as every other drawing call, so the
+    /// context's transform, clip and alpha apply. An earlier version wrote into
+    /// the pixel buffer directly and therefore ignored all three — and a page
+    /// that sizes its canvas for a 2x display, calls `ctx.scale(2, 2)` and then
+    /// draws in CSS pixels (which is what a captcha's challenge surface does)
+    /// had its whole picture rendered at half size into the top-left quadrant.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the canvas drawImage signature; grouping into rects adds a type for one call site"
+    )]
+    pub fn draw_image_rect(
+        &mut self,
+        src: &[u8],
+        src_w: u32,
+        src_h: u32,
+        sx: f32,
+        sy: f32,
+        sw: f32,
+        sh: f32,
+        dx: f32,
+        dy: f32,
+        dw: f32,
+        dh: f32,
+    ) {
+        if src_w == 0 || src_h == 0 || sw <= 0.0 || sh <= 0.0 || dw <= 0.0 || dh <= 0.0 {
+            return;
+        }
+        let expected = (src_w as usize) * (src_h as usize) * 4;
+        if src.len() < expected {
+            return;
+        }
+        let info = ImageInfo::new(
+            (src_w as i32, src_h as i32),
+            ColorType::RGBA8888,
+            AlphaType::Unpremul,
+            None,
+        );
+        let row_bytes = src_w as usize * 4;
+        let data = skia_safe::Data::new_copy(&src[..expected]);
+        let Some(image) = skia_safe::images::raster_from_data(&info, data, row_bytes) else {
+            return;
+        };
+        let src_rect = SkRect::from_xywh(sx, sy, sw, sh);
+        let dst_rect = SkRect::from_xywh(dx, dy, dw, dh);
+        let matrix = self.state.transform;
+        let alpha = self.state.global_alpha;
+        self.with_canvas(|canvas| {
+            canvas.save();
+            canvas.concat(&matrix);
+            let mut paint = skia_safe::Paint::default();
+            paint.set_anti_alias(true);
+            paint.set_alpha_f(alpha);
+            canvas.draw_image_rect(
+                &image,
+                Some((&src_rect, skia_safe::canvas::SrcRectConstraint::Fast)),
+                dst_rect,
+                &paint,
+            );
+            canvas.restore();
+        });
+    }
+
     pub fn put_image_data(&mut self, data: &[u8], x: u32, y: u32, w: u32, h: u32) {
         let stride = self.width as usize * 4;
         for row in 0..h.min(self.height.saturating_sub(y)) {

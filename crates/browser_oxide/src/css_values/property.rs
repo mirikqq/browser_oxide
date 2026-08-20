@@ -16,6 +16,17 @@ pub enum PropertyId {
     MinHeight,
     MaxWidth,
     MaxHeight,
+    /// `top` / `right` / `bottom` / `left` — the inset properties.
+    ///
+    /// These were missing from the registry entirely, so the cascade dropped
+    /// them and layout never saw an offset: a `position: absolute` box sat
+    /// wherever normal flow put it. A widget that positions a popup next to its
+    /// anchor — which is how a captcha places its challenge — therefore rendered
+    /// its panel somewhere else on the page.
+    Top,
+    Right,
+    Bottom,
+    Left,
     MarginTop,
     MarginRight,
     MarginBottom,
@@ -24,6 +35,10 @@ pub enum PropertyId {
     PaddingRight,
     PaddingBottom,
     PaddingLeft,
+    BorderTopStyle,
+    BorderRightStyle,
+    BorderBottomStyle,
+    BorderLeftStyle,
     BorderTopWidth,
     BorderRightWidth,
     BorderBottomWidth,
@@ -75,6 +90,10 @@ impl PropertyId {
             "min-height" => Self::MinHeight,
             "max-width" => Self::MaxWidth,
             "max-height" => Self::MaxHeight,
+            "top" => Self::Top,
+            "right" => Self::Right,
+            "bottom" => Self::Bottom,
+            "left" => Self::Left,
             "margin-top" => Self::MarginTop,
             "margin-right" => Self::MarginRight,
             "margin-bottom" => Self::MarginBottom,
@@ -83,6 +102,10 @@ impl PropertyId {
             "padding-right" => Self::PaddingRight,
             "padding-bottom" => Self::PaddingBottom,
             "padding-left" => Self::PaddingLeft,
+            "border-top-style" => Self::BorderTopStyle,
+            "border-right-style" => Self::BorderRightStyle,
+            "border-bottom-style" => Self::BorderBottomStyle,
+            "border-left-style" => Self::BorderLeftStyle,
             "border-top-width" => Self::BorderTopWidth,
             "border-right-width" => Self::BorderRightWidth,
             "border-bottom-width" => Self::BorderBottomWidth,
@@ -144,6 +167,7 @@ pub enum CssValue {
     Float(Float),
     Clear(Clear),
     Visibility(Visibility),
+    BorderStyle(BorderStyle),
     ContentVisibility(ContentVisibility),
 
     // Sizing

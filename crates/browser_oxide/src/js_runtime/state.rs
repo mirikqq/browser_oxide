@@ -99,10 +99,15 @@ impl DomState {
     /// Call after assigning `stealth_profile`.
     pub fn sync_viewport_from_profile(&mut self) {
         if let Some(p) = self.stealth_profile.as_ref() {
+            // The profile is the single source of geometry: layout, media
+            // queries and `devicePixelRatio` all have to read the same numbers.
+            // Layout used to be handed the size but not the density, pinning
+            // its ratio at 1 while the page was told something else.
             self.layout_engine
-                .set_viewport(crate::layout::Viewport::new(
+                .set_viewport(crate::layout::Viewport::with_dpr(
                     p.inner_width as f32,
                     p.inner_height as f32,
+                    p.device_pixel_ratio as f32,
                 ));
         }
     }

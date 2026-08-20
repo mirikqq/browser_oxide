@@ -323,6 +323,53 @@ pub fn op_canvas_set_global_alpha(state: &mut OpState, #[smi] id: i32, alpha: f6
     }
 }
 
+/// `ctx.globalCompositeOperation`, `ctx.shadow*` and `ctx.filter`.
+///
+/// The backend has implemented all three for a long time; nothing exposed them
+/// to JS, so assigning any of them created a plain property on the context
+/// object and the engine never heard about it. A page erasing with
+/// `destination-out` or drawing a shadow got a plain opaque draw instead.
+#[op2(fast)]
+pub fn op_canvas_set_composite(state: &mut OpState, #[smi] id: i32, #[string] op: &str) {
+    let state = state.borrow_mut::<CanvasState>();
+    if let Some(c) = state.canvases.get_mut(&id) {
+        c.set_global_composite_operation(op);
+    }
+}
+
+#[op2(fast)]
+pub fn op_canvas_set_shadow_blur(state: &mut OpState, #[smi] id: i32, blur: f64) {
+    let state = state.borrow_mut::<CanvasState>();
+    if let Some(c) = state.canvases.get_mut(&id) {
+        c.set_shadow_blur(blur as f32);
+    }
+}
+
+#[op2(fast)]
+pub fn op_canvas_set_shadow_offset(state: &mut OpState, #[smi] id: i32, x: f64, y: f64) {
+    let state = state.borrow_mut::<CanvasState>();
+    if let Some(c) = state.canvases.get_mut(&id) {
+        c.set_shadow_offset_x(x as f32);
+        c.set_shadow_offset_y(y as f32);
+    }
+}
+
+#[op2(fast)]
+pub fn op_canvas_set_shadow_color(state: &mut OpState, #[smi] id: i32, #[string] color: &str) {
+    let state = state.borrow_mut::<CanvasState>();
+    if let Some(c) = state.canvases.get_mut(&id) {
+        c.set_shadow_color_str(color);
+    }
+}
+
+#[op2(fast)]
+pub fn op_canvas_set_filter(state: &mut OpState, #[smi] id: i32, #[string] filter: &str) {
+    let state = state.borrow_mut::<CanvasState>();
+    if let Some(c) = state.canvases.get_mut(&id) {
+        c.set_filter(filter);
+    }
+}
+
 #[op2(fast)]
 pub fn op_canvas_save(state: &mut OpState, #[smi] id: i32) {
     let state = state.borrow_mut::<CanvasState>();
@@ -639,6 +686,102 @@ pub fn op_canvas_draw_decoded_image(
     }
 }
 
+impl CanvasState {
+    /// Register decoded pixels and return their id.
+    ///
+    /// Used by the `<img>` loader: a decoded image is a `drawImage` source, and
+    /// the canvas state is where such sources live.
+    pub fn store_image(&mut self, rgba: Vec<u8>, width: u32, height: u32) -> i32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.images.insert(
+            id,
+            DecodedImage {
+                rgba,
+                width,
+                height,
+            },
+        );
+        id
+    }
+}
+
+/// `ctx.getTransform()` — the live matrix, not a fixed identity.
+///
+/// It used to return a hardcoded identity, so a page that read the matrix back
+/// (to map pointer coordinates into canvas space, which is how a drag challenge
+/// decides where the user dropped something) computed against a matrix the
+/// canvas never had.
+#[op2]
+#[serde]
+pub fn op_canvas_get_transform(state: &mut OpState, #[smi] id: i32) -> Vec<f32> {
+    let state = state.borrow::<CanvasState>();
+    match state.canvases.get(&id) {
+        Some(c) => c.transform().to_vec(),
+        None => vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+    }
+}
+
+/// `canvas.width = n` / `canvas.height = n`: reallocate the surface, same id.
+#[op2(fast)]
+pub fn op_canvas_resize(state: &mut OpState, #[smi] canvas_id: i32, #[smi] w: i32, #[smi] h: i32) {
+    let state = state.borrow_mut::<CanvasState>();
+    if let Some(c) = state.canvases.get_mut(&canvas_id) {
+        c.resize(w.max(0) as u32, h.max(0) as u32);
+    }
+}
+
+/// `drawImage` with a source rectangle and a destination rectangle.
+///
+/// `src_kind` selects where the pixels come from: `0` a decoded image (an
+/// `<img>` that finished loading), `1` another canvas. The old ops could only
+/// blit a whole canvas at an offset, so an `<img>` source drew nothing and the
+/// scaling forms were ignored.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the canvas drawImage signature end to end"
+)]
+#[op2(fast)]
+pub fn op_canvas_draw_image_rect(
+    state: &mut OpState,
+    #[smi] dst_id: i32,
+    #[smi] src_kind: i32,
+    #[smi] src_id: i32,
+    sx: f64,
+    sy: f64,
+    sw: f64,
+    sh: f64,
+    dx: f64,
+    dy: f64,
+    dw: f64,
+    dh: f64,
+) {
+    let state = state.borrow_mut::<CanvasState>();
+    let src = if src_kind == 0 {
+        state
+            .images
+            .get(&src_id)
+            .map(|i| (i.rgba.clone(), i.width, i.height))
+    } else {
+        state.canvases.get(&src_id).map(|c| {
+            (
+                c.get_image_data(0, 0, c.width(), c.height()),
+                c.width(),
+                c.height(),
+            )
+        })
+    };
+    let Some((rgba, sw_px, sh_px)) = src else {
+        return;
+    };
+    if let Some(dst) = state.canvases.get_mut(&dst_id) {
+        dst.draw_image_rect(
+            &rgba, sw_px, sh_px, sx as f32, sy as f32, sw as f32, sh as f32, dx as f32, dy as f32,
+            dw as f32, dh as f32,
+        );
+    }
+}
+
 deno_core::extension!(
     canvas_extension,
     ops = [
@@ -680,5 +823,13 @@ deno_core::extension!(
         op_canvas_set_fill_gradient,
         op_image_decode_base64,
         op_canvas_draw_decoded_image,
+        op_canvas_draw_image_rect,
+        op_canvas_resize,
+        op_canvas_get_transform,
+        op_canvas_set_composite,
+        op_canvas_set_shadow_blur,
+        op_canvas_set_shadow_offset,
+        op_canvas_set_shadow_color,
+        op_canvas_set_filter,
     ],
 );

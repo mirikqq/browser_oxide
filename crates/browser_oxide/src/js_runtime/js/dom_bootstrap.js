@@ -224,6 +224,54 @@
 
     function _installSvgGeometry(el, tag) {
         try {
+            // The `<svg>` element's geometry factories. `createSVGRect` is the
+            // best known — it is a stock browser-capability probe, and libraries
+            // call it to build rects for `getIntersectionList`/`checkIntersection`
+            // — but the whole family is stock SVG 1.1 surface that this engine
+            // simply did not have.
+            if (tag === "svg") {
+                const _num = (v) => ({ value: +v || 0, valueInSpecifiedUnits: +v || 0 });
+                const _defs = {
+                    createSVGRect: () => ({ x: 0, y: 0, width: 0, height: 0 }),
+                    createSVGPoint: () => ({
+                        x: 0, y: 0,
+                        matrixTransform(m) {
+                            const mm = m || {};
+                            return {
+                                x: this.x * (mm.a ?? 1) + this.y * (mm.c ?? 0) + (mm.e ?? 0),
+                                y: this.x * (mm.b ?? 0) + this.y * (mm.d ?? 1) + (mm.f ?? 0),
+                            };
+                        },
+                    }),
+                    createSVGMatrix: () => (globalThis.DOMMatrix ? new DOMMatrix() : {
+                        a: 1, b: 0, c: 0, d: 1, e: 0, f: 0,
+                    }),
+                    createSVGLength: () => _num(0),
+                    createSVGAngle: () => _num(0),
+                    createSVGNumber: () => _num(0),
+                    createSVGTransform: () => ({
+                        type: 0, angle: 0,
+                        matrix: globalThis.DOMMatrix ? new DOMMatrix() : null,
+                        setTranslate() {}, setScale() {}, setRotate() {},
+                    }),
+                    createSVGTransformFromMatrix: (m) => ({ type: 1, angle: 0, matrix: m }),
+                    getIntersectionList: () => (globalThis.NodeList ? [] : []),
+                    getEnclosureList: () => [],
+                    checkIntersection: () => false,
+                    checkEnclosure: () => false,
+                    suspendRedraw: () => 0,
+                    unsuspendRedraw: () => {},
+                    unsuspendRedrawAll: () => {},
+                    forceRedraw: () => {},
+                };
+                for (const [name, fn] of Object.entries(_defs)) {
+                    if (typeof el[name] === "function") continue;
+                    Object.defineProperty(el, name, {
+                        value: fn, writable: true, enumerable: false, configurable: true,
+                    });
+                    if (_maskRuntime) _maskRuntime(el[name], name);
+                }
+            }
             Object.defineProperty(el, "getBBox", {
                 value: function getBBox() {
                     let x = 0, y = 0, width = 0, height = 0;
@@ -288,6 +336,35 @@
             }
         } catch (_) { /* ignore */ }
         return null;
+    }
+
+    /// Debug counter for injected iframes. It used to be assigned straight to
+    /// `globalThis`, which re-created a named engine global on the window
+    /// *after* the cleanup pass had deleted it — visible to any page that
+    /// enumerates the global namespace.
+    function _setIfAppendCount(n) {
+        const st = _boState();
+        if (st) st.__ifAppendCount = n;
+    }
+
+    /// The `document.cookie` mirror of `net::cookies`, for this origin.
+    ///
+    /// It used to live at `globalThis.__jsCookies`, but that name is one the
+    /// cleanup pass moves onto the engine's namespace and deletes from the
+    /// global — so every read created a fresh empty object and
+    /// `document.cookie` answered `""` no matter what the server had set.
+    /// Cookies still travelled correctly at the HTTP layer, which is what made
+    /// it invisible: only *scripts* saw a cookie-less browser, and a client
+    /// that receives `Set-Cookie` and then reports no cookies at all is exactly
+    /// the shape a risk engine scores as a fresh, suspicious visitor.
+    function _cookieMirror() {
+        const st = _boState();
+        if (st) {
+            if (!st.__jsCookies) st.__jsCookies = {};
+            return st.__jsCookies;
+        }
+        if (!globalThis.__jsCookies) globalThis.__jsCookies = {};
+        return globalThis.__jsCookies;
     }
 
     function _onNodeInsertedInner(child, sync = true) {
@@ -786,11 +863,33 @@
             for (const k in cache) { if (cache[k] !== "") parts.push(k + ": " + cache[k]); }
             ops.op_dom_set_attribute(nodeId, "style", parts.join("; "));
         }
+        // A declaration a browser would refuse.
+        //
+        // CSSOM drops a value it cannot parse, leaving the property as it was.
+        // This proxy stored whatever it was handed, so a page whose arithmetic
+        // produced `NaN` — from a metric that read back as an empty string, say
+        // — wrote `height: NaN` into the element and the browser-side result
+        // (property simply unset) never happened. The element then laid out on
+        // a value no engine would accept. Measured on hCaptcha's tiles:
+        // `background-size: 120px NaNpx` and nothing painted.
+        const _rejects = (v) => {
+            const t = String(v).trim();
+            if (t === "") return false;      // empty means "remove", which is valid
+            // `NaN`, `undefined`, `Infinity` never appear in valid CSS; they are
+            // exactly what broken JS arithmetic stringifies to. No trailing
+            // delimiter is required: the unit is usually glued straight on, as
+            // in `background-size: 120px NaNpx`.
+            return /(^|[\s(,])(NaN|undefined|Infinity)/.test(t);
+        };
+
         const toKebab = (p) => p.replace(/[A-Z]/g, m => "-" + m.toLowerCase());
         const style = Object.create(globalThis.CSSStyleDeclaration.prototype || Object.prototype);
         return new Proxy(style, {
             get(target, prop) {
-                if (prop === "setProperty") return (name, value) => { cache[name] = String(value); flush(); };
+                if (prop === "setProperty") return (name, value) => {
+                    if (_rejects(value)) return;
+                    cache[name] = String(value); flush();
+                };
                 if (prop === "getPropertyValue") return (name) => cache[name] || "";
                 if (prop === "removeProperty") return (name) => { const old = cache[name] || ""; delete cache[name]; flush(); return old; };
                 if (prop === "cssText") return ops.op_dom_get_attribute(nodeId, "style") || "";
@@ -807,11 +906,15 @@
                     for (const k in cache) delete cache[k];
                     for (const part of String(value).split(";")) {
                         const idx = part.indexOf(":");
-                        if (idx > 0) cache[part.slice(0, idx).trim()] = part.slice(idx + 1).trim();
+                        if (idx > 0) {
+                            const v = part.slice(idx + 1).trim();
+                            if (!_rejects(v)) cache[part.slice(0, idx).trim()] = v;
+                        }
                     }
                     flush();
                     return true;
                 }
+                if (_rejects(value)) return true;   // refused, as a browser does
                 cache[toKebab(prop)] = String(value);
                 flush();
                 return true;
@@ -873,6 +976,39 @@
     Object.defineProperty(Attr.prototype, Symbol.toStringTag, {
         value: "Attr", configurable: true,
     });
+
+    /// Set by the `HTMLImageElement` block below, which is defined after this
+    /// class. `setAttribute('src', …)` on an <img> starts the fetch through it,
+    /// so markup-parsed images and `img.src = …` follow the same path.
+    /// `_maskFunction` captured while it still exists.
+    ///
+    /// The cleanup pass purges the masking helpers from the global namespace,
+    /// so any `typeof _maskFunction === 'function'` check made at *runtime* —
+    /// from an element factory, say — fails and the masking silently does
+    /// nothing. Every function installed after cleanup then serialises as its
+    /// own JS source instead of `[native code]`.
+    const _maskRuntime = (typeof _maskFunction === "function") ? _maskFunction : null;
+
+    let _onImgSrcAttr = null;
+    /// The document's focused element. `null` means "the body", which is what
+    /// `document.activeElement` reports when nothing is focused.
+    let _activeElement = null;
+    /// Set below by the form-control block: clears a control's dirty value /
+    /// checkedness flags so it falls back to its markup default again.
+    let _clearDirtyValue = null;
+
+    // pointerId → the element currently capturing it.
+    const _pointerCaptures = new Map();
+    const _firePointerCapture = (el, type, pointerId) => {
+        try {
+            const P = globalThis.PointerEvent || globalThis.MouseEvent;
+            const ev = new P(type, {
+                bubbles: true, cancelable: false, composed: true,
+                pointerId, pointerType: "mouse", isPrimary: true,
+            });
+            el.dispatchEvent(ev);
+        } catch (_e) { /* ignore */ }
+    };
 
     class Element extends Node {
         get tagName() { return ops.op_dom_get_tag_name(_getNodeId(this)).toUpperCase(); }
@@ -936,8 +1072,21 @@
             return els.length > 0 ? _wrapNode(els[els.length - 1]) : null;
         }
         getAttribute(name) { return ops.op_dom_get_attribute(_getNodeId(this), name); }
-        setAttribute(name, value) { ops.op_dom_set_attribute(_getNodeId(this), name, String(value)); }
-        removeAttribute(name) { ops.op_dom_remove_attribute(_getNodeId(this), name); }
+        setAttribute(name, value) {
+            const v = String(value);
+            ops.op_dom_set_attribute(_getNodeId(this), name, v);
+            if (_onImgSrcAttr && name.toLowerCase() === "src"
+                && (this.tagName || "").toLowerCase() === "img") {
+                _onImgSrcAttr(this, v);
+            }
+        }
+        removeAttribute(name) {
+            ops.op_dom_remove_attribute(_getNodeId(this), name);
+            if (_onImgSrcAttr && name.toLowerCase() === "src"
+                && (this.tagName || "").toLowerCase() === "img") {
+                _onImgSrcAttr(this, null);
+            }
+        }
         getAttributeNode(name) {
             const n = String(name);
             const val = ops.op_dom_get_attribute(_getNodeId(this), n);
@@ -1022,6 +1171,42 @@
             if (cur) cur.left = left; else _scrollState.set(id, { top: 0, left });
         }
         scrollIntoView(_arg) { /* spec no-op when no scrollable ancestor; safe stub */ }
+
+        // Pointer capture.
+        //
+        // These did not exist at all, and a drag implementation opens with
+        // `e.target.setPointerCapture(e.pointerId)` — so the very first line of
+        // every `pointerdown` handler threw `TypeError: … is not a function` and
+        // the handler never got as far as setting its "dragging" flag. Every
+        // later `pointermove` then arrived at a widget that did not believe a
+        // drag was in progress: the events registered, nothing moved, and the
+        // gesture never produced an answer to submit.
+        //
+        // Retargeting is not needed here — pointer events are dispatched at the
+        // element under the pointer and bubble — so this tracks the capture and
+        // fires the two events the spec pairs with it.
+        setPointerCapture(pointerId) {
+            const id = pointerId | 0;
+            const prev = _pointerCaptures.get(id);
+            if (prev === this) return;
+            if (prev) _firePointerCapture(prev, "lostpointercapture", id);
+            _pointerCaptures.set(id, this);
+            _firePointerCapture(this, "gotpointercapture", id);
+        }
+        releasePointerCapture(pointerId) {
+            const id = pointerId | 0;
+            if (_pointerCaptures.get(id) !== this) {
+                throw new DOMException(
+                    "Failed to execute 'releasePointerCapture' on 'Element': " +
+                    "No active pointer with the given id is found.",
+                    "NotFoundError");
+            }
+            _pointerCaptures.delete(id);
+            _firePointerCapture(this, "lostpointercapture", id);
+        }
+        hasPointerCapture(pointerId) {
+            return _pointerCaptures.get(pointerId | 0) === this;
+        }
         scrollTo(xOrOpts, y) {
             if (typeof xOrOpts === "object" && xOrOpts !== null) {
                 if (xOrOpts.left !== undefined) this.scrollLeft = xOrOpts.left;
@@ -1288,8 +1473,37 @@
                 try { _runActivation(this); } catch (_) { /* ignore */ }
             }
         }
-        focus() { this.dispatchEvent(new Event("focus")); }
-        blur() { this.dispatchEvent(new Event("blur")); }
+        /// Focus moves `document.activeElement`, and takes it off whatever held
+        /// it before. It used to only fire the event, so `activeElement` stayed
+        /// on `<body>` for the document's whole life: a page reading it to find
+        /// the focused field saw none, and a driver sending keystrokes to the
+        /// focused element had nowhere to send them.
+        ///
+        /// Order follows the spec: the old target gets `blur`/`focusout`, the
+        /// new one `focus`/`focusin`, and the bubbling pair comes after the
+        /// non-bubbling one.
+        focus() {
+            const prev = _activeElement;
+            if (prev === this) return;
+            _activeElement = this;
+            if (prev && prev !== this) {
+                try {
+                    prev.dispatchEvent(new FocusEvent("blur", { relatedTarget: this }));
+                    prev.dispatchEvent(new FocusEvent("focusout", {
+                        bubbles: true, relatedTarget: this,
+                    }));
+                } catch (_) { /* ignore */ }
+            }
+            this.dispatchEvent(new FocusEvent("focus", { relatedTarget: prev || null }));
+            this.dispatchEvent(new FocusEvent("focusin", {
+                bubbles: true, relatedTarget: prev || null,
+            }));
+        }
+        blur() {
+            if (_activeElement === this) _activeElement = null;
+            this.dispatchEvent(new FocusEvent("blur", {}));
+            this.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
+        }
         checkVisibility() { return true; }
         animate() { return { finished: Promise.resolve(), cancel() {}, play() {}, pause() {} }; }
         getAnimations() { return []; }
@@ -1504,19 +1718,158 @@
         },
         enumerable: true, configurable: true
     });
+    // ── Image loading ────────────────────────────────────────────────────
+    //
+    // These three used to be constants: `complete` was always `true` and the
+    // natural size came from the `width`/`height` *content attributes*, so an
+    // image without them reported `0x0` while claiming to be complete — a
+    // combination a real browser cannot produce, and a cheap tell. Nothing was
+    // ever fetched, and neither `load` nor `error` fired, so a widget that
+    // waits for its images to arrive waited forever. hCaptcha's challenge tiles
+    // are exactly that: the task text rendered and every tile stayed blank.
+    //
+    // State lives off the element (a WeakMap, not own properties) so
+    // `Object.getOwnPropertyNames(img)` keeps Chrome's shape.
+    const _imgState = new WeakMap();
+    // Intrinsic sizes by resolved URL. A document that shows the same sprite in
+    // twenty places should fetch it once, as the HTTP cache would.
+    const _imgSizes = new Map();
+
+    const _imgStateOf = (el) => {
+        let st = _imgState.get(el);
+        if (!st) { st = { done: false, ok: false, w: 0, h: 0, url: null, id: -1 }; _imgState.set(el, st); }
+        return st;
+    };
+    // `drawImage(img, …)` needs the decoded pixels, which live in the canvas
+    // state under this id. Exposed on the prototype rather than as an own
+    // property so `Object.getOwnPropertyNames(img)` keeps Chrome's shape.
+    Object.defineProperty(HTMLImageElement.prototype, '_decodedImageId', {
+        get() { return _imgStateOf(this).id; },
+        enumerable: false, configurable: true,
+    });
+
+    const _startImgLoad = (el, rawSrc) => {
+        const st = _imgStateOf(el);
+        if (!rawSrc) {
+            // Per spec, clearing `src` puts the element back to "no image".
+            st.done = false; st.ok = false; st.w = 0; st.h = 0; st.url = null;
+            return;
+        }
+        let url;
+        try {
+            url = new URL(String(rawSrc), globalThis.location?.href || undefined).href;
+        } catch (_) { url = String(rawSrc); }
+        if (st.url === url) return;      // same image, nothing to redo
+        st.url = url; st.done = false; st.ok = false; st.w = 0; st.h = 0;
+
+        const settle = (ok, w, h, id) => {
+            // A `src` reassigned while this load was in flight wins: the stale
+            // result must not overwrite the newer one or fire its events.
+            if (st.url !== url) return;
+            st.done = true; st.ok = ok; st.w = w | 0; st.h = h | 0;
+            st.id = (id === undefined || id === null) ? -1 : (id | 0);
+            try {
+                el.dispatchEvent(new Event(ok ? "load" : "error"));
+            } catch (_) { /* ignore */ }
+        };
+
+        const cached = _imgSizes.get(url);
+        if (cached) {
+            // Still a task, never synchronous: a browser fires `load` from the
+            // event loop, and code that assigns `src` then attaches `onload`
+            // right after would otherwise miss it.
+            setTimeout(() => settle(cached.ok, cached.w, cached.h, cached.id), 0);
+            return;
+        }
+        try {
+            ops.op_img_load(url).then((r) => {
+                const ok = !!(r && r.ok);
+                const rec = {
+                    ok, w: (r && r.width) | 0, h: (r && r.height) | 0,
+                    id: (r && typeof r.id === 'number') ? r.id : -1,
+                };
+                _imgSizes.set(url, rec);
+                settle(rec.ok, rec.w, rec.h, rec.id);
+            }, () => settle(false, 0, 0, -1));
+        } catch (_) {
+            setTimeout(() => settle(false, 0, 0, -1), 0);
+        }
+    };
+
     Object.defineProperty(HTMLImageElement.prototype, "naturalWidth", {
-        get() { return this.width; },
+        get() { return _imgStateOf(this).w; },
         enumerable: true, configurable: true
     });
     Object.defineProperty(HTMLImageElement.prototype, "naturalHeight", {
-        get() { return this.height; },
+        get() { return _imgStateOf(this).h; },
         enumerable: true, configurable: true
     });
+    // Chrome: `true` for an element with no `src` at all, and for one whose
+    // fetch has settled either way. `false` only while a load is outstanding.
     Object.defineProperty(HTMLImageElement.prototype, "complete", {
-        get() { return true; }, 
+        get() {
+            const st = _imgStateOf(this);
+            if (!st.url) return true;
+            return st.done;
+        },
         enumerable: true, configurable: true
     });
-    HTMLImageElement.prototype.decode = function() { return Promise.resolve(); };
+    Object.defineProperty(HTMLImageElement.prototype, "src", {
+        get() {
+            const raw = this.getAttribute("src");
+            if (raw == null) return "";
+            try {
+                return new URL(raw, globalThis.location?.href || undefined).href;
+            } catch (_) { return raw; }
+        },
+        set(v) { this.setAttribute("src", String(v)); },
+        enumerable: true, configurable: true
+    });
+    Object.defineProperty(HTMLImageElement.prototype, "currentSrc", {
+        get() { return _imgStateOf(this).ok ? _imgStateOf(this).url || "" : ""; },
+        enumerable: true, configurable: true
+    });
+    HTMLImageElement.prototype.decode = function decode() {
+        const st = _imgStateOf(this);
+        if (st.done) {
+            return st.ok
+                ? Promise.resolve()
+                : Promise.reject(new DOMException("The source image cannot be decoded.", "EncodingError"));
+        }
+        return new Promise((resolve, reject) => {
+            this.addEventListener("load", () => resolve(), { once: true });
+            this.addEventListener("error", () => reject(
+                new DOMException("The source image cannot be decoded.", "EncodingError")
+            ), { once: true });
+        });
+    };
+    // The engine drives loads from the attribute, so markup-parsed images and
+    // `img.src = …` take the same path.
+    _onImgSrcAttr = (el, value) => _startImgLoad(el, value);
+
+    // Images that came from the markup never pass through `setAttribute`, so
+    // the host kicks this off once the document is parsed (right before it
+    // dispatches DOMContentLoaded) — same point a browser has finished the
+    // parser-triggered fetches.
+    try {
+        Object.defineProperty(_boNs, 'images', {
+            value: {
+                scan() {
+                    let n = 0;
+                    try {
+                        const list = document.querySelectorAll('img');
+                        for (let i = 0; i < list.length; i++) {
+                            const el = list[i];
+                            const src = el.getAttribute('src');
+                            if (src) { _startImgLoad(el, src); n++; }
+                        }
+                    } catch (_) { /* ignore */ }
+                    return n;
+                },
+            },
+            writable: true, configurable: true, enumerable: false,
+        });
+    } catch (_) { /* ignore */ }
     class HTMLInputElement extends HTMLElement {}
     class HTMLFormElement extends HTMLElement {
         submit() {
@@ -1549,12 +1902,18 @@
                 finalBody = params.toString();
             }
 
-            globalThis.__pendingNavigation = {
+            // Through the engine's state object, not `globalThis`: the cleanup
+            // pass deletes that name, so a form submit wrote its navigation
+            // into a fresh global nobody reads and the page never navigated.
+            const _st = _boState();
+            const _nav = {
                 url: finalUrl,
                 method: method,
                 body: finalBody,
                 kind: 'assign'
             };
+            if (_st) _st.__pendingNavigation = _nav;
+            else globalThis.__pendingNavigation = _nav;
             // Signal the Rust event loop to short-circuit run_until_idle —
             // see crates/js_runtime/src/extensions/nav_ext.rs.
             try { ops.op_set_pending_nav(); } catch (_) {}
@@ -1593,12 +1952,10 @@
             const controls = this.querySelectorAll('input, textarea, select');
             for (let i = 0; i < controls.length; i++) {
                 const el = controls[i];
-                const type = String(el.type || '').toLowerCase();
-                if (type === 'checkbox' || type === 'radio') {
-                    el.checked = el.hasAttribute('checked');
-                } else if (type !== 'submit' && type !== 'button' && type !== 'reset') {
-                    el.value = el.getAttribute('value') || '';
-                }
+                // Clearing the dirty flags *is* the reset: the getters then
+                // read the markup defaults again. Assigning `el.value` here
+                // would instead mark the control dirty at its default value.
+                if (_clearDirtyValue) _clearDirtyValue(el);
             }
         }
     }
@@ -1627,10 +1984,8 @@
         });
     };
     _reflectStr(HTMLInputElement.prototype, 'name');
-    _reflectStr(HTMLInputElement.prototype, 'value');
     _reflectStr(HTMLInputElement.prototype, 'type', 'type', 'text');
     _reflectStr(HTMLInputElement.prototype, 'placeholder');
-    _reflectBool(HTMLInputElement.prototype, 'checked');
     _reflectBool(HTMLInputElement.prototype, 'disabled');
     _reflectBool(HTMLInputElement.prototype, 'readOnly', 'readonly');
     _reflectBool(HTMLInputElement.prototype, 'required');
@@ -1982,13 +2337,11 @@
     function _clearCurrentScriptLater(to) {
         const mine = _currentScript;
         const restore = () => { if (_currentScript === mine) _setCurrentScript(to ?? null); };
-        try {
-            // The engine's own background timer where available: a plain
-            // `setTimeout` here would hold `run_until_idle` open on every
-            // script the document runs.
-            const bg = _boNs && _boNs.host && _boNs.host.__bgSetTimeout;
-            if (typeof bg === "function") { bg(restore, 0); return; }
-        } catch (_) { /* fall through */ }
+        // A plain `setTimeout`, not the engine's background timer: the
+        // background one does not hold `run_until_idle` open, so the restore
+        // could be dropped and `document.currentScript` would still name the
+        // last script once the document was idle. One 0 ms timer per script is
+        // the cost of getting the reset to actually happen.
         setTimeout(restore, 0);
     }
 
@@ -1999,22 +2352,13 @@
         try {
             (0, eval)(code);
         } finally {
-            // Restore *after* the microtask checkpoint, not before it. HTML's
-            // "clean up after running script" performs the checkpoint while the
-            // element is still `document.currentScript`, so a microtask the
-            // script queued still sees it — restoring synchronously here made
-            // every such continuation read null.
-            //
-            // Turbopack's chunk loader depends on exactly that: `registerChunk`
-            // awaits its sibling chunks and then evaluates the entry module,
-            // and Next.js's `getAssetPrefix()` throws
-            // `Invariant: Expected document.currentScript to be a <script>
-            // element` when it reads null there — which aborted hydration on
-            // every Next.js page built with Turbopack.
-            //
-            // Guarded so a nested script that set its own element wins: only
-            // the eval that is still the current one restores.
-            _clearCurrentScriptLater(prev);
+            // Restored synchronously: HTML performs the microtask checkpoint
+            // only when the JS stack is empty, and a script inserted from
+            // inside running page code never empties it. `document.currentScript`
+            // is therefore back to its previous value by the time `appendChild`
+            // returns. (The document's *own* scripts do empty the stack — see
+            // `clear_current_script_js` in `page.rs`, which defers instead.)
+            _setCurrentScript(prev);
         }
     }
 
@@ -2307,12 +2651,62 @@
             const h = globalThis.innerHeight || 0;
             return x >= 0 && y >= 0 && x < w && y < h;
         }
+        /// Everything under the point, topmost first.
+        ///
+        /// Both entry points used to answer `body` for any point inside the
+        /// viewport, whatever was actually drawn there. Anything that asks "is
+        /// my element the thing at this coordinate" — hit-testing before a
+        /// click, an overlay checking whether it is covered, a widget routing a
+        /// gesture — got the same wrong answer every time. Layout gives real
+        /// boxes now, so the question can be answered from them.
+        _hitStack(x, y) {
+            if (!this._pointInViewport(x, y)) return [];
+            x = +x; y = +y;
+            const hits = [];
+            let all;
+            try { all = this.querySelectorAll('*'); } catch (_e) { return []; }
+            for (let i = 0; i < all.length; i++) {
+                const el = all[i];
+                let st = null;
+                try { st = getComputedStyle(el); } catch (_e) { /* ignore */ }
+                if (st) {
+                    if (st.display === 'none') continue;
+                    if (st.visibility === 'hidden' || st.visibility === 'collapse') continue;
+                    if (st.pointerEvents === 'none') continue;
+                }
+                let r;
+                try { r = el.getBoundingClientRect(); } catch (_e) { continue; }
+                if (!r || r.width <= 0 || r.height <= 0) continue;
+                if (x < r.left || x >= r.right || y < r.top || y >= r.bottom) continue;
+                let z = 0;
+                let positioned = 0;
+                if (st) {
+                    positioned = st.position && st.position !== 'static' ? 1 : 0;
+                    const zi = parseInt(st.zIndex, 10);
+                    if (positioned && isFinite(zi)) z = zi;
+                }
+                hits.push({ el, z, positioned, order: i });
+            }
+            // Painting order, approximated by the three rules that decide it in
+            // practice: a higher `z-index` wins, a positioned box paints over a
+            // static one, and otherwise whatever comes later in the document is
+            // on top — which also puts a descendant above its ancestor, since it
+            // always comes after it. Sorting by tree depth instead let a deeply
+            // nested box on an untouched part of the page beat an overlay that
+            // was appended over it.
+            hits.sort((a, b) =>
+                (b.z - a.z) || (b.positioned - a.positioned) || (b.order - a.order));
+            return hits.map((h) => h.el);
+        }
         elementFromPoint(x, y) {
             if (!this._pointInViewport(x, y)) return null;
-            return this.body || this.documentElement || null;
+            const stack = this._hitStack(x, y);
+            return stack.length ? stack[0] : (this.body || this.documentElement || null);
         }
         elementsFromPoint(x, y) {
             if (!this._pointInViewport(x, y)) return [];
+            const stack = this._hitStack(x, y);
+            if (stack.length) return stack;
             return this.body ? [this.body] : [];
         }
         caretPositionFromPoint(x, y) { return null; }
@@ -2332,14 +2726,13 @@
             // Unified cookie jar: returns the mirror of net::cookies for this origin.
             // The mirror is refreshed synchronously on every page navigation and after
             // each fetch() response via _syncCookiesFromNet().
-            if (!globalThis.__jsCookies) globalThis.__jsCookies = {};
-            return Object.entries(globalThis.__jsCookies)
+            return Object.entries(_cookieMirror())
                 .map(([k, v]) => `${k}=${v}`)
                 .join("; ");
         }
         set cookie(val) {
             // Parse "name=value; path=/; ..." — update local mirror AND push to net::cookies.
-            if (!globalThis.__jsCookies) globalThis.__jsCookies = {};
+            const _mirror = _cookieMirror();
             const parts = String(val).split(";");
             const [name, ...rest] = (parts[0] || "").split("=");
             const key = name.trim();
@@ -2348,9 +2741,9 @@
             // Check for max-age=0 or expires in the past (delete cookie)
             const lower = String(val).toLowerCase();
             if (lower.includes("max-age=0") || lower.includes("max-age=-")) {
-                delete globalThis.__jsCookies[key];
+                delete _mirror[key];
             } else {
-                globalThis.__jsCookies[key] = value;
+                _mirror[key] = value;
             }
             // Fire-and-forget propagation to the net layer.
             try {
@@ -2413,7 +2806,18 @@
         }
         get doctype() { return null; }
         get defaultView() { return globalThis; }
-        get activeElement() { return this.body; }
+        get activeElement() {
+            // A detached element cannot stay focused — Chrome falls back to the
+            // body the moment the focused node leaves the tree.
+            if (_activeElement) {
+                try {
+                    if (_activeElement.isConnected !== false) return _activeElement;
+                } catch (_) { /* fall through */ }
+                _activeElement = null;
+            }
+            return this.body;
+        }
+        hasFocus() { return true; }
         get scripts() { return this.getElementsByTagName("script"); }
         get forms() { return this.getElementsByTagName("form"); }
         get images() { return this.getElementsByTagName("img"); }
@@ -2704,6 +3108,319 @@
     // Expose the real HTMLElement subclasses — the prototype chain is
     // EventTarget ← Node ← Element ← HTMLElement ← HTML*Element so that
     // `el instanceof HTMLDivElement` etc. works as in real Chrome.
+    // ── Members the strict-API probe found missing on a real login form ──────
+    //
+    // Each is plain spec surface every Chrome element carries. Their absence is
+    // doubly costly: form code that reads them breaks, and the absence itself
+    // differs from Chrome, so a fingerprinter sees a window where
+    // `'contentEditable' in div` is false.
+
+    const _reflectInt = (proto, prop, attr = prop.toLowerCase(), dflt = -1) => {
+        Object.defineProperty(proto, prop, {
+            get() {
+                const v = this.getAttribute(attr);
+                if (v == null) return dflt;
+                const n = parseInt(v, 10);
+                return Number.isNaN(n) ? dflt : n;
+            },
+            set(v) { this.setAttribute(attr, String(v | 0)); },
+            enumerable: true, configurable: true,
+        });
+    };
+
+    // Element: the namespace every node reports. SVG content lives in the SVG
+    // namespace, everything else parsed from an HTML document in the XHTML one.
+    Object.defineProperty(Element.prototype, 'namespaceURI', {
+        get() {
+            try {
+                const tag = ops.op_dom_get_tag_name(_getNodeId(this)).toLowerCase();
+                if (_SVG_TAGS.has(tag)) return 'http://www.w3.org/2000/svg';
+            } catch (_) { /* detached */ }
+            return 'http://www.w3.org/1999/xhtml';
+        },
+        enumerable: true, configurable: true,
+    });
+    Object.defineProperty(Element.prototype, 'prefix', {
+        get() { return null; }, enumerable: true, configurable: true,
+    });
+
+    // HTMLElement: the global content attributes.
+    _reflectStr(HTMLElement.prototype, 'title');
+    _reflectStr(HTMLElement.prototype, 'lang');
+    _reflectStr(HTMLElement.prototype, 'dir');
+    _reflectBool(HTMLElement.prototype, 'hidden');
+    Object.defineProperty(HTMLElement.prototype, 'translate', {
+        get() { return this.getAttribute('translate') !== 'no'; },
+        set(v) { this.setAttribute('translate', v ? 'yes' : 'no'); },
+        enumerable: true, configurable: true,
+    });
+    // `contentEditable` is the tri-state string; `isContentEditable` is the
+    // resolved boolean, inherited from the nearest editable ancestor.
+    Object.defineProperty(HTMLElement.prototype, 'contentEditable', {
+        get() {
+            const v = this.getAttribute('contenteditable');
+            if (v == null) return 'inherit';
+            return v === '' ? 'true' : String(v);
+        },
+        set(v) { this.setAttribute('contenteditable', String(v)); },
+        enumerable: true, configurable: true,
+    });
+    Object.defineProperty(HTMLElement.prototype, 'isContentEditable', {
+        get() {
+            let n = this;
+            while (n && n.getAttribute) {
+                const v = n.getAttribute('contenteditable');
+                if (v === 'true' || v === '') return true;
+                if (v === 'false') return false;
+                n = n.parentNode;
+            }
+            return false;
+        },
+        enumerable: true, configurable: true,
+    });
+
+    // Form controls beyond the handful already reflected above.
+    _reflectStr(HTMLInputElement.prototype, 'autocomplete');
+    _reflectStr(HTMLInputElement.prototype, 'pattern');
+    _reflectInt(HTMLInputElement.prototype, 'maxLength', 'maxlength', 524288);
+    _reflectInt(HTMLInputElement.prototype, 'minLength', 'minlength', -1);
+    // ── `value` / `checked`: internal state, not attribute reflection ───────
+    //
+    // These were plain `_reflectStr`/`_reflectBool`, i.e. `el.value = 'x'` wrote
+    // the `value` *content attribute*. That is not what a browser does, and the
+    // difference is observable three ways: typing into a field silently
+    // rewrote the markup, `defaultValue` moved with `value` instead of staying
+    // at the markup default, and `getAttribute('value')` changed on every
+    // keystroke — which no real browser ever shows. React tracks controlled
+    // inputs through exactly this pair, which is why its `_valueTracker` kept
+    // turning up in the strict-API log.
+    //
+    // Per HTML: `value` is backed by internal state plus a *dirty value flag*.
+    // Before the flag is set the state follows the content attribute; once
+    // anything assigns `value` (or the user types) the attribute stops
+    // affecting it. `defaultValue` reflects the attribute throughout. Same
+    // shape for `checked` / `defaultChecked` with a dirty *checkedness* flag.
+    const _valueState = new WeakMap();
+    const _vs = (el) => {
+        let st = _valueState.get(el);
+        if (!st) { st = { dirty: false, value: '', checkedDirty: false, checked: false }; _valueState.set(el, st); }
+        return st;
+    };
+    // Types whose `value` IDL attribute is in "default" or "default/on" mode:
+    // it is the content attribute, with no internal state at all.
+    const _DEFAULT_VALUE_TYPES = new Set(['button', 'reset', 'submit', 'image']);
+    const _ON_VALUE_TYPES = new Set(['checkbox', 'radio']);
+
+    Object.defineProperty(HTMLInputElement.prototype, 'value', {
+        get() {
+            const t = String(this.getAttribute('type') || 'text').toLowerCase();
+            const attr = this.getAttribute('value');
+            if (_DEFAULT_VALUE_TYPES.has(t)) return attr == null ? '' : attr;
+            if (_ON_VALUE_TYPES.has(t)) return attr == null ? 'on' : attr;
+            const st = _vs(this);
+            if (st.dirty) return st.value;
+            return attr == null ? '' : attr;
+        },
+        set(v) {
+            const t = String(this.getAttribute('type') || 'text').toLowerCase();
+            const str = v == null ? '' : String(v);
+            if (_DEFAULT_VALUE_TYPES.has(t) || _ON_VALUE_TYPES.has(t)) {
+                this.setAttribute('value', str);
+                return;
+            }
+            const st = _vs(this);
+            st.dirty = true;
+            st.value = str;
+        },
+        enumerable: true, configurable: true,
+    });
+    Object.defineProperty(HTMLInputElement.prototype, 'checked', {
+        get() {
+            const st = _vs(this);
+            return st.checkedDirty ? st.checked : this.hasAttribute('checked');
+        },
+        set(v) {
+            const st = _vs(this);
+            st.checkedDirty = true;
+            st.checked = !!v;
+        },
+        enumerable: true, configurable: true,
+    });
+    Object.defineProperty(HTMLInputElement.prototype, 'defaultChecked', {
+        get() { return this.hasAttribute('checked'); },
+        set(v) {
+            if (v) this.setAttribute('checked', '');
+            else this.removeAttribute('checked');
+        },
+        enumerable: true, configurable: true,
+    });
+    // <textarea> keeps the same rule with its child text as the default.
+    Object.defineProperty(HTMLTextAreaElement.prototype, 'value', {
+        get() {
+            const st = _vs(this);
+            return st.dirty ? st.value : String(this.textContent || '');
+        },
+        set(v) {
+            const st = _vs(this);
+            st.dirty = true;
+            st.value = v == null ? '' : String(v);
+        },
+        enumerable: true, configurable: true,
+    });
+    Object.defineProperty(HTMLTextAreaElement.prototype, 'defaultValue', {
+        get() { return String(this.textContent || ''); },
+        set(v) { this.textContent = String(v); },
+        enumerable: true, configurable: true,
+    });
+    /// Form reset clears both dirty flags, which is what puts a control back on
+    /// its markup default.
+    _clearDirtyValue = (el) => {
+        const st = _valueState.get(el);
+        if (st) { st.dirty = false; st.checkedDirty = false; }
+    };
+
+    Object.defineProperty(HTMLInputElement.prototype, 'defaultValue', {
+        get() { const v = this.getAttribute('value'); return v == null ? '' : v; },
+        set(v) { this.setAttribute('value', String(v)); },
+        enumerable: true, configurable: true,
+    });
+    for (const proto of [HTMLButtonElement, HTMLSelectElement, HTMLTextAreaElement]) {
+        if (!proto) continue;
+        _reflectStr(proto.prototype, 'name');
+        _reflectBool(proto.prototype, 'disabled');
+    }
+    _reflectBool(HTMLTextAreaElement.prototype, 'required');
+    _reflectBool(HTMLTextAreaElement.prototype, 'readOnly', 'readonly');
+    _reflectStr(HTMLTextAreaElement.prototype, 'placeholder');
+
+    // `labels` — the <label>s pointing at this control, live per spec.
+    const _labelsFor = function () {
+        const ids = [];
+        try {
+            const id = this.getAttribute('id');
+            if (id) {
+                const esc = String(id).replace(/(["\\])/g, '\\$1');
+                const found = ops.op_dom_query_selector_all(
+                    ops.op_dom_document_node(), `label[for="${esc}"]`,
+                );
+                for (let i = 0; i < found.length; i++) ids.push(found[i]);
+            }
+            // A control nested inside its own <label> is labelled by it.
+            let n = this.parentNode;
+            while (n && n.tagName) {
+                if (n.tagName.toLowerCase() === 'label') {
+                    const nid = _getNodeId(n);
+                    if (ids.indexOf(nid) < 0) ids.push(nid);
+                }
+                n = n.parentNode;
+            }
+        } catch (_) { /* ignore */ }
+        return new NodeList(ids);
+    };
+    for (const proto of [HTMLInputElement, HTMLSelectElement, HTMLTextAreaElement, HTMLButtonElement]) {
+        if (!proto) continue;
+        Object.defineProperty(proto.prototype, 'labels', {
+            get: _labelsFor, enumerable: true, configurable: true,
+        });
+    }
+
+    // Constraint validation. Input masking and multi-step sign-in forms — the
+    // Epic login among them — gate on `checkValidity()` before advancing.
+    class ValidityState {
+        constructor(el) { this._el = el; }
+        get valueMissing() {
+            return !!this._el.required && String(this._el.value || '') === '';
+        }
+        get tooLong() {
+            const m = this._el.maxLength;
+            return m >= 0 && String(this._el.value || '').length > m;
+        }
+        get tooShort() {
+            const m = this._el.minLength;
+            const v = String(this._el.value || '');
+            return m >= 0 && v.length > 0 && v.length < m;
+        }
+        get typeMismatch() {
+            const t = String(this._el.type || '').toLowerCase();
+            const v = String(this._el.value || '');
+            if (!v) return false;
+            if (t === 'email') return !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
+            if (t === 'url') { try { new URL(v); return false; } catch (_) { return true; } }
+            return false;
+        }
+        get patternMismatch() {
+            const p = this._el.pattern;
+            const v = String(this._el.value || '');
+            if (!p || !v) return false;
+            try { return !new RegExp(`^(?:${p})$`).test(v); } catch (_) { return false; }
+        }
+        get customError() { return !!this._el._customValidity; }
+        get badInput() { return false; }
+        get rangeOverflow() { return false; }
+        get rangeUnderflow() { return false; }
+        get stepMismatch() { return false; }
+        get valid() {
+            return !(this.valueMissing || this.tooLong || this.tooShort
+                || this.typeMismatch || this.patternMismatch || this.customError);
+        }
+    }
+    Object.defineProperty(ValidityState.prototype, Symbol.toStringTag, {
+        value: 'ValidityState', configurable: true,
+    });
+    globalThis.ValidityState = ValidityState;
+
+    for (const proto of [HTMLInputElement, HTMLSelectElement, HTMLTextAreaElement, HTMLButtonElement]) {
+        if (!proto) continue;
+        Object.defineProperty(proto.prototype, 'validity', {
+            get() { return new ValidityState(this); }, enumerable: true, configurable: true,
+        });
+        Object.defineProperty(proto.prototype, 'validationMessage', {
+            get() { return this._customValidity || ''; }, enumerable: true, configurable: true,
+        });
+        proto.prototype.setCustomValidity = function setCustomValidity(msg) {
+            this._customValidity = String(msg || '');
+        };
+        proto.prototype.checkValidity = function checkValidity() {
+            if (this.validity.valid) return true;
+            this.dispatchEvent(new Event('invalid', { cancelable: true }));
+            return false;
+        };
+        proto.prototype.reportValidity = function reportValidity() {
+            return this.checkValidity();
+        };
+    }
+
+    // Text-entry selection. Input masks read `selectionStart` after every
+    // keystroke and write it back with `setSelectionRange`.
+    for (const proto of [HTMLInputElement, HTMLTextAreaElement]) {
+        if (!proto) continue;
+        const len = function () { return String(this.value || '').length; };
+        Object.defineProperty(proto.prototype, 'selectionStart', {
+            get() { return this._selStart == null ? len.call(this) : this._selStart; },
+            set(v) { this._selStart = v | 0; },
+            enumerable: true, configurable: true,
+        });
+        Object.defineProperty(proto.prototype, 'selectionEnd', {
+            get() { return this._selEnd == null ? len.call(this) : this._selEnd; },
+            set(v) { this._selEnd = v | 0; },
+            enumerable: true, configurable: true,
+        });
+        Object.defineProperty(proto.prototype, 'selectionDirection', {
+            get() { return this._selDir || 'none'; },
+            set(v) { this._selDir = String(v); },
+            enumerable: true, configurable: true,
+        });
+        proto.prototype.setSelectionRange = function setSelectionRange(start, end, dir) {
+            this._selStart = start | 0;
+            this._selEnd = end | 0;
+            this._selDir = dir ? String(dir) : 'none';
+            this.dispatchEvent(new Event('select', { bubbles: true }));
+        };
+        proto.prototype.select = function select() {
+            this.setSelectionRange(0, String(this.value || '').length);
+        };
+    }
+
     // ── Inline `on*` content attributes ──────────────────────────────────
     // `<button onclick="startAnalysis()">` was completely inert: elements had
     // no event-handler IDL attributes at all, so `el.onclick` read `undefined`
@@ -2726,7 +3443,7 @@
         'oncontentvisibilityautostatechange', 'oncontextlost', 'oncontextmenu',
         'oncontextrestored', 'oncuechange', 'ondblclick', 'ondrag', 'ondragend',
         'ondragenter', 'ondragleave', 'ondragover', 'ondragstart', 'ondrop',
-        'ondurationchange', 'onemptied', 'onended', 'onerror', 'onfocus',
+        'ondurationchange', 'onemptied', 'onended', 'onerror', 'onfocus', 'onfocusin', 'onfocusout',
         'onformdata', 'ongotpointercapture', 'oninput', 'oninvalid', 'onkeydown',
         'onkeypress', 'onkeyup', 'onload', 'onloadeddata', 'onloadedmetadata',
         'onloadstart', 'onlostpointercapture', 'onmousedown', 'onmouseenter',
@@ -2807,6 +3524,41 @@
             });
         } catch (_) { /* ignore */ }
     }
+
+    // Document carries GlobalEventHandlers too, and Chrome exposes each as an
+    // accessor on `Document.prototype`. Ours had none, so
+    // `'onvisibilitychange' in document` was false and any feature detection
+    // over the set took the wrong branch. No content-attribute compilation
+    // here — a document has no `on*` attributes to compile.
+    for (const _name of _elementEventHandlerNames.concat([
+        'onvisibilitychange', 'onreadystatechange', 'onfullscreenchange',
+        'onfullscreenerror', 'onpointerlockchange', 'onpointerlockerror',
+        'onfreeze', 'onresume', 'onprerenderingchange',
+    ])) {
+        if (_windowOnly.has(_name)) continue;
+        try {
+            Object.defineProperty(Document.prototype, _name, {
+                get() {
+                    const h = _onExplicit.get(this);
+                    return h && _name in h ? h[_name] : null;
+                },
+                set(v) {
+                    let h = _onExplicit.get(this);
+                    if (!h) { h = Object.create(null); _onExplicit.set(this, h); }
+                    h[_name] = typeof v === "function" ? v : null;
+                },
+                enumerable: true,
+                configurable: true,
+            });
+        } catch (_) { /* ignore */ }
+    }
+    // Chrome 148 Document members this engine never defined.
+    Object.defineProperty(Document.prototype, 'prerendering', {
+        get() { return false; }, enumerable: true, configurable: true,
+    });
+    Object.defineProperty(Document.prototype, 'wasDiscarded', {
+        get() { return false; }, enumerable: true, configurable: true,
+    });
 
     globalThis.HTMLElement = HTMLElement;
     globalThis.HTMLDivElement = HTMLDivElement;
@@ -3003,8 +3755,8 @@
             if (typeof HTMLIFrameElement !== 'undefined' && child instanceof HTMLIFrameElement) {
                 const _fi = _appendedIframes.length;
                 _appendedIframes.push(child);
-                // Debug counter — readable via window.__ifAppendCount for diagnostics
-                try { globalThis.__ifAppendCount = (_appendedIframes.length); } catch (_) {}
+                // Debug counter, on the engine namespace — see _setIfAppendCount
+                try { _setIfAppendCount(_appendedIframes.length); } catch (_) {}
                 // Define lazy getter for window[N] — contentWindow is created on demand
                 Object.defineProperty(globalThis, String(_fi), {
                     get: function() { return _getIframeWindow(_appendedIframes[_fi]); },
@@ -3037,7 +3789,7 @@
                     && !_appendedIframes.includes(newChild)) {
                 const _fi = _appendedIframes.length;
                 _appendedIframes.push(newChild);
-                try { globalThis.__ifAppendCount = (_appendedIframes.length); } catch (_) {}
+                try { _setIfAppendCount(_appendedIframes.length); } catch (_) {}
                 Object.defineProperty(globalThis, String(_fi), {
                     get: function() { return _getIframeWindow(_appendedIframes[_fi]); },
                     configurable: true, enumerable: false,
@@ -3385,7 +4137,7 @@
         if (el && _fi >= _appendedIframes.length) {
             while (_appendedIframes.length < _fi) _appendedIframes.push(null);
             _appendedIframes.push(el);
-            try { globalThis.__ifAppendCount = _appendedIframes.length; } catch (_) {}
+            try { _setIfAppendCount(_appendedIframes.length); } catch (_) {}
         }
         // Install as window[N] — replace lazy getter (if any) with actual value
         try {
@@ -4491,7 +5243,7 @@
             _moObservers.length = 0;
             _appendedIframes.length = 0;
             _frameRegistry.length = 0;
-            try { globalThis.__ifAppendCount = 0; } catch (_) {}
+            try { _setIfAppendCount(0); } catch (_) {}
             // Re-seed the document wrapper: `_wrapNode` must keep returning
             // the singleton `_document` for the document node id, which
             // `replace_dom` preserves.

@@ -70,6 +70,83 @@ pub struct ChildIframe {
     /// the event loop. Comparing against this decides whether the realm is
     /// actually stale.
     pub source: String,
+    /// The frame's box in the top-level viewport, as last pushed into the realm.
+    /// Kept so an unchanged layout does not re-enter the child runtime.
+    frame_box: Option<(f64, f64, f64, f64)>,
+}
+
+impl ChildIframe {
+    /// Publish the frame's measured box into the child realm.
+    ///
+    /// `x`/`y` are the frame's offset inside the top-level viewport, so the
+    /// realm can turn its local coordinates into top-level ones; `w`/`h` become
+    /// the realm's `innerWidth`/`innerHeight`.
+    pub fn set_frame_geometry(&mut self, x: f64, y: f64, w: f64, h: f64) {
+        let next = (x, y, w, h);
+        if self.frame_box == Some(next) {
+            return;
+        }
+        self.frame_box = Some(next);
+        // The realm's *layout* viewport is the frame's box too, not just the
+        // number JS reports. Leaving layout on the profile's window size gave a
+        // 302x76 frame an initial containing block thousands of pixels wide, so
+        // anything positioned against it — a widget pinning its links to the
+        // bottom-right corner — was laid out against that phantom width and
+        // landed far outside the frame.
+        {
+            let op_state = self.event_loop.runtime_mut().op_state();
+            let mut state = op_state.borrow_mut();
+            if let Some(dom_state) = state.try_borrow_mut::<crate::js_runtime::state::DomState>() {
+                let dpr = dom_state.layout_engine.viewport().device_pixel_ratio;
+                dom_state
+                    .layout_engine
+                    .set_viewport(crate::layout::Viewport::with_dpr(w as f32, h as f32, dpr));
+            }
+        }
+        let js = FRAME_GEOMETRY_JS
+            .replace("__X__", &format!("{:.2}", x))
+            .replace("__Y__", &format!("{:.2}", y))
+            .replace("__W__", &format!("{:.2}", w))
+            .replace("__H__", &format!("{:.2}", h));
+        let _ = self.event_loop.execute_script(&js);
+    }
+}
+
+/// Tell a child realm where its frame sits and how big it is.
+///
+/// A realm cannot measure its own frame: `window.frameElement` crosses the
+/// realm boundary and `parent` is not reachable, so the numbers have to come
+/// from the embedder, which is the side that laid the frame out. Without them a
+/// frame reported the top-level viewport as its own and placed events in the
+/// wrong coordinate space.
+const FRAME_GEOMETRY_JS: &str = r#"(function(){
+  try {
+    var syms = Object.getOwnPropertySymbols(globalThis);
+    for (var i = 0; i < syms.length; i++) {
+      var v = globalThis[syms[i]];
+      if (v && v.__bo) { v.frame = { x: __X__, y: __Y__, w: __W__, h: __H__ }; return 'ок'; }
+    }
+  } catch (e) {}
+  return 'нет неймспейса';
+})()"#;
+
+/// Install the per-frame diagnostic tape, before the frame's own scripts.
+///
+/// A widget that rebuilds its browsing context — hCaptcha does this on every
+/// challenge reload — carries away any probe attached from outside, so hooks
+/// installed by hand never survive to the moment worth watching. Injecting from
+/// here means every realm, including each rebuilt one, starts with the tape
+/// already running.
+///
+/// Both constructors need it: a frame's document arrives either inline
+/// (`srcdoc`) or over the network (`src`), and the interesting ones are the
+/// second kind.
+fn install_frame_trace(event_loop: &mut BrowserEventLoop) {
+    if std::env::var_os("BROWSER_OXIDE_FRAME_TRACE").is_some() {
+        event_loop
+            .execute_script(include_str!("js/frame_trace.js"))
+            .ok();
+    }
 }
 
 impl ChildIframe {
@@ -98,6 +175,7 @@ impl ChildIframe {
         // its own initial execution, so a bridge installed afterwards is installed
         // into a document that has already given up. See `from_url`.
         event_loop.execute_script(INSTALL_PARENT_BRIDGE).ok();
+        install_frame_trace(&mut event_loop);
 
         // Execute scripts in the child's own V8 context. W2.7 — Chrome
         // reports `about:srcdoc` for srcdoc iframe stack frames.
@@ -120,6 +198,7 @@ impl ChildIframe {
             node_id,
             event_loop,
             source: html.to_string(),
+            frame_box: None,
         })
     }
 
@@ -241,6 +320,7 @@ impl ChildIframe {
         // The embedder answers that first message with the config the frame needs
         // to fetch its proof-of-work worker, so losing it stalls the whole widget.
         event_loop.execute_script(INSTALL_PARENT_BRIDGE).ok();
+        install_frame_trace(&mut event_loop);
 
         // Execute scripts, fetching external ones
         for (i, script) in scripts.iter().enumerate() {
@@ -291,6 +371,35 @@ impl ChildIframe {
             }
         }
 
+        // The child document's own lifecycle. Only the top-level page advanced
+        // `readyState` and fired `DOMContentLoaded`/`load`; a framed document sat
+        // at `loading` forever, so anything inside it written as
+        //
+        //     if (document.readyState === 'loading')
+        //         document.addEventListener('DOMContentLoaded', init)
+        //
+        // registered `init` and waited for an event that never came. Measured on
+        // Epic's login: hCaptcha's 605 KB frame bundle executed fine and then
+        // rendered nothing at all, leaving an empty widget container.
+        //
+        // Same spec order as the page path: `interactive` before
+        // DOMContentLoaded, `complete` before `load`, both from a task so the
+        // handlers run inside the event loop rather than during setup.
+        const NS: &str = "(function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()";
+        event_loop
+            .execute_script(&format!(
+                "setTimeout(function(){{\
+                   var b=(({NS}||{{}}).host||{{}}).bo;\
+                   if(b)b.__documentReadyState='interactive';\
+                   (function(){{var ns=null;try{{var y=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<y.length;i++){{var v=globalThis[y[i]];if(v&&v.__bo){{ns=v;break;}}}}}}catch(e){{}}try{{if(ns&&ns.images)ns.images.scan();}}catch(e){{}}}})();\
+                   document.dispatchEvent(new Event('DOMContentLoaded',{{bubbles:true}}));\
+                   globalThis.dispatchEvent(new Event('DOMContentLoaded',{{bubbles:true}}));\
+                   if(b)b.__documentReadyState='complete';\
+                   globalThis.dispatchEvent(new Event('load'));\
+                 }},0);"
+            ))
+            .ok();
+
         // Run child event loop (shorter timeout for iframes)
         event_loop.run_until_idle(Duration::from_secs(10)).await?;
 
@@ -298,6 +407,7 @@ impl ChildIframe {
             node_id,
             event_loop,
             source: url.to_string(),
+            frame_box: None,
         })
     }
 

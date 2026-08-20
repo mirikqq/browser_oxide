@@ -45,6 +45,12 @@
             const path = [];
             let node = this.target;
             while (node) { path.push(node); node = node.parentNode; }
+            // The window closes the path, as it does in a browser.
+            if (path.length && path[path.length - 1] === globalThis.document) {
+                path.push(globalThis);
+            } else if (this.target === globalThis.document) {
+                path.push(globalThis);
+            }
             return path;
         }
         // Phase constants
@@ -88,6 +94,19 @@
         }
     }
 
+    // Offset of an event's point inside its target's box.
+    const _mouseOffset = (ev, horizontal) => {
+        try {
+            const t = ev.target;
+            if (!t || typeof t.getBoundingClientRect !== "function") return 0;
+            const r = t.getBoundingClientRect();
+            const v = horizontal ? ev.clientX - r.left : ev.clientY - r.top;
+            return Number.isFinite(v) ? v : 0;
+        } catch (_e) {
+            return 0;
+        }
+    };
+
     class MouseEvent extends UIEvent {
         constructor(type, options = {}) {
             super(type, { bubbles: true, cancelable: true, ...options });
@@ -97,8 +116,6 @@
             this.clientY = options.clientY || 0;
             this.pageX = options.pageX || this.clientX;
             this.pageY = options.pageY || this.clientY;
-            this.offsetX = options.offsetX || 0;
-            this.offsetY = options.offsetY || 0;
             this.button = options.button || 0;
             this.buttons = options.buttons || 0;
             this.ctrlKey = !!options.ctrlKey;
@@ -109,6 +126,23 @@
             this.movementX = options.movementX || 0;
             this.movementY = options.movementY || 0;
         }
+        // `offsetX`/`offsetY` are not init members — Chrome computes them from
+        // the event's target when they are read, and they are accessors on the
+        // prototype, not own properties.
+        //
+        // They used to be own properties pinned at 0, and canvas hit-testing is
+        // built on them: `const x = e.offsetX, y = e.offsetY` is how a widget
+        // turns a click into a point on its bitmap. Every click therefore landed
+        // on the canvas origin, outside anything drawn — the handler ran, the
+        // event was trusted, and nothing was ever selected or picked up.
+        get offsetX() { return _mouseOffset(this, true); }
+        get offsetY() { return _mouseOffset(this, false); }
+        // Relative to the nearest positioned ancestor in Chrome; page
+        // coordinates match that whenever nothing in the chain is positioned,
+        // and they are what code falling back from `offsetX` expects to find.
+        get layerX() { return this.pageX; }
+        get layerY() { return this.pageY; }
+        get which() { return this.button + 1; }
         getModifierState(key) { return false; }
     }
 
@@ -160,7 +194,17 @@
             this.twist = options.twist || 0;
             this.pointerType = options.pointerType || "mouse";
             this.isPrimary = options.isPrimary !== undefined ? options.isPrimary : true;
+            this.altitudeAngle = options.altitudeAngle !== undefined
+                ? options.altitudeAngle : Math.PI / 2;
+            this.azimuthAngle = options.azimuthAngle || 0;
+            this.persistentDeviceId = options.persistentDeviceId || 0;
         }
+        // Dispatched events carry no coalesced or predicted samples, which is
+        // also what Chrome reports for one it did not coalesce. Missing entirely,
+        // they threw out of any move handler that asked — and a drag handler is
+        // the usual caller.
+        getCoalescedEvents() { return [this]; }
+        getPredictedEvents() { return []; }
     }
 
     class WheelEvent extends MouseEvent {
@@ -390,6 +434,20 @@
                 path.push(current);
                 current = current.parentNode;
             }
+        }
+        // The window is the last stop on the path, and it was missing.
+        //
+        // Propagation ended at `document`, so a listener bound to `window` —
+        // which is where page-wide handlers live, and where behavioural
+        // telemetry records pointer motion — never saw a single event. A widget
+        // scoring the gesture read an empty motion trace, a drag implementation
+        // listening on the window got no moves at all, and an answer derived
+        // from "the last position the pointer was seen at" came out as the
+        // origin because the pointer had never been seen.
+        if (path.length && path[path.length - 1] === globalThis.document) {
+            path.push(globalThis);
+        } else if (this === globalThis.document) {
+            path.push(this, globalThis);
         }
 
         // Capture phase (root → target)

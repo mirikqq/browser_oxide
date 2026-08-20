@@ -133,6 +133,17 @@
 
 <script>
   let picked = null, lastHtml = '';
+  // A gesture in flight. The mirror is rebuilt by reassigning `srcdoc`, which
+  // throws the whole document away — so a snapshot arriving mid-drag would
+  // destroy the very element being dragged. Redraws are held until the pointer
+  // comes back up, and the last snapshot is applied then.
+  let dragging = false, pendingSnap = null, lastMoveSent = 0;
+  // Typing has the same problem as dragging, for a different reason: rebuilding
+  // `srcdoc` drops the browser's focus out of the mirror, so the next keystroke
+  // goes nowhere. Redraws are held for a moment after each key and applied once
+  // the burst stops.
+  let lastKeyAt = 0;
+  const KEY_QUIET_MS = 700;
   let lastFrameDocs = [];
   let framesDirty = false;
   let trail = [], t0 = Date.now();
@@ -302,19 +313,25 @@
     });
   }
 
+  // Request and response side by side. A refusal is rarely explained by the
+  // answer alone — the question is what went out: which headers carried the
+  // session, what the payload actually said.
   function detail(r) {
-    const hdrs = (r.headers || []).map(([k, v]) => `${k}: ${v}`).join('\n') || '—';
-    const body = r.body ? esc(r.body) :
-      '<span class="dim">тело не текстовое либо пустое</span>';
+    const fmt = list => (list || []).map(([k, v]) => `${k}: ${v}`).join('\n') || '—';
+    const bodyOr = (b, empty) => b ? esc(b) : `<span class="dim">${empty}</span>`;
     return `<div class="ndet">
       <h4>Запрос</h4>
       <pre class="kv">${r.method} ${esc(r.url)}</pre>
+      <h4>Заголовки запроса</h4>
+      <pre>${esc(fmt(r.reqHeaders))}</pre>
+      <h4>Тело запроса</h4>
+      <pre>${bodyOr(r.reqBody, 'без тела')}</pre>
       <h4>Ответ</h4>
       <pre class="kv">${r.status} · ${esc(r.mime || 'без Content-Type')} · ${kb(r.size)}</pre>
       <h4>Заголовки ответа</h4>
-      <pre>${esc(hdrs)}</pre>
+      <pre>${esc(fmt(r.headers))}</pre>
       <h4>Тело ответа</h4>
-      <pre>${body}</pre>
+      <pre>${bodyOr(r.body, 'тело не текстовое либо пустое')}</pre>
     </div>`;
   }
 
@@ -343,6 +360,46 @@
 
   // Turns one serialised <iframe …data-bo-frame="N"…> into a box carrying the
   // child realm's own document.
+  // A <canvas> in the mirror is always blank: its bitmap lives in the engine,
+  // not in the markup. The snapshot stamps `data-bo-shot` with the engine's own
+  // `toDataURL()`, so here it becomes an <img> showing what was actually drawn.
+  // Backgrounds the engine inlined for us: the element carries the picture as
+  // a data URL because its own `blob:` reference means nothing in this browser.
+  function applyBlobBackgrounds(root) {
+    root.querySelectorAll('[data-bo-bg]').forEach(el => {
+      const d = el.getAttribute('data-bo-bg');
+      if (d) el.style.backgroundImage = 'url("' + d + '")';
+    });
+  }
+
+  function canvasShot(tag) {
+    const shot = /data-bo-shot="([^"]*)"/.exec(tag);
+    const w = (/\bwidth="(\d+)"/.exec(tag) || [])[1];
+    const h = (/\bheight="(\d+)"/.exec(tag) || [])[1];
+    const style = (/\bstyle="([^"]*)"/.exec(tag) || [])[1] || '';
+    const size = (w ? ' width="' + w + '"' : '') + (h ? ' height="' + h + '"' : '');
+    // Carried through so a gesture can be aimed back at the real canvas: its
+    // index in the document, and its intrinsic size for scaling the offsets.
+    const cidx = (/data-bo-cidx="(\d+)"/.exec(tag) || [])[1] || '0';
+    const cw = (/data-bo-cw="(\d+)"/.exec(tag) || [])[1] || w || '0';
+    const ch = (/data-bo-ch="(\d+)"/.exec(tag) || [])[1] || h || '0';
+    const meta = ' data-bo-cidx="' + cidx + '" data-bo-cw="' + cw + '" data-bo-ch="' + ch + '"';
+    if (!shot || !shot[1]) {
+      // No snapshot (too small, or nothing drawn) — keep the space it occupies,
+      // and stay targetable: a canvas can be interactive before it has pixels.
+      return '<div data-bo-canvas="пусто"' + meta + ' style="' + style +
+             ';display:block;width:100%;height:100%;background:#141821;' +
+             'outline:1px dashed #2a3242"></div>';
+    }
+    // Laid out by the author's own CSS, not by the bitmap's pixel size. A
+    // canvas is usually sized in CSS and drawn at devicePixelRatio, so pinning
+    // the <img> to the bitmap's width made it render at twice its intended box
+    // — and every gesture aimed at it then landed on the wrong coordinates.
+    return '<img data-bo-canvas="1"' + meta + ' src="' + shot[1] + '"' +
+           ' style="' + style + ';display:block;width:100%;height:100%;' +
+           'object-fit:fill">';
+  }
+
   function frameBox(tag) {
     const m = /data-bo-frame="(\d+)"/.exec(tag);
     const i = m ? Number(m[1]) : -1;
@@ -373,7 +430,9 @@
       .replace(/<script[\s\S]*?<\/script>/gi, '')
       .replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi, '')
       .replace(/<iframe\b[^>]*>/gi, '')
-      .replace(/<noscript[\s\S]*?<\/noscript>/gi, '');
+      .replace(/<noscript[\s\S]*?<\/noscript>/gi, '')
+      .replace(/<canvas\b[^>]*>[\s\S]*?<\/canvas>/gi, canvasShot)
+      .replace(/<canvas\b[^>]*>/gi, canvasShot);
     const size = (w && h) ? (w + '×' + h) : 'без размера';
     // No visible label: the index is only needed by the click router (it rides in
     // the attribute) and the role/size are already shown in the selector line when
@@ -386,12 +445,61 @@
 
   let lastFrames = [];
 
+  // A burst of typing holds redraws back; this lets the last one through once
+  // the keyboard goes quiet.
+  setInterval(() => {
+    if (dragging || !pendingSnap) return;
+    if (Date.now() - lastKeyAt < KEY_QUIET_MS) return;
+    const p = pendingSnap; pendingSnap = null; paint(p);
+  }, 250);
+
+  // Live canvas refresh during a gesture.
+  //
+  // Rebuilding the mirror mid-drag would replace the very node the pointer is
+  // holding, so redraws are held back until release. Holding the canvas bitmaps
+  // back with them made a drag look dead: the engine moved the piece on every
+  // pointermove and the viewer watched a frozen picture. Only the <img> src is
+  // swapped here — no node is replaced and no layout is rebuilt, so the gesture
+  // survives while the drawing keeps up.
+  function refreshCanvasShots(s) {
+    const f = $('mirror');
+    const d = f && f.contentDocument;
+    if (!d) return;
+    const apply = (html, root, scoped) => {
+      if (!html || !root) return;
+      const re = /<canvas\b[^>]*>/gi;
+      let m;
+      while ((m = re.exec(html))) {
+        const shot = /data-bo-shot="([^"]*)"/.exec(m[0]);
+        if (!shot || !shot[1]) continue;
+        const cidx = (/data-bo-cidx="(\d+)"/.exec(m[0]) || [])[1] || '0';
+        const sel = 'img[data-bo-canvas="1"][data-bo-cidx="' + cidx + '"]';
+        let img;
+        if (scoped) {
+          img = root.querySelector(sel);
+        } else {
+          img = Array.prototype.find.call(
+            root.querySelectorAll(sel), n => !n.closest('.bo-frame'));
+        }
+        if (img && img.getAttribute('src') !== shot[1]) img.setAttribute('src', shot[1]);
+      }
+    };
+    apply(s.html, d, false);
+    for (let i = 0; i < lastFrameDocs.length; i++) {
+      apply(lastFrameDocs[i], d.querySelector('.bo-frame[data-bo-idx="' + i + '"]'), true);
+    }
+  }
+
   function paint(s) {
     lastFrames = s.frames || [];
     $('counts').textContent = s.counts
       ? `${s.counts.elements} эл · ${s.counts.inputs} input · ${s.counts.buttons} button` : '';
 
+    // A held-back redraw still shows the drawing: only the bitmaps move.
+    if (dragging || Date.now() - lastKeyAt < KEY_QUIET_MS) refreshCanvasShots(s);
+
     if (s.html && (s.html !== lastHtml || framesDirty)) {
+      if (dragging || Date.now() - lastKeyAt < KEY_QUIET_MS) { pendingSnap = s; return; }
       framesDirty = false;
       // Author CSS now reaches the mirror, so no cosmetic overrides are needed.
       // These two compensate for state the engine leaves unfinished: MUI writes
@@ -399,7 +507,12 @@
       // the app pins body{overflow:hidden} for a scroll container it never wires up.
       const unfinished = `<style>
         html,body{overflow:auto!important;}
-        [style*="opacity: 0;"],[style$="opacity: 0"]{opacity:1!important;}
+        /* Only in the top document. Inside a frame box this was a lie: hCaptcha
+           hides its own error banner with `opacity: 0`, and forcing it visible
+           made "Please try again" show permanently — plus every element the
+           widget keeps hidden appeared, which is why its logo and the
+           Privacy/Terms links looked misplaced. */
+        [style*="opacity: 0;"]:not(.bo-frame *),[style$="opacity: 0"]:not(.bo-frame *){opacity:1!important;}
       </style>`;
       const html = s.html
         // The mirror deliberately runs without allow-scripts — re-running the SPA
@@ -413,6 +526,8 @@
         //  · preload hints for assets nothing will consume warn on every load
         //  · crossorigin on fonts fails CORS from 127.0.0.1
         .replace(/<noscript[\s\S]*?<\/noscript>/gi, '')
+        .replace(/<canvas\b[^>]*>[\s\S]*?<\/canvas>/gi, canvasShot)
+        .replace(/<canvas\b[^>]*>/gi, canvasShot)
         // Frames are substituted, not dropped. A real <iframe> here cannot help:
         // the mirror runs without allow-scripts, so it would render blank, and
         // allowing scripts would re-run the third party inside the viewer's own
@@ -438,24 +553,148 @@
       f.srcdoc = html;
       f.onload = () => {
         const d = f.contentDocument; if (!d) return;
+        // A fresh document means fresh focus. Put it back where the user was
+        // typing, otherwise the keystroke after a redraw is swallowed.
+        if (Date.now() - lastKeyAt < 3000) {
+          try { f.contentWindow.focus(); d.body && d.body.focus && d.body.focus(); } catch (_) {}
+        }
         d.addEventListener('click', ev => {
           ev.preventDefault();
           // A click landing inside a frame box belongs to that frame's realm —
           // the mirror is a copy, so the click has to be replayed in the engine,
           // and replaying it against the top document would miss entirely.
+          // Selection only. The interaction itself already travelled through
+          // the pointer path below (down → move → up), which ends in a real
+          // click in the engine; sending `frameclick` here too would deliver
+          // the click twice.
           const box = ev.target.closest && ev.target.closest('.bo-frame');
           if (box) {
             const idx = box.getAttribute('data-bo-idx');
             const body = box.querySelector('.bo-frame-body');
-            const sel = selectorWithin(body, ev.target);
-            $('sel').textContent = 'frame ' + idx + ' → ' + sel;
+            $('sel').textContent = 'frame ' + idx + ' → ' + selectorWithin(body, ev.target);
             picked = null;
-            send({ action: 'frameclick', index: String(idx), sel: sel, text: '' });
             return;
           }
           pick(selectorFor(ev.target));
         }, true);
         d.addEventListener('submit', ev => ev.preventDefault(), true);
+        applyBlobBackgrounds(d);
+
+        // ---- raw pointer forwarding -------------------------------------
+        // The viewer's own gesture goes to the engine step by step. A drag
+        // cannot be replayed as a click, and the captcha asks for exactly that.
+        const targetOf = (ev) => {
+          const el = ev.target;
+          if (!el || !el.getBoundingClientRect) return null;
+          const box = el.closest && el.closest('.bo-frame');
+          const r = el.getBoundingClientRect();
+          // Offsets are element-relative on purpose: the mirror lays the page
+          // out at its own width, so its absolute pixels are not the engine's.
+          let ox = Math.round(ev.clientX - r.left);
+          let oy = Math.round(ev.clientY - r.top);
+          const frame = box ? box.getAttribute('data-bo-idx') : null;
+
+          // A canvas is one element whose *inside* is the interface — a drag or
+          // a click there is a coordinate, not a node. The mirror shows a scaled
+          // snapshot of it, so the offsets have to be rescaled to the canvas'
+          // own pixels and the target named by index, since the <img> standing
+          // in for it does not exist in the engine's document. Challenges that
+          // are ordinary divs with images keep going through selectors.
+          const shot = el.closest && el.closest('[data-bo-canvas]');
+          if (shot) {
+            const sr = shot.getBoundingClientRect();
+            const cw = Number(shot.getAttribute('data-bo-cw')) || sr.width || 1;
+            const ch = Number(shot.getAttribute('data-bo-ch')) || sr.height || 1;
+            const sx = sr.width ? cw / sr.width : 1;
+            const sy = sr.height ? ch / sr.height : 1;
+            const t = {
+              cidx: shot.getAttribute('data-bo-cidx') || '0',
+              sel: 'canvas',
+              ox: Math.round((ev.clientX - sr.left) * sx),
+              oy: Math.round((ev.clientY - sr.top) * sy),
+              rx: Math.max(0, Math.min(1, (ev.clientX - sr.left) / Math.max(1, sr.width))),
+              ry: Math.max(0, Math.min(1, (ev.clientY - sr.top) / Math.max(1, sr.height))),
+            };
+            if (frame !== null) t.index = frame;
+            return t;
+          }
+          if (box) {
+            const body = box.querySelector('.bo-frame-body');
+            if (!body || !body.contains(el)) return null;
+            return { index: frame, sel: selectorWithin(body, el), ox, oy,
+              rx: Math.max(0, Math.min(1, ox / Math.max(1, r.width))),
+              ry: Math.max(0, Math.min(1, oy / Math.max(1, r.height))) };
+          }
+          return { index: null, sel: selectorFor(el), ox, oy,
+            rx: Math.max(0, Math.min(1, ox / Math.max(1, r.width))),
+            ry: Math.max(0, Math.min(1, oy / Math.max(1, r.height))) };
+        };
+        let lastPointer = null;
+        const sendPointer = (phase, ev) => {
+          const t = targetOf(ev);
+          if (!t) return;
+          const msg = { action: 'pointer', phase, sel: t.sel, ox: t.ox, oy: t.oy };
+          msg.rx = t.rx; msg.ry = t.ry;
+          if (t.index !== null && t.index !== undefined) msg.index = String(t.index);
+          if (t.cidx !== undefined) msg.cidx = String(t.cidx);
+          lastPointer = msg;
+          send(msg);
+        };
+        d.addEventListener('pointerdown', ev => {
+          ev.preventDefault();
+          dragging = true;
+          sendPointer('down', ev);
+        }, true);
+        d.addEventListener('pointermove', ev => {
+          // A real mouse reports at 60-125 Hz and a widget scoring behaviour
+          // reads the cadence, so the stream is thinned only enough to stay
+          // ahead of the socket — 40 ms produced a visibly robotic 25 Hz.
+          const now = Date.now();
+          if (now - lastMoveSent < 8) return;
+          lastMoveSent = now;
+          sendPointer('move', ev);
+        }, true);
+        const endGesture = ev => {
+          if (!dragging) return;
+          dragging = false;
+          sendPointer('up', ev);
+          // Whatever the page did while the pointer was down is drawn now.
+          if (pendingSnap) { const p = pendingSnap; pendingSnap = null; paint(p); }
+        };
+        d.addEventListener('pointerup', endGesture, true);
+
+        // ---- raw keyboard forwarding ------------------------------------
+        // Sent per keystroke, not as a finished string: a field that validates
+        // or masks per character behaves differently when handed a whole value.
+        const sendKey = (phase, ev) => {
+          // The mirror must not edit itself — it is a copy, and its text would
+          // then disagree with the engine's.
+          ev.preventDefault();
+          lastKeyAt = Date.now();
+          const box = ev.target && ev.target.closest && ev.target.closest('.bo-frame');
+          const msg = {
+            action: 'key', phase, key: ev.key, code: ev.code,
+            ctrl: ev.ctrlKey, alt: ev.altKey, shift: ev.shiftKey, meta: ev.metaKey,
+            sel: '',
+          };
+          if (box) msg.index = String(box.getAttribute('data-bo-idx'));
+          send(msg);
+        };
+        d.addEventListener('keydown', ev => sendKey('down', ev), true);
+        d.addEventListener('keyup', ev => sendKey('up', ev), true);
+        d.addEventListener('pointercancel', endGesture, true);
+        // A release outside the mirror still ends the gesture, otherwise the
+        // redraw stays frozen for good.
+        window.addEventListener('pointerup', () => {
+          if (!dragging) return;
+          dragging = false;
+          // The release can happen outside the mirror document. The engine
+          // still needs an up event or the widget remains in a pressed state;
+          // replay the last in-bounds point rather than inventing an out-of-
+          // viewport coordinate.
+          if (lastPointer) send({ ...lastPointer, phase: 'up' });
+          if (pendingSnap) { const p = pendingSnap; pendingSnap = null; paint(p); }
+        });
       };
     }
 

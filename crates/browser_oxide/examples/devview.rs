@@ -107,10 +107,49 @@ const SNAPSHOT_JS: &str = r#"
         box: [Math.round(r.width), Math.round(r.height)]
       };
     });
+  // Same canvas inlining as the frame path — see SERIALIZE_WITH_CANVAS.
+  function __boSerialize() {
+    var cs = document.querySelectorAll('canvas');
+    var touched = [], budget = 4;
+    for (var i = 0; i < cs.length && budget > 0; i++) {
+      var c = cs[i];
+      if ((c.width | 0) < 24 || (c.height | 0) < 24) continue;
+      var url = '';
+      try {
+        // Bounded thumbnail, not the full surface: a full-resolution PNG of a
+        // large canvas is hundreds of KB on every tick.
+        var MAX = 320, cw = c.width | 0, chh = c.height | 0;
+        var sc = Math.min(1, MAX / Math.max(cw, chh));
+        var tw = Math.max(1, Math.round(cw * sc)), th = Math.max(1, Math.round(chh * sc));
+        var t = document.createElement('canvas');
+        t.width = tw; t.height = th;
+        var xx = t.getContext('2d');
+        xx.drawImage(c, 0, 0, cw, chh, 0, 0, tw, th);
+        url = t.toDataURL();
+      } catch (e) { continue; }
+      if (!url || url.length < 32) continue;
+      c.setAttribute('data-bo-shot', url);
+      c.setAttribute('data-bo-cidx', String(i));
+      c.setAttribute('data-bo-cw', String(c.width | 0));
+      c.setAttribute('data-bo-ch', String(c.height | 0));
+      touched.push(c);
+      budget--;
+    }
+    var html = document.documentElement.outerHTML;
+    for (var j = 0; j < touched.length; j++) {
+      try {
+      touched[j].removeAttribute('data-bo-shot');
+      touched[j].removeAttribute('data-bo-cidx');
+      touched[j].removeAttribute('data-bo-cw');
+      touched[j].removeAttribute('data-bo-ch');
+    } catch (e) {}
+    }
+    return html;
+  }
   return JSON.stringify({
     url: location.href,
     title: document.title,
-    html: document.documentElement.outerHTML,
+    html: __boSerialize(),
     actionables: acts,
     frames: frames,
     cursor: cursor,
@@ -125,8 +164,30 @@ const SNAPSHOT_JS: &str = r#"
 })()
 "#;
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
+/// The engine runs on a thread with a 64 MB stack, not the process main thread.
+///
+/// macOS gives `main` 8 MB and it cannot be grown after link time. Building a
+/// second V8 isolate (which is what every `<iframe src=…>` needs) does not fit
+/// in what is left of that, and V8 fails the child isolate's own bootstrap with
+/// `Maximum call stack size exceeded` before any page script runs — so a page
+/// with a cross-origin frame died on load. `parallel.rs` and the worker pool
+/// already size their threads this way for the same reason.
+fn main() {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime")
+                .block_on(run());
+        })
+        .expect("failed to spawn engine thread")
+        .join()
+        .expect("engine thread panicked");
+}
+
+async fn run() {
     let mut args = std::env::args().skip(1);
     let url = args.next().expect("usage: devview <url> [port]");
     let port: u16 = args.next().and_then(|p| p.parse().ok()).unwrap_or(7333);
@@ -171,22 +232,75 @@ async fn main() {
         }
     };
 
-    let profile = browser_oxide::stealth::presets::chrome_148_macos();
+    // A fresh fingerprint per launch. A fixed preset means every session out of
+    // one address range carries the same canvas hash, screen and audio surface —
+    // which clusters on its own, regardless of how correct each value is.
+    // `BROWSER_OXIDE_PROFILE_SEED` pins it when a run has to be reproducible.
+    let profile = match std::env::var("BROWSER_OXIDE_PROFILE_SEED")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(seed) => {
+            let mut rng = browser_oxide::stealth::presets::seeded_rng(seed);
+            browser_oxide::stealth::presets::random_desktop_with_rng(&mut rng)
+        }
+        None => browser_oxide::stealth::presets::random_desktop(),
+    };
+    // The locale is not left to the dice: it is pulled to wherever the traffic
+    // actually leaves. An exit IP in Stockholm presenting `Europe/Paris` and
+    // `fr-FR` is a mismatch a risk engine checks on nearly every request —
+    // geolocating the peer is the cheapest signal it has. Opt out with
+    // `BROWSER_OXIDE_NO_GEO=1` when testing on a fixed profile.
+    let mut profile = profile;
+    if std::env::var_os("BROWSER_OXIDE_NO_GEO").is_none() {
+        match browser_oxide::stealth::egress::detect_country(&profile).await {
+            Some(cc) => {
+                if browser_oxide::stealth::egress::apply_country(&mut profile, &cc) {
+                    eprintln!("[гео] выход из {cc} — локаль подогнана");
+                } else {
+                    eprintln!("[гео] выход из {cc} — нет записи, локаль оставлена случайной");
+                }
+            }
+            None => eprintln!("[гео] определить страну выхода не удалось, локаль случайная"),
+        }
+    }
+    let profile = profile;
+    eprintln!(
+        "[профиль] {} {} · {}x{} dpr={} · {} ядер · {} ГБ · {} {} · {}",
+        profile.os_name,
+        profile.browser_version,
+        profile.screen_width,
+        profile.screen_height,
+        profile.device_pixel_ratio,
+        profile.cpu_cores,
+        profile.device_memory,
+        profile.timezone,
+        profile.language,
+        profile.webgl_renderer.chars().take(48).collect::<String>(),
+    );
     let started = std::time::Instant::now();
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async move {
             emit("status", "\"text\":\"навигация…\"".into());
-            // Pooled navigation: measured on this URL the pool renders the same page
-            // in ~4 s where the cold path spends ~25 s waiting on deadline floors.
-            let pool = browser_oxide::PagePool::new(1);
-            if let Ok(seed) = pool.acquire(Some(profile.clone())).await {
-                pool.release(seed);
-            }
             // `INIT=<js>` runs before the page's own scripts — the only place from
             // which anything can be observed before the page touches it.
-            let init: Vec<String> = std::env::var("INIT").ok().into_iter().collect();
-            let mut page = match pool.navigate_with_init(&url, profile, &init).await {
+            // `navigate_with_init` deliberately takes exactly the scripts supplied by
+            // its caller. Keep the same human-input runtime as `Page::navigate`, then
+            // append the optional diagnostic script before the document's scripts run.
+            let mut init = vec![include_str!("../src/js/humanize.js").to_string()];
+            if let Ok(script) = std::env::var("INIT") {
+                init.push(script);
+            }
+            // Challenge widgets are a lifecycle-sensitive path: a pooled navigation
+            // can retain a prior document's state and intentionally skips the cold
+            // challenge-follow loop. Devview is used to diagnose those widgets, so
+            // it must reproduce a fresh browser navigation rather than optimize it.
+            let mut page = match browser_oxide::Page::navigate_with_init(
+                &url, profile, 4, init,
+            )
+            .await
+            {
                 Ok(p) => p,
                 Err(e) => {
                     emit("status", format!("\"text\":\"ошибка навигации: {e}\""));
@@ -289,12 +403,163 @@ async fn main() {
                     // A click the viewer aimed at a frame has to be replayed in
                     // that frame's own realm. Its DOM is a separate document, so a
                     // selector resolved against the top one would find nothing.
-                    if raw.contains("\"frameclick\"") {
-                        let idx: usize = field(&raw, "index").parse().unwrap_or(0);
+                    // Full-resolution snapshot of a canvas, written to a file.
+                    //
+                    // The mirror scales its canvas thumbnails and re-lays them out
+                    // with the viewer's CSS, so it cannot answer "what did the
+                    // engine actually draw, at what size". This can: it is the
+                    // engine's own bitmap, untouched.
+                    if raw.contains("\"shot\"") {
+                        let idx_raw = field(&raw, "index");
+                        let cidx = field(&raw, "cidx");
+                        let cidx = if cidx.is_empty() { "0".to_string() } else { cidx };
+                        let js = format!(
+                            "(function(){{var c=document.querySelectorAll('canvas')[{cidx}];\
+                             if(!c)return '';\
+                             try{{return c.width+'x'+c.height+'|'+c.toDataURL();}}catch(e){{return '';}}}})()"
+                        );
+                        let out = if idx_raw.is_empty() {
+                            page.evaluate(&js).unwrap_or_default()
+                        } else {
+                            let idx = realm_for_dom_slot(
+                                &mut page,
+                                idx_raw.parse().unwrap_or(0),
+                            );
+                            match page.child_iframe(idx) {
+                                Some(c) => c.evaluate(&js).unwrap_or_default(),
+                                None => String::new(),
+                            }
+                        };
+                        let state = match out.split_once('|') {
+                            Some((dims, url)) if url.starts_with("data:image/png;base64,") => {
+                                let b64 = &url["data:image/png;base64,".len()..];
+                                match base64_decode(b64) {
+                                    Some(bytes) => {
+                                        let path = format!(
+                                            "/tmp/bo_canvas_{}.png",
+                                            std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .map(|d| d.as_secs())
+                                                .unwrap_or(0)
+                                        );
+                                        match std::fs::write(&path, &bytes) {
+                                            Ok(_) => format!(
+                                                "{dims}, {} байт → {path}",
+                                                bytes.len()
+                                            ),
+                                            Err(e) => format!("не записалось: {e}"),
+                                        }
+                                    }
+                                    None => "не разобрался base64".to_string(),
+                                }
+                            }
+                            _ => "канваса нет или toDataURL пуст".to_string(),
+                        };
+                        emit(
+                            "action",
+                            format!("\"raw\":{},\"state\":{}", json_str(&raw), json_str(&state)),
+                        );
+                        continue;
+                    }
+                    // Raw keystroke forwarding, same discipline as `pointer`.
+                    if raw.contains("\"key\"") {
+                        let phase = field(&raw, "phase");
+                        let key = field(&raw, "key").replace('`', "\\`");
+                        let code = field(&raw, "code").replace('`', "\\`");
                         let sel = field(&raw, "sel").replace('`', "\\`");
+                        let flag = |name: &str| {
+                            if field(&raw, name) == "true" {
+                                "true"
+                            } else {
+                                "false"
+                            }
+                        };
+                        let js = KEY_JS
+                            .replace("__SEL__", &sel)
+                            .replace("__KEY__", &key)
+                            .replace("__CODE__", &code)
+                            .replace("__PHASE__", &phase)
+                            .replace("__CTRL__", flag("ctrl"))
+                            .replace("__ALT__", flag("alt"))
+                            .replace("__SHIFT__", flag("shift"))
+                            .replace("__META__", flag("meta"));
+                        let idx_raw = field(&raw, "index");
+                        let out = if idx_raw.is_empty() {
+                            page.evaluate(&js).unwrap_or_else(|e| format!("ошибка: {e}"))
+                        } else {
+                            let idx = realm_for_dom_slot(
+                                &mut page,
+                                idx_raw.parse().unwrap_or(0),
+                            );
+                            match page.child_iframe(idx) {
+                                Some(c) => {
+                                    c.evaluate(&js).unwrap_or_else(|e| format!("ошибка: {e}"))
+                                }
+                                None => format!("нет фрейма {idx}"),
+                            }
+                        };
+                        emit(
+                            "action",
+                            format!("\"raw\":{},\"state\":{}", json_str(&raw), json_str(&out)),
+                        );
+                        continue;
+                    }
+                    // Raw pointer forwarding: the viewer's own gesture, step by step.
+                    if raw.contains("\"pointer\"") {
+                        let phase = field(&raw, "phase");
+                        let sel = field(&raw, "sel").replace('`', "\\`");
+                        let ox = field(&raw, "ox");
+                        let oy = field(&raw, "oy");
+                        let rx = field(&raw, "rx");
+                        let ry = field(&raw, "ry");
+                        let idx_raw = field(&raw, "index");
+                        let js = POINTER_JS
+                            .replace("__CIDX__", &field(&raw, "cidx"))
+                            .replace("__SEL__", &sel)
+                            .replace("__OX__", if ox.is_empty() { "0" } else { &ox })
+                            .replace("__OY__", if oy.is_empty() { "0" } else { &oy })
+                            .replace("__RX__", if rx.is_empty() { "0" } else { &rx })
+                            .replace("__RY__", if ry.is_empty() { "0" } else { &ry })
+                            .replace("__PHASE__", &phase);
+                        let out = if idx_raw.is_empty() {
+                            page.evaluate(&js).unwrap_or_else(|e| format!("ошибка: {e}"))
+                        } else {
+                            let idx = realm_for_dom_slot(
+                                &mut page,
+                                idx_raw.parse().unwrap_or(0),
+                            );
+                            match page.child_iframe(idx) {
+                                Some(c) => {
+                                    c.evaluate(&js).unwrap_or_else(|e| format!("ошибка: {e}"))
+                                }
+                                None => format!("нет фрейма {idx}"),
+                            }
+                        };
+                        emit(
+                            "action",
+                            format!("\"raw\":{},\"state\":{}", json_str(&raw), json_str(&out)),
+                        );
+                        continue;
+                    }
+                    if raw.contains("\"frameclick\"") {
+                        let idx = realm_for_dom_slot(
+                            &mut page,
+                            field(&raw, "index").parse().unwrap_or(0),
+                        );
+                        let sel = field(&raw, "sel").replace('`', "\\`");
+                        // Marked trusted, like the pointer path. An untrusted
+                        // click is not a click to a widget that checks — hCaptcha
+                        // takes the whole `pointerdown … click` sequence without a
+                        // complaint and does nothing at all with it, so a press on
+                        // its own button silently did nothing.
                         let js = format!(
                             "(function(){{var e=document.querySelector(`{sel}`);\
                              if(!e)return 'нет элемента';\
+                             var ns=(function(){{try{{var s=Object.getOwnPropertySymbols(globalThis);\
+                                 for(var i=0;i<s.length;i++){{var v=globalThis[s[i]];if(v&&v.__bo)return v;}}}}catch(e){{}}return null;}})();\
+                             var mark=(typeof globalThis.__bo_mark_trusted==='function')\
+                                 ?globalThis.__bo_mark_trusted\
+                                 :((ns&&ns.input&&typeof ns.input.mark==='function')?ns.input.mark:null);\
                              var r=e.getBoundingClientRect();\
                              var b={{bubbles:true,cancelable:true,view:window,\
                                     clientX:Math.round(r.left+r.width/2),\
@@ -304,9 +569,9 @@ async fn main() {
                                .forEach(function(t){{\
                                  var C=(t.indexOf('pointer')===0&&typeof PointerEvent!=='undefined')\
                                        ?PointerEvent:MouseEvent;\
-                                 try{{e.dispatchEvent(new C(t,b));}}catch(_){{}}\
+                                 try{{var ev=new C(t,b); if(mark)mark(ev); e.dispatchEvent(ev);}}catch(_){{}}\
                                }});\
-                             return 'клик во фрейме по '+(e.id||e.tagName);}})()"
+                             return 'клик во фрейме по '+(e.id||e.tagName)+(mark?' [trusted]':' [untrusted]');}})()"
                         );
                         let out = match page.child_iframe(idx) {
                             Some(c) => c.evaluate(&js).unwrap_or_else(|e| format!("ошибка: {e}")),
@@ -335,7 +600,10 @@ async fn main() {
                         continue;
                     }
                     if raw.contains("\"frame\"") {
-                        let idx: usize = field(&raw, "index").parse().unwrap_or(0);
+                        let idx = realm_for_dom_slot(
+                            &mut page,
+                            field(&raw, "index").parse().unwrap_or(0),
+                        );
                         let js = field(&raw, "text");
                         let out = match page.child_iframe(idx) {
                             Some(c) => c.evaluate(&js).unwrap_or_else(|e| format!("ошибка: {e}")),
@@ -466,7 +734,7 @@ fn push_snapshot(
                 let Some(at) = *at else { continue };
                 let html = page
                     .child_iframe(realm)
-                    .and_then(|c| c.evaluate("document.documentElement.outerHTML").ok())
+                    .and_then(|c| c.evaluate(&serialize_js()).ok())
                     .unwrap_or_default();
                 match last.iter_mut().find(|(id, _)| id == node_id) {
                     Some((_, prev)) if *prev == html => continue,
@@ -507,14 +775,18 @@ fn drain_netlog() -> String {
     let items: Vec<String> = recs
         .iter()
         .map(|r| {
-            let hdrs: Vec<String> = r
-                .headers
-                .iter()
-                .map(|(k, v)| format!("[{},{}]", json_str(k), json_str(v)))
-                .collect();
+            let pairs = |list: &[(String, String)]| -> String {
+                list.iter()
+                    .map(|(k, v)| format!("[{},{}]", json_str(k), json_str(v)))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            let hdrs = pairs(&r.headers);
+            let req_hdrs = pairs(&r.req_headers);
             format!(
                 "{{\"seq\":{},\"method\":{},\"url\":{},\"status\":{},\"kind\":{},\
-                 \"mime\":{},\"size\":{},\"headers\":[{}],\"body\":{}}}",
+                 \"mime\":{},\"size\":{},\"headers\":[{}],\"body\":{},\
+                 \"reqHeaders\":[{}],\"reqBody\":{}}}",
                 r.seq,
                 json_str(&r.method),
                 json_str(&r.url),
@@ -522,21 +794,44 @@ fn drain_netlog() -> String {
                 json_str(r.kind),
                 json_str(&r.mime),
                 r.size,
-                hdrs.join(","),
-                json_str(&r.body)
+                hdrs,
+                json_str(&r.body),
+                req_hdrs,
+                json_str(&r.req_body)
             )
         })
         .collect();
     format!("[{}]", items.join(","))
 }
 
+/// Quote a string as JSON.
+///
+/// Only backslash, quote and newline used to be escaped, and carriage returns
+/// were dropped outright — every other control character went out raw. A page
+/// whose markup or whose response body contains a tab, a form feed or a stray
+/// `\x0b` — minified bundles are full of them — produced a payload the viewer
+/// could not parse at all: "Bad control character in string literal in JSON",
+/// and the whole snapshot was lost rather than one field.
 fn json_str(s: &str) -> String {
-    let escaped = s
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "");
-    format!("\"{escaped}\"")
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            // Everything below 0x20 has to be escaped, and so do the lone
+            // surrogates' worth of unprintables JSON refuses.
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Park the settled value of an async action so the loop can poll for it: humanized
@@ -563,18 +858,433 @@ fn wrap_action(inner: &str) -> String {
 /// through as a literal backslash-n, which is a syntax error outside a string
 /// literal. Multi-line JS sent to the `eval`/`frame` actions therefore failed to
 /// compile and read as an engine defect rather than a transport one.
+/// One step of a raw pointer gesture, replayed in the engine.
+///
+/// The viewer forwards its own `pointerdown`/`pointermove`/`pointerup` instead
+/// of a synthesised click, because a drag cannot be expressed as one: hCaptcha's
+/// "drag each shape to its matching outline" needs a press, a path, and a
+/// release on two different elements.
+///
+/// The target is named by selector plus an offset inside it, not by viewport
+/// coordinates. The mirror lays the document out at its own width, so its pixel
+/// positions are not the engine's; an element-relative offset survives that.
+///
+/// Events are minted trusted where the realm still exposes the marker — the top
+/// page hands it to humanize.js, which captures and revokes it, so there the
+/// engine's own input API is used instead.
+const POINTER_JS: &str = r#"(function(){
+  // A gesture aimed at a canvas arrives by index, not by selector: the mirror
+  // draws a scaled <img> in its place, so a selector built there names a node
+  // this document does not have.
+  var cidx = '__CIDX__';
+  var el = cidx !== ''
+    ? document.querySelectorAll('canvas')[cidx | 0]
+    : document.querySelector(`__SEL__`);
+  if (!el) return 'нет элемента';
+  var r = el.getBoundingClientRect();
+  // A canvas gesture arrives in the bitmap's own pixels: the mirror shows a
+  // scaled snapshot and scales the offsets back up by `data-bo-cw`/`ch`. A
+  // selector gesture arrives in CSS pixels inside the element. A canvas is
+  // normally sized in CSS and drawn at devicePixelRatio, so the two differ by
+  // that factor — reading bitmap pixels as CSS pixels put every press near the
+  // bottom-right corner or past the element entirely, so nothing inside the
+  // canvas was ever hit and no drag could start.
+  var kx = 1, ky = 1;
+  if (cidx !== '' && el.width && el.height && r.width && r.height) {
+    kx = r.width / el.width;
+    ky = r.height / el.height;
+  }
+  // The mirror and engine have different viewport widths. For ordinary DOM
+  // elements replay a relative point against the engine's computed box; canvas
+  // gestures retain bitmap coordinates because the bitmap is the interaction
+  // surface itself.
+  var rx = Number(__RX__), ry = Number(__RY__);
+  var x = cidx !== ''
+    ? r.left + (__OX__) * kx
+    : r.left + (isFinite(rx) ? Math.max(0, Math.min(1, rx)) * r.width : (__OX__));
+  var y = cidx !== ''
+    ? r.top + (__OY__) * ky
+    : r.top + (isFinite(ry) ? Math.max(0, Math.min(1, ry)) * r.height : (__OY__));
+  // Event coordinates are CSS viewport pixels. Clamp after converting the
+  // mirror offset: neither a canvas backing-store coordinate nor a stale mirror
+  // rect may place a pointer outside the browser profile's viewport.
+  var vw = Math.max(1, Number(globalThis.innerWidth) || 1);
+  var vh = Math.max(1, Number(globalThis.innerHeight) || 1);
+  x = Math.max(0, Math.min(vw - 1, x));
+  y = Math.max(0, Math.min(vh - 1, y));
+  var ns = (function(){try{var s=Object.getOwnPropertySymbols(globalThis);
+      for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})();
+  var mark = (typeof globalThis.__bo_mark_trusted === 'function')
+      ? globalThis.__bo_mark_trusted
+      : ((ns && ns.input && typeof ns.input.mark === 'function') ? ns.input.mark : null);
+  var st = ns ? (ns.__drag || (ns.__drag = {})) : {};
+  function underPointer() {
+    try { return document.elementFromPoint(x, y) || el; } catch (e) { return el; }
+  }
+  function fire(type, Ctor, receiver) {
+    var isMove = type === 'pointermove' || type === 'mousemove';
+    var isRelease = type === 'pointerup' || type === 'mouseup';
+    var isPress = type === 'pointerdown' || type === 'mousedown';
+    var prev = st.at || { x: x, y: y };
+    var buttons = isRelease ? 0 : (isMove ? (st.down ? 1 : 0) : (isPress ? 1 : 0));
+    var init = { bubbles: true, cancelable: true, view: globalThis,
+                 clientX: Math.round(x), clientY: Math.round(y),
+                 screenX: Math.round((Number(globalThis.screenX) || 0) + x),
+                 screenY: Math.round((Number(globalThis.screenY) || 0) + y),
+                 movementX: Math.round(x - prev.x), movementY: Math.round(y - prev.y),
+                 button: isMove && Ctor === globalThis.PointerEvent ? -1 : 0,
+                 buttons: buttons };
+    if (type === 'pointerenter' || type === 'mouseenter') init.bubbles = false;
+    if (Ctor === globalThis.PointerEvent) {
+      init.pointerId = 1; init.pointerType = 'mouse'; init.isPrimary = true;
+      init.width = 1; init.height = 1; init.pressure = init.buttons ? 0.5 : 0;
+    }
+    var ev;
+    try { ev = new Ctor(type, init); } catch (e) { return; }
+    if (mark) { try { mark(ev); } catch (e) {} }
+    try { (receiver || underPointer() || el).dispatchEvent(ev); } catch (e) {}
+  }
+  var P = globalThis.PointerEvent || globalThis.MouseEvent;
+  var phase = '__PHASE__';
+
+  if (phase === 'down') {
+    var target = underPointer();
+    st.down = { x: x, y: y, target: target, dragged: false };
+    fire('pointerover', P, target); fire('pointerenter', P, target);
+    fire('mouseover', globalThis.MouseEvent, target); fire('mouseenter', globalThis.MouseEvent, target);
+    fire('pointerdown', P, target); fire('mousedown', globalThis.MouseEvent, target);
+    try { target.focus && target.focus(); } catch (e) {}
+  } else if (phase === 'move') {
+    var moved = st.down && Math.hypot(x - st.down.x, y - st.down.y) > 4;
+    if (moved) st.down.dragged = true;
+    var target = underPointer();
+    fire('pointermove', P, target); fire('mousemove', globalThis.MouseEvent, target);
+  } else {
+    var target = underPointer();
+    var down = st.down;
+    fire('pointerup', P, target); fire('mouseup', globalThis.MouseEvent, target);
+    // A canvas is one DOM element for every tile. Compare geometry as well as
+    // target identity so a completed canvas drag cannot turn into a click.
+    if (down && !down.dragged && down.target === target) {
+      fire('click', globalThis.MouseEvent, target);
+    }
+    st.down = null;
+  }
+  st.at = { x: x, y: y };
+  return phase + ' @' + Math.round(x) + ',' + Math.round(y)
+    + ' → ' + (el.id ? '#' + el.id : el.tagName.toLowerCase())
+    + (mark ? ' [trusted]' : ' [untrusted]');
+})()"#;
+
+/// One keystroke, replayed in the engine.
+///
+/// Forwarded as it happens rather than as a finished string: a field that
+/// reacts per character — validation, masking, an autocomplete that fires on
+/// `input` — behaves differently when handed the whole value at once.
+///
+/// The target is the engine's own `activeElement`, not the mirror's: focus
+/// lives in the engine, and the mirror is a copy that gets rebuilt underneath.
+/// On `keydown` of a printable key the value is edited at the caret and
+/// `beforeinput`/`input` are fired, which is what a real keystroke does — a
+/// bare `KeyboardEvent` changes no text at all.
+const KEY_JS: &str = r#"(function(){
+  var sel = `__SEL__`;
+  var el = sel ? document.querySelector(sel) : (document.activeElement || document.body);
+  if (!el) return 'нет цели';
+  var key = `__KEY__`, code = `__CODE__`, phase = '__PHASE__';
+  var ns = (function(){try{var s=Object.getOwnPropertySymbols(globalThis);
+      for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})();
+  var mark = (typeof globalThis.__bo_mark_trusted === 'function')
+      ? globalThis.__bo_mark_trusted
+      : ((ns && ns.input && typeof ns.input.mark === 'function') ? ns.input.mark : null);
+  function fire(type, Ctor, init) {
+    var ev;
+    try { ev = new Ctor(type, init); } catch (e) { return true; }
+    if (mark) { try { mark(ev); } catch (e) {} }
+    try { return el.dispatchEvent(ev); } catch (e) { return true; }
+  }
+  // A keystroke that arrives at a field nobody ever moved to or clicked is the
+  // same tell as a press with no approach. If the target is not already
+  // focused, focus it the way a person would: the pointer path lands there
+  // first. Only the first key of a burst pays this — afterwards the field is
+  // already current.
+  if (phase === 'down' && el !== document.activeElement && el.focus) {
+    try {
+      var r = el.getBoundingClientRect();
+      var pos = { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+      var ns2 = ns || {};
+      var seat = ns2.__drag || (ns2.__drag = {});
+      var from = seat.at || { x: pos.x - 160, y: pos.y - 90 };
+      var steps = 10;
+      for (var i2 = 1; i2 <= steps; i2++) {
+        var t2 = i2 / steps, e2 = 1 - Math.pow(1 - t2, 3);
+        var mx = from.x + (pos.x - from.x) * e2 + (Math.random() - 0.5) * 1.2;
+        var my = from.y + (pos.y - from.y) * e2 + (Math.random() - 0.5) * 1.2;
+        var mi = { bubbles: true, cancelable: true, view: globalThis,
+                   clientX: Math.round(mx), clientY: Math.round(my), button: -1, buttons: 0 };
+        try {
+          var mv = new globalThis.MouseEvent('mousemove', mi);
+          if (mark) mark(mv);
+          (document.elementFromPoint(mx, my) || el).dispatchEvent(mv);
+        } catch (e) {}
+      }
+      seat.at = pos;
+      var ci = { bubbles: true, cancelable: true, view: globalThis,
+                 clientX: Math.round(pos.x), clientY: Math.round(pos.y), button: 0, buttons: 1 };
+      ['mousedown', 'mouseup', 'click'].forEach(function (t3) {
+        try {
+          var ev3 = new globalThis.MouseEvent(t3, t3 === 'mouseup' ? Object.assign({}, ci, { buttons: 0 }) : ci);
+          if (mark) mark(ev3);
+          el.dispatchEvent(ev3);
+        } catch (e) {}
+      });
+      el.focus();
+    } catch (e) {}
+  }
+
+  var kinit = { key: key, code: code, bubbles: true, cancelable: true, view: globalThis,
+                ctrlKey: __CTRL__, altKey: __ALT__, shiftKey: __SHIFT__, metaKey: __META__ };
+  if (phase === 'up') { fire('keyup', globalThis.KeyboardEvent, kinit); return 'keyup ' + key; }
+
+  var notPrevented = fire('keydown', globalThis.KeyboardEvent, kinit);
+  var tag = (el.tagName || '').toLowerCase();
+  var editable = (tag === 'input' || tag === 'textarea');
+  if (!notPrevented || !editable) return 'keydown ' + key + (editable ? ' (отменён)' : '');
+
+  var val = String(el.value == null ? '' : el.value);
+  var start = el.selectionStart == null ? val.length : el.selectionStart;
+  var end = el.selectionEnd == null ? start : el.selectionEnd;
+  var next = null, itype = 'insertText', data = null;
+  if (key.length === 1 && !__CTRL__ && !__META__) {
+    next = val.slice(0, start) + key + val.slice(end); data = key;
+    start = start + 1;
+  } else if (key === 'Backspace') {
+    itype = 'deleteContentBackward';
+    if (end > start) { next = val.slice(0, start) + val.slice(end); }
+    else if (start > 0) { next = val.slice(0, start - 1) + val.slice(start); start = start - 1; }
+  } else if (key === 'Delete') {
+    itype = 'deleteContentForward';
+    if (end > start) { next = val.slice(0, start) + val.slice(end); }
+    else { next = val.slice(0, start) + val.slice(start + 1); }
+  }
+  if (next === null) return 'keydown ' + key;
+  if (fire('beforeinput', globalThis.InputEvent || globalThis.Event,
+           { inputType: itype, data: data, bubbles: true, cancelable: true })) {
+    // Through the prototype setter, the way a framework-wrapped field expects
+    // its value to arrive.
+    var d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value');
+    if (d && d.set) { d.set.call(el, next); } else { el.value = next; }
+    try { el.setSelectionRange(start, start); } catch (e) {}
+    fire('input', globalThis.InputEvent || globalThis.Event,
+         { inputType: itype, data: data, bubbles: true, cancelable: false });
+  }
+  return 'keydown ' + key + ' → ' + JSON.stringify(String(el.value)).slice(0, 40);
+})()"#;
+
+/// A canvas snapshot small enough to ship on every tick.
+///
+/// The full-resolution PNG of a captcha's 1000x940 surface is ~800 KB, and a
+/// snapshot carrying one pushed the whole message past 1.4 MB — five times a
+/// second, which the broadcast channel simply drops. This downscales to a
+/// bounded width first: enough to see what the engine drew, ~40x smaller.
+const CANVAS_THUMB_FN: &str = r#"
+  function __boThumb(c) {
+    var MAX = 320;
+    var w = c.width | 0, h = c.height | 0;
+    if (!w || !h) return '';
+    var scale = Math.min(1, MAX / Math.max(w, h));
+    var tw = Math.max(1, Math.round(w * scale));
+    var th = Math.max(1, Math.round(h * scale));
+    var t = document.createElement('canvas');
+    t.width = tw; t.height = th;
+    var x = t.getContext('2d');
+    if (!x) return '';
+    x.drawImage(c, 0, 0, w, h, 0, 0, tw, th);
+    return t.toDataURL();
+  }
+"#;
+
+/// Inline everything the mirror cannot resolve on its own.
+///
+/// The mirror is markup rendered by the viewer's browser, so a `blob:` URL —
+/// how a page shows an image it fetched itself, and how hCaptcha delivers its
+/// tile art — points at an object that exists only inside this engine. Those
+/// references are rewritten to `data:` before serialising: backgrounds onto a
+/// `data-bo-bg` attribute the view reads, `<img>` sources in place.
+///
+/// Bounded, and restored afterwards: the page must not observe either change.
+const INLINE_BLOBS_FN: &str = r#"
+  function __boInlineBlobs() {
+    var undo = [];
+    var budget = 30;
+    var cache = {};
+    function toData(u) {
+      if (cache[u] !== undefined) return cache[u];
+      var out = '';
+      try { out = Deno.core.ops.op_blob_data_url(u) || ''; } catch (e) { out = ''; }
+      cache[u] = out;
+      return out;
+    }
+    var all = document.querySelectorAll('*');
+    for (var i = 0; i < all.length && budget > 0; i++) {
+      var el = all[i];
+      // <img src="blob:…">
+      try {
+        var src = el.tagName === 'IMG' ? el.getAttribute('src') : null;
+        if (src && src.indexOf('blob:') === 0) {
+          var d = toData(src);
+          if (d) { el.setAttribute('src', d); undo.push([el, 'src', src]); budget--; }
+        }
+      } catch (e) {}
+      // background-image: url(blob:…)
+      try {
+        var bg = getComputedStyle(el).backgroundImage;
+        if (bg && bg.indexOf('blob:') >= 0) {
+          var m = /url\(["']?(blob:[^"')]+)["']?\)/.exec(bg);
+          if (m) {
+            var dd = toData(m[1]);
+            if (dd) {
+              el.setAttribute('data-bo-bg', dd);
+              undo.push([el, 'data-bo-bg', null]);
+              budget--;
+            }
+          }
+        }
+      } catch (e) {}
+    }
+    return undo;
+  }
+  function __boUndoBlobs(undo) {
+    for (var i = 0; i < undo.length; i++) {
+      var el = undo[i][0], attr = undo[i][1], prev = undo[i][2];
+      try {
+        if (prev === null) el.removeAttribute(attr);
+        else el.setAttribute(attr, prev);
+      } catch (e) {}
+    }
+  }
+"#;
+
+/// Serialise a document with every canvas' pixels inlined.
+///
+/// A `<canvas>` carries no markup: its bitmap lives in the engine, so the
+/// mirror — which is HTML — always drew an empty box where the page has a
+/// picture. Stamping `toDataURL()` onto the element as an attribute lets the
+/// view swap in an `<img>` and show what the engine actually rendered.
+///
+/// Bounded on purpose: only canvases big enough to matter, and only a few of
+/// them, because each PNG is a few hundred KB and this runs on every snapshot.
+const SERIALIZE_WITH_CANVAS_BODY: &str = r#"(function(){
+  __THUMB__
+  var blobUndo = __boInlineBlobs();
+  var cs = document.querySelectorAll('canvas');
+  var touched = [];
+  var budget = 4;
+  for (var i = 0; i < cs.length && budget > 0; i++) {
+    var c = cs[i];
+    var w = c.width | 0, h = c.height | 0;
+    if (w < 24 || h < 24) continue;
+    var url = '';
+    try { url = __boThumb(c); } catch (e) { continue; }
+    if (!url || url.length < 32) continue;
+    c.setAttribute('data-bo-shot', url);
+    // Index among this document's canvases plus the intrinsic size: the view
+    // needs both to aim a gesture back at the real element. The mirror shows a
+    // scaled <img>, so a selector built there would name the wrong node and its
+    // offsets would be in thumbnail pixels.
+    c.setAttribute('data-bo-cidx', String(i));
+    c.setAttribute('data-bo-cw', String(w));
+    c.setAttribute('data-bo-ch', String(h));
+    touched.push(c);
+    budget--;
+  }
+  var html = document.documentElement.outerHTML;
+  __boUndoBlobs(blobUndo);
+  // The attribute is a view-only artefact — the page must never see it.
+  for (var j = 0; j < touched.length; j++) {
+    try { touched[j].removeAttribute('data-bo-shot'); } catch (e) {}
+  }
+  return html;
+})()"#;
+
+/// The frame serialiser with the thumbnail helper spliced in.
+fn serialize_js() -> String {
+    SERIALIZE_WITH_CANVAS_BODY.replace("__THUMB__", &format!("{CANVAS_THUMB_FN}{INLINE_BLOBS_FN}"))
+}
+
+/// Minimal base64 decode for the canvas snapshot command.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut rev = [255u8; 256];
+    for (i, c) in T.iter().enumerate() {
+        rev[*c as usize] = i as u8;
+    }
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for b in s.bytes() {
+        if b == b'=' || b == b'\n' || b == b'\r' {
+            continue;
+        }
+        let v = rev[b as usize];
+        if v == 255 {
+            return None;
+        }
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Map the viewer's frame number — a position among the top document's
+/// `<iframe>` elements — onto an index into the materialized child realms.
+///
+/// The two orders are not the same. A page can hold `<iframe>`s that were never
+/// materialized (no `src`, `javascript:`, CSP-blocked), so the n-th element is
+/// not the n-th realm: on Epic's login the challenge is element 2 but realm 1,
+/// and a click aimed at it answered "нет фрейма 2". Falls back to treating the
+/// number as a realm index, which keeps the older commands working.
+fn realm_for_dom_slot(page: &mut browser_oxide::Page, wanted: usize) -> usize {
+    let slots = page.child_frame_dom_slots();
+    for (realm_idx, (_node, slot)) in slots.iter().enumerate() {
+        if *slot == Some(wanted) {
+            return realm_idx;
+        }
+    }
+    wanted
+}
+
 fn field(raw: &str, key: &str) -> String {
+    // The quoted name must be followed by `:`, or the scan matches the same text
+    // appearing as a *value*: `{"action":"key","key":"a"}` split on the first
+    // `"key"` — the one inside `"action":"key"` — and returned nothing at all,
+    // so every keystroke arrived with an empty key.
     let needle = format!("\"{key}\"");
-    let Some(rest) = raw.split_once(&needle).map(|(_, r)| r) else {
-        return String::new();
-    };
-    let rest = rest.trim_start();
-    let Some(rest) = rest.strip_prefix(':') else {
-        return String::new();
+    let mut from = 0usize;
+    let rest = loop {
+        let Some(hit) = raw[from..].find(&needle) else {
+            return String::new();
+        };
+        let after = from + hit + needle.len();
+        let tail = raw[after..].trim_start();
+        if let Some(t) = tail.strip_prefix(':') {
+            break t;
+        }
+        from = after;
     };
     let rest = rest.trim_start();
     let Some(rest) = rest.strip_prefix('"') else {
-        return String::new();
+        // A bare JSON value — number, `true`, `null`. This used to return the
+        // empty string, so `{"action":"frame","index":1}` parsed as index 0 and
+        // every frame command silently evaluated in the *first* child realm.
+        // A caller comparing realms then saw them all report the same document
+        // and concluded the realms were wrong, when only the parse was.
+        let end = rest.find([',', '}']).unwrap_or(rest.len());
+        return rest[..end].trim().to_string();
     };
 
     let mut out = String::new();

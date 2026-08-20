@@ -43,6 +43,39 @@ fn blob_registry() -> &'static Mutex<BlobRegistry> {
     })
 }
 
+/// A `blob:` URL rendered as a `data:` URL.
+///
+/// The mirror is markup handed to another browser, where a `blob:` reference
+/// points at an object that only exists inside this engine — so a tile shown
+/// through `URL.createObjectURL` arrives blank. Re-encoding the bytes inline is
+/// what makes them visible there.
+#[op2]
+#[string]
+pub fn op_blob_data_url(#[string] url: String) -> String {
+    let reg = blob_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(entry) = reg.blobs.get(&url) else {
+        return String::new();
+    };
+    let mime = if entry.content_type.is_empty() {
+        "application/octet-stream"
+    } else {
+        entry.content_type.as_str()
+    };
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &entry.data);
+    format!("data:{mime};base64,{b64}")
+}
+
+/// The bytes behind a `blob:` URL, for consumers outside this module.
+///
+/// `<img src="blob:…">` is how a page shows an image it fetched itself — and
+/// how hCaptcha delivers its challenge tiles — so the image loader needs to
+/// read the registry directly rather than going out to the network for a URL
+/// that has no network behind it.
+pub fn blob_bytes(url: &str) -> Option<Vec<u8>> {
+    let reg = blob_registry().lock().unwrap_or_else(|e| e.into_inner());
+    reg.blobs.get(url).map(|e| e.data.clone())
+}
+
 /// Register a blob's bytes + MIME type under a blob: URL. Called from
 /// `URL.createObjectURL`. `content_type` comes from the `Blob.type`
 /// field; may be empty string for unspecified blobs.
@@ -638,6 +671,7 @@ deno_core::extension!(
     worker_extension,
     ops = [
         op_blob_register,
+        op_blob_data_url,
         op_blob_fetch_text,
         op_blob_fetch_bytes,
         op_blob_revoke,

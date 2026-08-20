@@ -34,6 +34,34 @@ pub enum Position {
     Sticky,
 }
 
+/// CSS `border-style`.
+///
+/// Needed for geometry, not decoration: a border only occupies space when its
+/// style is something other than `none`/`hidden`. The initial `border-width` is
+/// `medium` (3px), so applying width unconditionally gave every single element
+/// a 3px border on all four sides — every box 6px too wide and 6px too tall,
+/// and every position shifted by the accumulated error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorderStyle {
+    None,
+    Hidden,
+    Solid,
+    Dashed,
+    Dotted,
+    Double,
+    Groove,
+    Ridge,
+    Inset,
+    Outset,
+}
+
+impl BorderStyle {
+    /// Whether a border with this style takes up no space.
+    pub fn is_blank(self) -> bool {
+        matches!(self, Self::None | Self::Hidden)
+    }
+}
+
 /// CSS `visibility` property values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Visibility {

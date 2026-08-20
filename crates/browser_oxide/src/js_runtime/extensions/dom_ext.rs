@@ -1163,6 +1163,25 @@ pub fn op_dom_get_computed_style(
     let id = NodeId::from_raw(node_id as u32);
     let ctx = calc_context_from(state);
 
+    // 0. UA defaults that differ from the generic initial value. Layout hides
+    //    `<head>` and its contents; `getComputedStyle` has to say the same
+    //    thing, or the two disagree about what is on the page.
+    if property == "display" {
+        if let Some(crate::dom::node::NodeData::Element(elem)) = state.dom.get(id).map(|n| &n.data)
+        {
+            const HIDDEN: &[&str] = &[
+                "head", "base", "basefont", "bgsound", "datalist", "link", "meta", "noembed",
+                "noframes", "param", "rp", "script", "style", "template", "title",
+            ];
+            if HIDDEN.contains(&&*elem.name.local) {
+                let inline = get_inline_style_value(&state.dom, id, property);
+                if inline.as_deref().unwrap_or("").is_empty() {
+                    return "none".into();
+                }
+            }
+        }
+    }
+
     // 1. Check inline style (highest specificity)
     let inline_val = get_inline_style_value(&state.dom, id, property);
     if let Some(val) = &inline_val {

@@ -231,6 +231,17 @@ pub struct HttpClient {
     proxy: Option<proxy::ProxyConfig>,
 }
 
+/// A host that answered the TLS handshake with `http/1.1` is not a failure —
+/// Chrome downgrades silently and so do we (the caller's h1 path takes over and
+/// [`HttpClient::h1_only_hosts`] makes it stick). Printing it as
+/// "H2 connection failed" made a routine protocol choice look like a broken
+/// connection; several hCaptcha content hosts are h1-only, so the noise showed
+/// up on every challenge.
+fn is_expected_h1_downgrade(e: &NetError) -> bool {
+    let msg = e.to_string();
+    msg.contains("ALPN negotiated http/1.1") || msg.contains("http/1.1 only (cached)")
+}
+
 impl HttpClient {
     /// Borrow this client's stealth profile (read-only). Useful for
     /// callers that need to spawn auxiliary clients with the same UA /
@@ -688,7 +699,9 @@ impl HttpClient {
                 let mut sender = match sender_res {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("[net] H2 connection failed for {}: {}", host, e);
+                        if !is_expected_h1_downgrade(&e) {
+                            eprintln!("[net] H2 connection failed for {}: {}", host, e);
+                        }
                         break 'h2 None;
                     }
                 };
@@ -702,7 +715,9 @@ impl HttpClient {
                 }
                 match h2_client::send_get(&mut sender, uri, host, &hdrs).await {
                     Ok((parts, body)) => {
-                        let resp = self.build_response(parts, body, url, "GET").await?;
+                        let resp = self
+                            .build_response(parts, body, url, "GET", &hdrs, &[])
+                            .await?;
                         break 'h2 Some(resp);
                     }
                     Err(e) if attempt == 0 && is_stale_conn_error(&e) => {
@@ -743,7 +758,8 @@ impl HttpClient {
                     );
                 }
                 let raw = h1_client::send_get(&mut tls_stream, host, &path, &hdrs).await?;
-                self.build_response_from_raw(raw, url, "GET").await?
+                self.build_response_from_raw(raw, url, "GET", &hdrs, &[])
+                    .await?
             }
         };
         self.learn_alt_svc(url, &response.headers).await;
@@ -820,7 +836,9 @@ impl HttpClient {
                 let mut sender = match sender_res {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("[net] H2 connection failed for {}: {}", host, e);
+                        if !is_expected_h1_downgrade(&e) {
+                            eprintln!("[net] H2 connection failed for {}: {}", host, e);
+                        }
                         break 'h2 None;
                     }
                 };
@@ -834,7 +852,9 @@ impl HttpClient {
                 }
                 match h2_client::send_get(&mut sender, uri, host, &hdrs).await {
                     Ok((parts, body)) => {
-                        let resp = self.build_response(parts, body, url, "GET").await?;
+                        let resp = self
+                            .build_response(parts, body, url, "GET", &hdrs, &[])
+                            .await?;
                         break 'h2 Some(resp);
                     }
                     Err(e) if attempt == 0 && is_stale_conn_error(&e) => {
@@ -878,7 +898,8 @@ impl HttpClient {
                     );
                 }
                 let raw = h1_client::send_get(&mut tls_stream, host, &path, &hdrs).await?;
-                self.build_response_from_raw(raw, url, "GET").await?
+                self.build_response_from_raw(raw, url, "GET", &hdrs, &[])
+                    .await?
             }
         };
 
@@ -1095,7 +1116,8 @@ impl HttpClient {
         let mut tls_stream = tls::connect_tls(&connector, &self.profile, host, tcp_stream).await?;
 
         let raw = h1_client::send_post(&mut tls_stream, host, &path, &hdrs, body).await?;
-        self.build_response_from_raw(raw, url, "POST").await
+        self.build_response_from_raw(raw, url, "POST", &hdrs, body)
+            .await
     }
 
     /// POST with a raw byte body and ONLY the caller-provided headers plus cookies.
@@ -1170,7 +1192,9 @@ impl HttpClient {
                 let mut sender = match sender_res {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("[net] H2 connection failed for {}: {}", host, e);
+                        if !is_expected_h1_downgrade(&e) {
+                            eprintln!("[net] H2 connection failed for {}: {}", host, e);
+                        }
                         break 'h2 None;
                     }
                 };
@@ -1187,7 +1211,9 @@ impl HttpClient {
                 }
                 match h2_client::send_post(&mut sender, uri, host, &hdrs, body).await {
                     Ok((parts, resp_body)) => {
-                        let resp = self.build_response(parts, resp_body, url, "POST").await?;
+                        let resp = self
+                            .build_response(parts, resp_body, url, "POST", &hdrs, body)
+                            .await?;
                         break 'h2 Some(resp);
                     }
                     Err(e) if attempt == 0 && is_stale_conn_error(&e) => {
@@ -1232,7 +1258,8 @@ impl HttpClient {
                     );
                 }
                 let raw = h1_client::send_post(&mut tls_stream, host, &path, &hdrs, body).await?;
-                self.build_response_from_raw(raw, url, "POST").await?
+                self.build_response_from_raw(raw, url, "POST", &hdrs, body)
+                    .await?
             }
         };
 
@@ -1327,14 +1354,18 @@ impl HttpClient {
                 let mut sender = match sender_res {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("[net] H2 connection failed for {}: {}", host, e);
+                        if !is_expected_h1_downgrade(&e) {
+                            eprintln!("[net] H2 connection failed for {}: {}", host, e);
+                        }
                         break 'h2 None;
                     }
                 };
                 let uri = parsed.as_str();
                 match h2_client::send_post(&mut sender, uri, host, &hdrs, body).await {
                     Ok((parts, resp_body)) => {
-                        let resp = self.build_response(parts, resp_body, url, "POST").await?;
+                        let resp = self
+                            .build_response(parts, resp_body, url, "POST", &hdrs, body)
+                            .await?;
                         break 'h2 Some(resp);
                     }
                     Err(e) if attempt == 0 && is_stale_conn_error(&e) => {
@@ -1365,7 +1396,8 @@ impl HttpClient {
                     None => parsed.path().to_string(),
                 };
                 let raw = h1_client::send_post(&mut tls_stream, host, &path, &hdrs, body).await?;
-                self.build_response_from_raw(raw, url, "POST").await?
+                self.build_response_from_raw(raw, url, "POST", &hdrs, body)
+                    .await?
             }
         };
 
@@ -1435,12 +1467,17 @@ impl HttpClient {
     }
 
     /// Build a Response from HTTP/2 response parts and body.
+    /// `req_headers` / `req_body` are carried through only for the network log:
+    /// a refusal is almost never explained by the response alone — what was
+    /// sent is the half that answers it.
     async fn build_response(
         &self,
         parts: http::response::Parts,
         body: Vec<u8>,
         url: &str,
         method: &str,
+        req_headers: &[(String, String)],
+        req_body: &[u8],
     ) -> Result<Response, NetError> {
         let status = parts.status.as_u16();
         let status_text = parts.status.canonical_reason().unwrap_or("").to_string();
@@ -1465,7 +1502,15 @@ impl HttpClient {
             .map(|s| s.as_str())
             .unwrap_or("");
         let decompressed = compression::decompress(&body, encoding)?;
-        netlog::record(method, url, status, &resp_headers, &decompressed);
+        netlog::record_full(
+            method,
+            url,
+            status,
+            &resp_headers,
+            &decompressed,
+            req_headers,
+            req_body,
+        );
 
         Ok(Response {
             status,
@@ -1480,11 +1525,14 @@ impl HttpClient {
     }
 
     /// Build a Response from an HTTP/1.1 raw response.
+    /// See [`Self::build_response`] on why the request side is carried through.
     async fn build_response_from_raw(
         &self,
         raw: h1_client::RawResponse,
         url: &str,
         method: &str,
+        req_headers: &[(String, String)],
+        req_body: &[u8],
     ) -> Result<Response, NetError> {
         let mut resp_headers = HashMap::new();
         let mut set_cookies = Vec::new();
@@ -1501,7 +1549,15 @@ impl HttpClient {
             .map(|s| s.as_str())
             .unwrap_or("");
         let decompressed = compression::decompress(&raw.body, encoding)?;
-        netlog::record(method, url, raw.status, &resp_headers, &decompressed);
+        netlog::record_full(
+            method,
+            url,
+            raw.status,
+            &resp_headers,
+            &decompressed,
+            req_headers,
+            req_body,
+        );
 
         Ok(Response {
             status: raw.status,

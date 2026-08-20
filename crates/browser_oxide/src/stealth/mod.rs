@@ -7,6 +7,7 @@
 
 pub mod behavior;
 pub mod config;
+pub mod egress;
 pub mod gpu;
 pub mod presets;
 pub mod profile;

@@ -115,9 +115,85 @@
     globalThis.ImageData = ImageData;
     _maskFunction(ImageData, 'ImageData');
 
+    // A context's `canvas` back-reference. Every browser has it, and library
+    // code leans on it constantly — `ctx.canvas.width`, `ctx.canvas.toDataURL()`,
+    // passing `ctx.canvas` on as a drawing source. Ours had none, so all of
+    // those read `undefined` and either threw or silently produced `NaN`.
+    //
+    // Kept in a WeakMap behind a prototype accessor rather than as an own
+    // property, which is where Chrome exposes it and what
+    // `Object.getOwnPropertyNames(ctx)` must keep showing.
+    const _ctxCanvas = new WeakMap();
+    // One 2D context per canvas, as in a browser: `c.getContext('2d') ===
+    // c.getContext('2d')` is true there and was false here. Beyond the tell,
+    // handing out a fresh context each call gave every caller its own copy of
+    // the readable state while the engine kept one — the two drifted apart.
+    const _ctx2d = new WeakMap();
+    const _context2dFor = (el, id) => {
+        let ctx = _ctx2d.get(el);
+        if (!ctx) {
+            ctx = new CanvasRenderingContext2D(id, el);
+            _ctx2d.set(el, ctx);
+        }
+        return ctx;
+    };
+
+    // The readable half of the context state.
+    //
+    // Every one of these used to read back `undefined`: some were setter-only,
+    // and the rest did not exist at all, so assigning them quietly created a
+    // plain property the engine never saw. Chrome returns a value for each, and
+    // code that does `const prev = ctx.fillStyle; …; ctx.fillStyle = prev`
+    // — a very common idiom — restored `undefined` instead.
+    const _defaultState = () => ({
+        fillStyle: "#000000",
+        strokeStyle: "#000000",
+        globalAlpha: 1,
+        globalCompositeOperation: "source-over",
+        lineWidth: 1,
+        lineCap: "butt",
+        lineJoin: "miter",
+        miterLimit: 10,
+        lineDashOffset: 0,
+        font: "10px sans-serif",
+        textAlign: "start",
+        textBaseline: "alphabetic",
+        direction: "inherit",
+        letterSpacing: "0px",
+        wordSpacing: "0px",
+        fontKerning: "auto",
+        fontStretch: "normal",
+        fontVariantCaps: "normal",
+        textRendering: "auto",
+        shadowBlur: 0,
+        shadowColor: "rgba(0, 0, 0, 0)",
+        shadowOffsetX: 0,
+        shadowOffsetY: 0,
+        filter: "none",
+        imageSmoothingEnabled: true,
+        imageSmoothingQuality: "low",
+    });
+
+    let _resetCtxState;
     class CanvasRenderingContext2D {
         #id;
-        constructor(id) { this.#id = id; }
+        #s = _defaultState();
+        #stack = [];
+        constructor(id, canvasEl) {
+            this.#id = id;
+            if (canvasEl) _ctxCanvas.set(this, canvasEl);
+        }
+
+        // Resizing a canvas resets the bitmap and the engine-side drawing
+        // state, so the mirror resets with them. Reached through a module-local
+        // function rather than a method: `Object.getOwnPropertyNames` on the
+        // prototype has to keep matching Chrome's.
+        static {
+            _resetCtxState = (ctx) => {
+                ctx.#s = _defaultState();
+                ctx.#stack = [];
+            };
+        }
 
         // Style
         set fillStyle(v) {
@@ -134,15 +210,108 @@
                     coords = [v._x0, v._y0, v._r0, v._x1, v._y1, v._r1];
                 }
                 ops.op_canvas_set_fill_gradient(this.#id, v._type, JSON.stringify({ coords, stops }));
+                this.#s.fillStyle = v;
             } else {
                 ops.op_canvas_set_fill_style(this.#id, String(v));
+                this.#s.fillStyle = String(v);
             }
         }
-        set strokeStyle(v) { ops.op_canvas_set_stroke_style(this.#id, String(v)); }
-        set lineWidth(v) { ops.op_canvas_set_line_width(this.#id, +v); }
-        set globalAlpha(v) { ops.op_canvas_set_global_alpha(this.#id, +v); }
-        set font(v) { this._font = String(v); ops.op_canvas_set_font(this.#id, this._font); }
-        get font() { return this._font || "10px sans-serif"; }
+        get fillStyle() { return this.#s.fillStyle; }
+        set strokeStyle(v) {
+            this.#s.strokeStyle = (v && typeof v === "object") ? v : String(v);
+            if (!v || typeof v !== "object") ops.op_canvas_set_stroke_style(this.#id, String(v));
+        }
+        get strokeStyle() { return this.#s.strokeStyle; }
+        set lineWidth(v) {
+            const n = +v;
+            if (!isFinite(n) || n <= 0) return;
+            this.#s.lineWidth = n;
+            ops.op_canvas_set_line_width(this.#id, n);
+        }
+        get lineWidth() { return this.#s.lineWidth; }
+        set globalAlpha(v) {
+            const n = +v;
+            if (!isFinite(n) || n < 0 || n > 1) return;
+            this.#s.globalAlpha = n;
+            ops.op_canvas_set_global_alpha(this.#id, n);
+        }
+        get globalAlpha() { return this.#s.globalAlpha; }
+        set globalCompositeOperation(v) {
+            this.#s.globalCompositeOperation = String(v);
+            ops.op_canvas_set_composite(this.#id, String(v));
+        }
+        get globalCompositeOperation() { return this.#s.globalCompositeOperation; }
+        set font(v) {
+            this.#s.font = String(v);
+            this._font = this.#s.font;
+            ops.op_canvas_set_font(this.#id, this.#s.font);
+        }
+        get font() { return this.#s.font; }
+
+        set shadowBlur(v) {
+            const n = +v;
+            if (!isFinite(n) || n < 0) return;
+            this.#s.shadowBlur = n;
+            ops.op_canvas_set_shadow_blur(this.#id, n);
+        }
+        get shadowBlur() { return this.#s.shadowBlur; }
+        set shadowColor(v) {
+            this.#s.shadowColor = String(v);
+            ops.op_canvas_set_shadow_color(this.#id, String(v));
+        }
+        get shadowColor() { return this.#s.shadowColor; }
+        set shadowOffsetX(v) {
+            const n = +v;
+            if (!isFinite(n)) return;
+            this.#s.shadowOffsetX = n;
+            ops.op_canvas_set_shadow_offset(this.#id, n, this.#s.shadowOffsetY);
+        }
+        get shadowOffsetX() { return this.#s.shadowOffsetX; }
+        set shadowOffsetY(v) {
+            const n = +v;
+            if (!isFinite(n)) return;
+            this.#s.shadowOffsetY = n;
+            ops.op_canvas_set_shadow_offset(this.#id, this.#s.shadowOffsetX, n);
+        }
+        get shadowOffsetY() { return this.#s.shadowOffsetY; }
+        set filter(v) {
+            this.#s.filter = String(v);
+            ops.op_canvas_set_filter(this.#id, String(v));
+        }
+        get filter() { return this.#s.filter; }
+
+        // Mirrored only: the raster backend does not act on these yet, but
+        // Chrome always reports a value and pages save/restore them.
+        set miterLimit(v) { const n = +v; if (isFinite(n)) this.#s.miterLimit = n; }
+        get miterLimit() { return this.#s.miterLimit; }
+        set lineDashOffset(v) { const n = +v; if (isFinite(n)) this.#s.lineDashOffset = n; }
+        get lineDashOffset() { return this.#s.lineDashOffset; }
+        set lineCap(v) { this.#s.lineCap = String(v); }
+        get lineCap() { return this.#s.lineCap; }
+        set lineJoin(v) { this.#s.lineJoin = String(v); }
+        get lineJoin() { return this.#s.lineJoin; }
+        set textAlign(v) { this.#s.textAlign = String(v); }
+        get textAlign() { return this.#s.textAlign; }
+        set textBaseline(v) { this.#s.textBaseline = String(v); }
+        get textBaseline() { return this.#s.textBaseline; }
+        set direction(v) { this.#s.direction = String(v); }
+        get direction() { return this.#s.direction; }
+        set letterSpacing(v) { this.#s.letterSpacing = String(v); }
+        get letterSpacing() { return this.#s.letterSpacing; }
+        set wordSpacing(v) { this.#s.wordSpacing = String(v); }
+        get wordSpacing() { return this.#s.wordSpacing; }
+        set fontKerning(v) { this.#s.fontKerning = String(v); }
+        get fontKerning() { return this.#s.fontKerning; }
+        set fontStretch(v) { this.#s.fontStretch = String(v); }
+        get fontStretch() { return this.#s.fontStretch; }
+        set fontVariantCaps(v) { this.#s.fontVariantCaps = String(v); }
+        get fontVariantCaps() { return this.#s.fontVariantCaps; }
+        set textRendering(v) { this.#s.textRendering = String(v); }
+        get textRendering() { return this.#s.textRendering; }
+        set imageSmoothingQuality(v) { this.#s.imageSmoothingQuality = String(v); }
+        get imageSmoothingQuality() { return this.#s.imageSmoothingQuality; }
+        set imageSmoothingEnabled(v) { this.#s.imageSmoothingEnabled = !!v; }
+        get imageSmoothingEnabled() { return this.#s.imageSmoothingEnabled; }
 
         // Rectangles
         fillRect(x, y, w, h) { ops.op_canvas_fill_rect(this.#id, x, y, w, h); }
@@ -204,8 +373,15 @@
         }
 
         // Transform
-        save() { ops.op_canvas_save(this.#id); }
-        restore() { ops.op_canvas_restore(this.#id); }
+        save() {
+            this.#stack.push(Object.assign({}, this.#s));
+            ops.op_canvas_save(this.#id);
+        }
+        restore() {
+            const prev = this.#stack.pop();
+            if (prev) this.#s = prev;
+            ops.op_canvas_restore(this.#id);
+        }
         translate(x, y) { ops.op_canvas_translate(this.#id, x, y); }
         rotate(angle) { ops.op_canvas_rotate(this.#id, angle); }
         scale(x, y) { ops.op_canvas_scale(this.#id, x, y); }
@@ -220,7 +396,12 @@
             }
         }
         resetTransform() { ops.op_canvas_reset_transform(this.#id); }
-        getTransform() { return {a:1,b:0,c:0,d:1,e:0,f:0}; }
+        getTransform() {
+            const t = ops.op_canvas_get_transform(this.#id);
+            const M = globalThis.DOMMatrix;
+            if (typeof M === "function") return new M([t[0], t[1], t[2], t[3], t[4], t[5]]);
+            return { a: t[0], b: t[1], c: t[2], d: t[3], e: t[4], f: t[5] };
+        }
 
         // Image data — real pixel ops
         getImageData(x, y, w, h) {
@@ -228,14 +409,59 @@
             return new ImageData(new Uint8ClampedArray(raw), w, h);
         }
         putImageData(imageData, dx, dy) {
-            ops.op_canvas_put_image_data(this.#id, imageData.data, dx, dy, imageData.width, imageData.height);
+            // `ImageData.data` is a `Uint8ClampedArray` in every browser, and the
+            // op binding only accepts a `Uint8Array` — so this threw
+            // "expected typed ArrayBufferView" on the one type it is always
+            // given. The whole read-modify-write pixel path
+            // (`getImageData` → edit → `putImageData`) was dead, including the
+            // round trip through our own `getImageData`, which hands back
+            // exactly that type.
+            const d = imageData && imageData.data;
+            if (!d) return;
+            const bytes = (d instanceof Uint8Array)
+                ? d
+                : new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
+            ops.op_canvas_put_image_data(
+                this.#id, bytes, dx, dy, imageData.width, imageData.height,
+            );
         }
         createImageData(w, h) { return new ImageData(w, h); }
-        drawImage(source, dx, dy) {
-            // source can be another canvas element — get its internal ID
-            if (source && source._canvasId !== undefined) {
-                ops.op_canvas_draw_image(this.#id, source._canvasId, dx || 0, dy || 0);
+        /// All three argument forms, and an `<img>` as a source.
+        ///
+        /// This used to accept only a canvas and only `(source, dx, dy)`: an
+        /// image source drew nothing at all, and the scaling forms silently
+        /// dropped their rectangles. Anything that composes a picture out of
+        /// sprites — a captcha's tiles, a sprite sheet, a chart's markers —
+        /// produced a blank canvas with no error to show for it.
+        drawImage(source, a, b, c, d, e, f, g, h) {
+            if (!source) return;
+            // Where the pixels live: a loaded <img> keeps a decoded-image id,
+            // a canvas keeps its own surface id.
+            let kind = -1, srcId = -1, natW = 0, natH = 0;
+            if (source._decodedImageId !== undefined && source._decodedImageId >= 0) {
+                kind = 0; srcId = source._decodedImageId;
+                natW = source.naturalWidth || 0; natH = source.naturalHeight || 0;
+            } else if (source._canvasId !== undefined) {
+                kind = 1; srcId = source._canvasId;
+                natW = source.width || 0; natH = source.height || 0;
+            } else {
+                return;
             }
+            if (!natW || !natH) return;
+
+            let sx = 0, sy = 0, sw = natW, sh = natH, dx, dy, dw, dh;
+            if (arguments.length >= 9) {
+                sx = a; sy = b; sw = c; sh = d; dx = e; dy = f; dw = g; dh = h;
+            } else if (arguments.length >= 5) {
+                dx = a; dy = b; dw = c; dh = d;
+            } else {
+                dx = a || 0; dy = b || 0; dw = natW; dh = natH;
+            }
+            ops.op_canvas_draw_image_rect(
+                this.#id, kind, srcId,
+                sx || 0, sy || 0, sw || 0, sh || 0,
+                dx || 0, dy || 0, dw || 0, dh || 0,
+            );
         }
 
         // Gradient — JS-side objects that track color stops
@@ -1201,7 +1427,7 @@
         removeAttribute(name) { delete this.#attrs[name]; }
         hasAttribute(name) { return name in this.#attrs; }
         getContext(type) {
-            if (type === "2d") return new CanvasRenderingContext2D(this.#canvasId);
+            if (type === "2d") return _context2dFor(this, this.#canvasId);
             if (type === "webgl" || type === "webgl2" || type === "experimental-webgl") {
                 // FIX-D2: webgl2 → WebGL2RenderingContext (distinct class +
                 // WebGL 2 surface); webgl/experimental-webgl → WebGLRenderingContext
@@ -1261,7 +1487,15 @@
         Object.setPrototypeOf(HTMLCanvasElement.prototype, globalThis.HTMLCanvasElement.prototype);
         Object.setPrototypeOf(HTMLCanvasElement, globalThis.HTMLCanvasElement);
     }
-    globalThis.HTMLCanvasElement = HTMLCanvasElement;
+    // NOT reassigned: the DOM-side class (an `HTMLElement` subclass) stays the
+    // global, so `document.createElement('canvas') instanceof HTMLCanvasElement`
+    // holds. Overwriting it with the standalone class broke exactly that — the
+    // real element does not have the standalone prototype in its chain.
+    Object.defineProperty(CanvasRenderingContext2D.prototype, 'canvas', {
+        get() { return _ctxCanvas.get(this) || null; },
+        enumerable: true, configurable: true,
+    });
+
     globalThis.CanvasRenderingContext2D = CanvasRenderingContext2D;
     globalThis.WebGLRenderingContext = WebGLRenderingContext;
     // Symbol.toStringTag — some scripts check
@@ -1332,15 +1566,19 @@
         });
     } catch {}
 
-    // Patch document.createElement to return HTMLCanvasElement for 'canvas'
-    const _origCreateElement = globalThis.document?.createElement?.bind(globalThis.document);
-    if (_origCreateElement) {
-        const _origFn = globalThis.document.createElement;
-        globalThis.document.createElement = function(tag) {
-            if (tag.toLowerCase() === "canvas") return new HTMLCanvasElement();
-            return _origFn.call(this, tag);
-        };
-    }
+    // `document.createElement('canvas')` deliberately NOT patched.
+    //
+    // It used to return `new HTMLCanvasElement()` — the standalone class above,
+    // which owns a drawing surface but no node in the DOM arena. Such an object
+    // has no node id, so `parent.appendChild(canvas)` resolved it to -1 and the
+    // op silently did nothing: a canvas created from script could never be put
+    // in the document. Everything that builds a picture and inserts it — a
+    // chart, a game, a captcha's challenge scene — got a surface it could draw
+    // on and a page that never showed it, with no error anywhere.
+    //
+    // The real element already carries every canvas method: they are installed
+    // on `_HTMLCanvasProto` below, and `_lazyInitCanvas` gives it a surface on
+    // the first `getContext`.
 
     // Install canvas-specific methods on `HTMLCanvasElement.prototype`
     // directly (NOT on Element.prototype). Real Chrome's DOM uses
@@ -1385,11 +1623,44 @@
             }
         }
 
+        // `width`/`height` reflect the content attributes, defaulting to
+        // 300x150. Assigning either resets the bitmap, as in a browser — code
+        // that sizes a canvas before drawing relies on both halves.
+        for (const [prop, dflt] of [["width", 300], ["height", 150]]) {
+            Object.defineProperty(_HTMLCanvasProto, prop, {
+                get() {
+                    const v = parseInt(this.getAttribute && this.getAttribute(prop), 10);
+                    return Number.isNaN(v) ? dflt : v;
+                },
+                set(v) {
+                    const n = Math.max(0, v | 0);
+                    if (this.setAttribute) this.setAttribute(prop, String(n));
+                    // Resize the existing surface rather than dropping its id.
+                    // Handing out a new id here orphaned every context already
+                    // taken from this canvas: the page went on drawing into the
+                    // old surface while everything else read a fresh empty one.
+                    try {
+                        if (this._canvasId) {
+                            const w = prop === "width" ? n : this.width;
+                            const h = prop === "height" ? n : this.height;
+                            ops.op_canvas_resize(this._canvasId, w | 0, h | 0);
+                            // The engine drops its drawing state here, per spec;
+                            // the context's readable mirror follows it.
+                            const ctx = _ctx2d.get(this);
+                            if (ctx) _resetCtxState(ctx);
+                        }
+                    } catch (_) {}
+                },
+                enumerable: true,
+                configurable: true,
+            });
+        }
+
         Object.defineProperty(_HTMLCanvasProto, "getContext", {
             value: function getContext(type) {
                 _requireCanvas(this, "getContext");
                 _lazyInitCanvas(this);
-                if (type === "2d") return new CanvasRenderingContext2D(this._canvasId);
+                if (type === "2d") return _context2dFor(this, this._canvasId);
                 if (
                     type === "webgl" ||
                     type === "webgl2" ||
@@ -1489,8 +1760,9 @@
                     this._canvasId = ops.op_canvas_create(this.width, this.height, _getOsName(), _getCanvasSeed());
                 }
                 if (!this._context) {
-                    this._context = new CanvasRenderingContext2D(this._canvasId);
-                    this._context.canvas = this;
+                    // The back-reference rides in the constructor: `canvas` is a
+                    // getter on the prototype, so assigning it throws.
+                    this._context = new CanvasRenderingContext2D(this._canvasId, this);
                 }
                 return this._context;
             }

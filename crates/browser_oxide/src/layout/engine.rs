@@ -1,6 +1,6 @@
 use crate::css_cascade::{ComputedStyle, StyleRule};
 use crate::css_values::property::{CssValue, PropertyId};
-use crate::css_values::types::display::Display;
+use crate::css_values::types::display::{Display, Position};
 use crate::dom::node::{NodeData, NodeId};
 use crate::dom::Dom;
 use crate::layout::query::DOMRect;
@@ -17,9 +17,84 @@ use taffy::prelude::*;
 /// real document.
 const LAYOUT_BUILD_LIMIT: usize = 100_000;
 
+/// What a text leaf needs to size itself.
+#[derive(Debug, Clone, Copy)]
+pub struct TextBox {
+    chars: f32,
+    longest_word: f32,
+    font_size: f32,
+}
+
+/// Size a run of text, wrapping it into the width it is offered.
+///
+/// Advance width is approximated at 0.6em per character and the line box at
+/// 1.2em, which is close enough for layout purposes; what matters is that the
+/// run *wraps* rather than growing without bound.
+fn measure_text(
+    known: taffy::Size<Option<f32>>,
+    available: taffy::Size<AvailableSpace>,
+    _node: taffy::NodeId,
+    ctx: Option<&mut TextBox>,
+    _style: &taffy::Style,
+) -> taffy::Size<f32> {
+    let Some(tb) = ctx else {
+        return taffy::Size {
+            width: known.width.unwrap_or(0.0),
+            height: known.height.unwrap_or(0.0),
+        };
+    };
+    let char_w = tb.font_size * 0.6;
+    let line_h = tb.font_size * 1.2;
+    let full = (tb.chars * char_w).max(0.0);
+    let min = (tb.longest_word * char_w).max(char_w);
+
+    let limit = match known.width {
+        Some(w) => w,
+        None => match available.width {
+            AvailableSpace::Definite(w) => w,
+            AvailableSpace::MinContent => min,
+            AvailableSpace::MaxContent => full,
+        },
+    };
+    // A single word never splits, so the box cannot be narrower than the
+    // longest one in it.
+    let width = full.min(limit.max(min)).max(0.0);
+    let lines = if width > 0.0 {
+        (full / width).ceil().max(1.0)
+    } else {
+        1.0
+    };
+    taffy::Size {
+        width,
+        height: known.height.unwrap_or(lines * line_h),
+    }
+}
+
+/// Elements the UA stylesheet hides.
+///
+/// Nothing supplied per-tag defaults, so `<head>` and everything in it was laid
+/// out as ordinary blocks — the text of every `<style>`, `<script>` and
+/// `<title>` was measured and given height, and `<body>` started that far down
+/// the page. Inside a captcha's frame that pushed its whole interface past the
+/// bottom edge, and every coordinate taken from it was off by the same amount.
+///
+/// The list is the `display: none` block of the HTML rendering spec:
+/// <https://html.spec.whatwg.org/multipage/rendering.html#hidden-elements>
+fn ua_declarations(tag: &str) -> HashMap<PropertyId, CssValue> {
+    const HIDDEN: &[&str] = &[
+        "head", "base", "basefont", "bgsound", "datalist", "link", "meta", "noembed", "noframes",
+        "param", "rp", "script", "style", "template", "title",
+    ];
+    let mut out = HashMap::new();
+    if HIDDEN.contains(&tag) {
+        out.insert(PropertyId::Display, CssValue::Display(Display::None));
+    }
+    out
+}
+
 /// The layout engine. Converts a DOM + styles into positioned elements.
 pub struct LayoutEngine {
-    tree: TaffyTree,
+    tree: TaffyTree<TextBox>,
     dom_to_taffy: HashMap<u32, taffy::NodeId>,
     viewport: Viewport,
     dirty: bool,
@@ -28,6 +103,19 @@ pub struct LayoutEngine {
     /// stylesheets are parsed; without them every box falls back to UA defaults,
     /// which is what made `getBoundingClientRect` report full-viewport widths.
     rules: Vec<StyleRule>,
+    /// Out-of-flow boxes waiting to be attached to their containing block,
+    /// with a flag for `position: fixed`.
+    ///
+    /// Taffy positions an absolute child against its parent. CSS positions it
+    /// against the nearest *positioned* ancestor — and a fixed one against the
+    /// viewport — so a box whose parent happens to be static picked up that
+    /// parent's offset on top of its own. A widget that measures where to put
+    /// its popup and writes the result into `top`/`left` landed that far away
+    /// from where it meant to.
+    abs_pending: Vec<(taffy::NodeId, bool)>,
+    /// Each built node's `position`, so a parent can tell which of its children
+    /// are out of flow. Filled as the post-order walk finishes each node.
+    css_position: HashMap<u32, Position>,
 }
 
 impl LayoutEngine {
@@ -35,6 +123,8 @@ impl LayoutEngine {
         Self {
             tree: TaffyTree::new(),
             dom_to_taffy: HashMap::new(),
+            abs_pending: Vec::new(),
+            css_position: HashMap::new(),
             viewport,
             dirty: true,
             root_taffy: None,
@@ -46,6 +136,11 @@ impl LayoutEngine {
     /// engine laid out against a compiled-in 1920x1080 while `window.innerWidth`
     /// reported the profile's size — so `vw`/`vh` and every percentage resolved
     /// against a viewport the page never sees, and the two disagreed observably.
+    /// The viewport layout is currently computing against.
+    pub fn viewport(&self) -> Viewport {
+        self.viewport
+    }
+
     pub fn set_viewport(&mut self, viewport: Viewport) {
         self.viewport = viewport;
         self.dirty = true;
@@ -68,6 +163,8 @@ impl LayoutEngine {
         // Clear previous tree
         self.tree = TaffyTree::new();
         self.dom_to_taffy.clear();
+        self.abs_pending.clear();
+        self.css_position.clear();
 
         let ctx = ResolveContext {
             font_size: 16.0,
@@ -86,7 +183,9 @@ impl LayoutEngine {
                 width: AvailableSpace::Definite(self.viewport.width),
                 height: AvailableSpace::Definite(self.viewport.height),
             };
-            self.tree.compute_layout(root_id, avail).ok();
+            self.tree
+                .compute_layout_with_measure(root_id, avail, measure_text)
+                .ok();
         }
 
         self.dirty = false;
@@ -167,7 +266,10 @@ impl LayoutEngine {
     ) -> Option<taffy::NodeId> {
         enum Work {
             Visit(NodeId),
-            Finish(NodeId),
+            /// The node plus how many out-of-flow boxes were already pending
+            /// when its subtree began: everything past that mark came from
+            /// inside it, and only those may attach here.
+            Finish(NodeId, usize),
         }
         let mut stack: Vec<Work> = vec![Work::Visit(root)];
         let mut visited: HashSet<NodeId> = HashSet::with_capacity(64);
@@ -187,15 +289,15 @@ impl LayoutEngine {
                         );
                     }
                     // Schedule Finish first so it pops after all children.
-                    stack.push(Work::Finish(node_id));
+                    stack.push(Work::Finish(node_id, self.abs_pending.len()));
                     // Push children in reverse for document order on pop.
                     let kids = dom.children(node_id);
                     for c in kids.into_iter().rev() {
                         stack.push(Work::Visit(c));
                     }
                 }
-                Work::Finish(node_id) => {
-                    self.finish_node(dom, node_id, ctx);
+                Work::Finish(node_id, mark) => {
+                    self.finish_node(dom, node_id, ctx, mark);
                 }
             }
         }
@@ -205,7 +307,7 @@ impl LayoutEngine {
     /// Build the taffy node for `node_id` using already-built children
     /// recorded in `self.dom_to_taffy` (set by prior Finish calls in
     /// post-order). Returns nothing — the result lives in `dom_to_taffy`.
-    fn finish_node(&mut self, dom: &Dom, node_id: NodeId, ctx: &ResolveContext) {
+    fn finish_node(&mut self, dom: &Dom, node_id: NodeId, ctx: &ResolveContext, mark: usize) {
         let node = match dom.get(node_id) {
             Some(n) => n,
             None => return,
@@ -214,14 +316,28 @@ impl LayoutEngine {
         // Collect already-built children's taffy IDs in document order.
         // Children that returned None (e.g. display:none, unsupported node
         // type) are absent from dom_to_taffy and naturally filtered out.
-        let children: Vec<taffy::NodeId> = dom
-            .children(node_id)
-            .into_iter()
-            .filter_map(|cid| self.dom_to_taffy.get(&cid.to_raw()).copied())
-            .collect();
+        // In-flow children only. An `absolute` or `fixed` child does not belong
+        // to its parent's box — it waits for whichever ancestor actually is its
+        // containing block, which is found below.
+        let mut children: Vec<taffy::NodeId> = Vec::new();
+        for cid in dom.children(node_id) {
+            let Some(tid) = self.dom_to_taffy.get(&cid.to_raw()).copied() else {
+                continue;
+            };
+            match self.css_position.get(&cid.to_raw()) {
+                Some(Position::Absolute) => self.abs_pending.push((tid, false)),
+                Some(Position::Fixed) => self.abs_pending.push((tid, true)),
+                _ => children.push(tid),
+            }
+        }
 
         let taffy_id = match &node.data {
             NodeData::Document | NodeData::DocumentFragment => {
+                // The initial containing block: whatever never found a
+                // positioned ancestor belongs here, `fixed` boxes included.
+                for (tid, _) in self.abs_pending.drain(..) {
+                    children.push(tid);
+                }
                 let style = taffy::Style {
                     display: taffy::Display::Block,
                     size: taffy::Size {
@@ -238,12 +354,32 @@ impl LayoutEngine {
             NodeData::Element(elem) => {
                 // Author rules first (specificity, then source order), inline last —
                 // inline always wins, matching the cascade.
-                let mut declarations = self.match_rules(dom, node_id);
+                // UA defaults go in first so author rules and inline styles
+                // still win over them.
+                let mut declarations = ua_declarations(&elem.name.local);
+                declarations.extend(self.match_rules(dom, node_id));
                 declarations.extend(self.parse_inline_style(elem));
                 let computed = ComputedStyle::resolve(&declarations, None);
                 if let Some(CssValue::Display(Display::None)) = computed.get(&PropertyId::Display) {
                     return;
                 }
+                let position = match computed.get(&PropertyId::Position) {
+                    Some(CssValue::Position(p)) => *p,
+                    _ => Position::Static,
+                };
+                // A positioned box is a containing block for the absolutes
+                // beneath it. `fixed` keeps rising: only the viewport holds it.
+                if !matches!(position, Position::Static) {
+                    let mut i = mark;
+                    while i < self.abs_pending.len() {
+                        if self.abs_pending[i].1 {
+                            i += 1;
+                        } else {
+                            children.push(self.abs_pending.remove(i).0);
+                        }
+                    }
+                }
+                self.css_position.insert(node_id.to_raw(), position);
                 let taffy_style = computed_to_taffy(&computed, ctx);
                 match self.tree.new_with_children(taffy_style, &children) {
                     Ok(id) => id,
@@ -251,17 +387,31 @@ impl LayoutEngine {
                 }
             }
             NodeData::Text(text) => {
-                let char_count = text.chars().count() as f32;
-                let width = char_count * ctx.font_size * 0.6;
-                let height = ctx.font_size * 1.2;
-                let style = taffy::Style {
-                    size: taffy::Size {
-                        width: Dimension::length(width),
-                        height: Dimension::length(height),
-                    },
-                    ..Default::default()
+                // Whitespace between block-level tags collapses away and
+                // generates no box. Giving it one put a line's worth of height
+                // between every pair of blocks — including the newline between
+                // `</head>` and `<body>`, which pushed the whole document down.
+                if text.trim().is_empty() {
+                    return;
+                }
+                // Sized by the measure function, which can wrap it. A fixed
+                // width of `chars × 0.6em` never wrapped, so one long run of
+                // text made its container thousands of pixels wide and pushed
+                // everything laid out beside it far off-screen — inside a 302px
+                // captcha frame, its own links ended up at x = 2482.
+                let ctx_box = TextBox {
+                    chars: text.chars().count() as f32,
+                    longest_word: text
+                        .split_whitespace()
+                        .map(|w| w.chars().count())
+                        .max()
+                        .unwrap_or(0) as f32,
+                    font_size: ctx.font_size,
                 };
-                match self.tree.new_leaf(style) {
+                match self
+                    .tree
+                    .new_leaf_with_context(taffy::Style::default(), ctx_box)
+                {
                     Ok(id) => id,
                     Err(_) => return,
                 }

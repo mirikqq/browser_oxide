@@ -33,6 +33,11 @@ pub struct NetRecord {
     pub headers: Vec<(String, String)>,
     /// Body preview, truncated to [`MAX_BODY`]. Empty for binary types.
     pub body: String,
+    /// What went *out*. A response alone cannot answer why a server refused:
+    /// the question is almost always what was sent — which headers carried the
+    /// session, what the payload actually contained.
+    pub req_headers: Vec<(String, String)>,
+    pub req_body: String,
 }
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -108,6 +113,19 @@ pub fn record(
     headers: &std::collections::HashMap<String, String>,
     body: &[u8],
 ) {
+    record_full(method, url, status, headers, body, &[], &[]);
+}
+
+/// As [`record`] but also keeping the request side of the exchange.
+pub fn record_full(
+    method: &str,
+    url: &str,
+    status: u16,
+    headers: &std::collections::HashMap<String, String>,
+    body: &[u8],
+    req_headers: &[(String, String)],
+    req_body: &[u8],
+) {
     if !enabled() {
         return;
     }
@@ -143,6 +161,13 @@ pub fn record(
         size: body.len(),
         headers: hdrs,
         body: preview,
+        req_headers: req_headers.to_vec(),
+        req_body: {
+            // Same truncation rule as the response, and the same reason: a
+            // multi-megabyte upload must not sit in the ring buffer.
+            let cut = req_body.len().min(MAX_BODY);
+            String::from_utf8_lossy(&req_body[..cut]).into_owned()
+        },
     };
 
     if let Ok(mut guard) = RECORDS.get_or_init(|| Mutex::new(Vec::new())).lock() {

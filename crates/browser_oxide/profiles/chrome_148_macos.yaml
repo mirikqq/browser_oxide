@@ -13,16 +13,16 @@
 # allow_http3, etc.) fall back to their serde defaults — see profile.rs.
 
 # ---- Identity ----
-user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
 browser_name: "Chrome"
-browser_version: "148.0.7778.168"
+browser_version: "147.0.7727.117"
 os_name: "macOS"
 os_version: "15.2"
 platform: "MacIntel"
 vendor: "Google Inc."
 vendor_sub: ""
 product_sub: "20030107"
-app_version: "5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+app_version: "5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
 
 # ---- Hardware ----
 screen_width: 1512

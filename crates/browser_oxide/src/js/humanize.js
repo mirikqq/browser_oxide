@@ -76,7 +76,23 @@
     // the engine can return to the caller as soon as the page's own
     // work settles. Falls back to plain `setTimeout` if the helper isn't
     // installed (test-only paths that bypass timer_bootstrap.js).
-    const _sched = globalThis.__bgSetTimeout || globalThis.setTimeout;
+    // Resolved off the engine namespace: the cleanup pass moves the helper
+    // there and deletes the global, so reading `globalThis.__bgSetTimeout`
+    // always missed and every schedule fell back to plain `setTimeout` — which
+    // pins `run_until_idle` open, exactly what the background timer exists to
+    // avoid.
+    const _sched = (function () {
+        try {
+            const syms = Object.getOwnPropertySymbols(globalThis);
+            for (let i = 0; i < syms.length; i++) {
+                const v = globalThis[syms[i]];
+                if (v && v.__bo && v.host && typeof v.host.__bgSetTimeout === 'function') {
+                    return v.host.__bgSetTimeout;
+                }
+            }
+        } catch (_e) { /* ignore */ }
+        return globalThis.__bgSetTimeout || globalThis.setTimeout;
+    })();
 
     // ---- Behavioural tap for the sensor payload ---------
     // Each event we synthesise also gets recorded into a per-page
@@ -127,51 +143,11 @@
         target.dispatchEvent(event);
     }
 
-    // v0.1.0-parity Fix 5 — keystroke generator wiring. On the first
-    // focusin event for an input/textarea, synthesize a short typing
-    // burst using the Rust-side CMU+Buffalo bigram-modulated LogNormal
-    // schedule. Populates _akRecKey for
-    // the sensor-payload behavioral tap. Single-shot per element
-    // (avoid flooding pages that re-focus a field many times).
-    const _ksFn = ((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return {};})().keystrokes);
-    if (typeof _ksFn === 'function') {
-        const _typedSym = Symbol.for('__browser_oxide_humanize_typed__');
-        document.addEventListener('focusin', function (e) {
-            try {
-                const t = e && e.target;
-                if (!t) return;
-                const tag = t.tagName;
-                if (tag !== 'INPUT' && tag !== 'TEXTAREA') return;
-                if (t[_typedSym]) return;
-                t[_typedSym] = true;
-                // Short token — enough to populate the buffer with a
-                // plausible-shape sample, not enough to leak into the
-                // page's own input listeners on benign forms.
-                const schedule = _ksFn('hi', 50);
-                for (const slot of schedule) {
-                    const key = slot.key, code = slot.code;
-                    _sched(function () {
-                        try {
-                            const ev = new KeyboardEvent('keydown', {
-                                key, code, bubbles: true, cancelable: true,
-                            });
-                            _dispatch(t, ev);
-                            _akRecKey(code, 0);
-                        } catch (_) {}
-                    }, slot.down_ms | 0);
-                    _sched(function () {
-                        try {
-                            const ev = new KeyboardEvent('keyup', {
-                                key, code, bubbles: true, cancelable: true,
-                            });
-                            _dispatch(t, ev);
-                            _akRecKey(code, 1);
-                        } catch (_) {}
-                    }, slot.up_ms | 0);
-                }
-            } catch (_e) {}
-        }, true);
-    }
+    // A phantom typing burst used to fire on the first focus of any input:
+    // two synthesized keystrokes, dispatched at the field itself. The page saw
+    // `keydown`/`keyup` for characters nobody pressed, on the very field the
+    // user was about to fill in — a form validating per keystroke acted on
+    // input that did not exist. Humanize now types only when asked to.
 
     // Box-Muller pair → standard normal sample. Used to draw lognormal
     // velocity-curve quantiles.
@@ -252,6 +228,138 @@
     // dispatches mousemove and pointermove together for the same physical
     // motion. Firing only `mousemove` left half of the vendor's coord buffer
     // empty, contributing to the silent-path penalty.
+    // The element under the pointer, which is where a real move is delivered.
+    //
+    // Each move used to be dispatched three times — once at `window`, once at
+    // `document`, once at `body` — reusing the same event object. A listener on
+    // any of the three saw the same move arrive repeatedly, `event.target` was
+    // whatever had been dispatched at rather than what the pointer was over, and
+    // re-dispatching an event that has already been dispatched is something no
+    // browser does. One dispatch at the hit-tested target, then ordinary
+    // bubbling, is what actually happens.
+    const _hitTarget = (cx, cy) => {
+        try {
+            const el = document.elementFromPoint(cx, cy);
+            if (el) return el;
+        } catch (_e) { /* ignore */ }
+        return document.body || document.documentElement || document;
+    };
+
+    // Screen coordinates come from the profile's own window geometry.
+    //
+    // These were `clientY + 90`: a hardcoded browser-chrome height that held
+    // for exactly one window shape. Every other profile — a different OS, a
+    // maximised window, a mobile preset with no chrome at all — reported a
+    // screenY that disagreed with its own `outerHeight - innerHeight`, and the
+    // pair is trivial for a sensor to cross-check.
+    const _chromeH = () => {
+        const outer = window.outerHeight || window.innerHeight || 0;
+        const inner = window.innerHeight || 0;
+        const d = outer - inner;
+        return d > 0 ? d : 0;
+    };
+    // Where this realm's viewport sits inside the top-level one. The embedder
+    // measures the frame and writes it here; the top realm has no frame and
+    // sits at the origin.
+    const _frameOrigin = () => {
+        try {
+            const f = _boNs && _boNs.frame;
+            if (f) return [f.x || 0, f.y || 0];
+        } catch (_e) { /* ignore */ }
+        return [0, 0];
+    };
+    const _screenXOf = (cx) => Math.round((window.screenX || 0) + _frameOrigin()[0] + cx);
+    const _screenYOf = (cy) =>
+        Math.round((window.screenY || 0) + _chromeH() + _frameOrigin()[1] + cy);
+
+    // ---- Click geometry -------------------------------------------------
+    //
+    // The point a click lands on used to be picked from the raw
+    // `getBoundingClientRect`, with no check that the spot was on screen or
+    // that the element was the thing actually on top there — and if the call
+    // threw, the click went to (0, 0) anyway. A press on a scrolled-away, fully
+    // covered or zero-sized element therefore produced a plausible-looking
+    // event sequence aimed at nothing.
+
+    const _viewport = () => [window.innerWidth || 0, window.innerHeight || 0];
+
+    /// The on-screen part of an element's box, or null when there is none.
+    const _visibleRect = (el) => {
+        let r;
+        try { r = el.getBoundingClientRect(); } catch (_e) { return null; }
+        if (!r || !isFinite(r.left) || !isFinite(r.top)) return null;
+        if (r.width <= 0 || r.height <= 0) return null;
+        const [vw, vh] = _viewport();
+        const left = Math.max(0, r.left);
+        const top = Math.max(0, r.top);
+        const right = Math.min(vw, r.right);
+        const bottom = Math.min(vh, r.bottom);
+        if (right - left <= 0 || bottom - top <= 0) return null;
+        return { left, top, width: right - left, height: bottom - top };
+    };
+
+    const _isHidden = (el) => {
+        try {
+            const st = getComputedStyle(el);
+            if (!st) return false;
+            if (st.display === 'none') return true;
+            if (st.visibility === 'hidden' || st.visibility === 'collapse') return true;
+            const op = parseFloat(st.opacity);
+            if (isFinite(op) && op === 0) return true;
+        } catch (_e) { /* ignore */ }
+        return false;
+    };
+
+    /// Whether the point actually lands on the element — itself or a descendant,
+    /// which is what a real press on a button's inner label does.
+    const _hitOk = (el, x, y) => {
+        let t;
+        try { t = document.elementFromPoint(x, y); } catch (_e) { return true; }
+        if (!t) return false;
+        return t === el || (typeof el.contains === 'function' && el.contains(t));
+    };
+
+    /// A point inside the visible box that the element actually receives.
+    const _pickPoint = (el) => {
+        const r = _visibleRect(el);
+        if (!r) return null;
+        const [vw, vh] = _viewport();
+        const cands = [
+            // Off-centre first: people do not land on the exact centroid.
+            [r.left + r.width * (0.35 + _rand() * 0.3), r.top + r.height * (0.35 + _rand() * 0.3)],
+            [r.left + r.width * 0.5, r.top + r.height * 0.5],
+            [r.left + r.width * 0.25, r.top + r.height * 0.5],
+            [r.left + r.width * 0.75, r.top + r.height * 0.5],
+            [r.left + r.width * 0.5, r.top + r.height * 0.25],
+            [r.left + r.width * 0.5, r.top + r.height * 0.75],
+        ];
+        for (const c of cands) {
+            const x = Math.round(c[0]);
+            const y = Math.round(c[1]);
+            if (x < 0 || y < 0 || x >= vw || y >= vh) continue;
+            if (_hitOk(el, x, y)) return [x, y, Math.max(4, r.width)];
+        }
+        return null;
+    };
+
+    /// Scroll the element into view the way a person does — in steps, through
+    /// the same wheel/scroll pair the page would see from a real wheel.
+    const _bringIntoView = async (el) => {
+        let r;
+        try { r = el.getBoundingClientRect(); } catch (_e) { return; }
+        const [, vh] = _viewport();
+        if (!vh || (r.bottom > 0 && r.top < vh)) return;
+        let remaining = Math.round(r.top - vh * 0.4);
+        const dir = remaining > 0 ? 1 : -1;
+        let guard = 0;
+        while (Math.abs(remaining) > 4 && guard++ < 60) {
+            const step = dir * Math.min(Math.abs(remaining), 90 + Math.round(_rand() * 70));
+            try { _fireScrollStep(step); } catch (_e) { break; }
+            remaining -= step;
+            await _sleep(16 + _rand() * 40);
+        }
+    };
+
     function _fireMove(x, y, prev) {
         const cx = Math.round(x), cy = Math.round(y);
         const mx = prev ? Math.round(x - prev[0]) : 0;
@@ -259,13 +367,11 @@
         const mouseEv = new MouseEvent('mousemove', {
             bubbles: true, cancelable: true, view: window,
             clientX: cx, clientY: cy,
-            screenX: cx, screenY: cy + 90,
+            screenX: _screenXOf(cx), screenY: _screenYOf(cy),
             movementX: mx, movementY: my,
             button: 0, buttons: 0,
         });
-        try { _dispatch(window, mouseEv); } catch (_) {}
-        _dispatch(document, mouseEv);
-        _dispatch(body, mouseEv);
+        _dispatch(_hitTarget(cx, cy), mouseEv);
         // PointerEvent paired emission. Pointer events were added in Chrome
         // 55 and are the modern primary pointer input event; modern sensors
         // and newer fingerprinters listen here in addition to legacy mousemove.
@@ -275,16 +381,14 @@
                 const pEv = new PE('pointermove', {
                     bubbles: true, cancelable: true, view: window,
                     clientX: cx, clientY: cy,
-                    screenX: cx, screenY: cy + 90,
+                    screenX: _screenXOf(cx), screenY: _screenYOf(cy),
                     movementX: mx, movementY: my,
                     button: -1, buttons: 0,
                     pointerType: 'mouse', pointerId: 1,
                     isPrimary: true, pressure: 0,
                     width: 1, height: 1,
                 });
-                try { _dispatch(window, pEv); } catch (_) {}
-                _dispatch(document, pEv);
-                _dispatch(body, pEv);
+                _dispatch(_hitTarget(cx, cy), pEv);
             }
         } catch (_) {}
         _akRecMouse(x, y, 0, 0); // 0 = move, button 0 = left
@@ -427,12 +531,6 @@
     (function _seedHistoricalCoords() {
         const vw = (window.innerWidth || 1920);
         const vh = (window.innerHeight || 1080);
-        // Source the trajectory from the Rust sigma-lognormal generator
-        // (`crates/stealth/src/behavior.rs::mouse_trajectory` — Plamondon
-        // Kinematic Theory, 2-7 strokes, BeCAPTCHA-Mouse-validated σ/μ
-        // distributions, pink-tremor noise). The JS-side triangular
-        // approximation this replaces was distinguishable from real
-        // human motion to a downstream behavioural classifier.
         const fromX = vw * 0.5 + (_rand() - 0.5) * 80;
         const fromY = vh * 0.4 + (_rand() - 0.5) * 80;
         const toX = vw * 0.45 + (_rand() - 0.5) * 200;
@@ -446,8 +544,6 @@
                 traj = JSON.parse(raw || '[]');
             }
         } catch (_) {}
-        // Fallback if op is unavailable: produce a minimal-but-plausible
-        // 12-point linear path so behavior is never empty.
         if (!Array.isArray(traj) || traj.length === 0) {
             traj = [];
             const n = 12;
@@ -460,10 +556,6 @@
                 });
             }
         }
-        // Project the trajectory onto the historical window
-        // [-1800ms, -100ms] before _akT0. Trajectory's own t_ms ranges
-        // from 0 to ~total_ms; rescale linearly. Subsample if the
-        // trajectory has more points than the buffer can hold.
         const maxT = traj.length > 0 ? traj[traj.length - 1].t_ms : 1;
         const stride = Math.max(1, Math.ceil(traj.length / 14));
         let lastX = fromX | 0, lastY = fromY | 0;
@@ -474,18 +566,11 @@
             const x = Math.max(0, Math.min(vw, p.x)) | 0;
             const y = Math.max(0, Math.min(vh, p.y)) | 0;
             if (_akEvents.mouse.length < 200) {
-                _akEvents.mouse.push({
-                    x: x, y: y, t: Math.round(dt),
-                    kind: 0, button: 0,
-                });
+                _akEvents.mouse.push({ x, y, t: Math.round(dt), kind: 0, button: 0 });
             }
             _akEvents.counters.mouse++;
             lastX = x; lastY = y;
         }
-        // Fire a synchronous mousemove + pointermove pair NOW so live
-        // addEventListener subscribers (the vendors' sensor scripts)
-        // see at least one event before any setTimeouts get a
-        // chance. Pairing matches real Chrome's per-physical-event emission.
         try {
             const evOpts = {
                 bubbles: true, cancelable: true, view: window,
@@ -513,11 +598,7 @@
                 try { body.dispatchEvent(pev); } catch (_) {}
             }
         } catch (_) {}
-        // Capture the final position so runCycle's deltas pick up
-        // from where this seeding left off.
-        try {
-            _boNs.input._lastPos = [lastX, lastY];
-        } catch (_) {}
+        try { _boNs.input._lastPos = [lastX, lastY]; } catch (_) {}
     })();
 
     // ---- Human-shaped targeted input -------------------------------------
@@ -595,34 +676,46 @@
 
     async function _humanClick(el) {
         if (!el) return 'нет элемента';
-        let cx = 0, cy = 0, w = 30;
-        try {
-            const r = el.getBoundingClientRect();
-            w = Math.max(4, r.width);
-            // Aim off-centre: humans do not land on the exact centroid.
-            cx = Math.round(r.left + r.width * (0.35 + _rand() * 0.3));
-            cy = Math.round(r.top + r.height * (0.35 + _rand() * 0.3));
-        } catch (_) {}
+        if (_isHidden(el)) return 'элемент скрыт — клика не будет';
+
+        let pick = _pickPoint(el);
+        if (!pick) {
+            // Out of view is not the same as unclickable: bring it in and retry
+            // once, against the box the fresh layout produced.
+            await _bringIntoView(el);
+            pick = _pickPoint(el);
+        }
+        if (!pick) return 'нет видимой точки: элемент обрезан, нулевого размера или перекрыт';
+        const [cx, cy, w] = pick;
 
         await _travelTo(cx, cy, w);
+        // The press goes to whatever is on top at that point — which for a
+        // button with an inner label is the label, exactly as in a browser.
+        let target = el;
+        try {
+            const t = document.elementFromPoint(cx, cy);
+            if (t && (t === el || (typeof el.contains === 'function' && el.contains(t)))) {
+                target = t;
+            }
+        } catch (_e) { /* ignore */ }
 
         const base = {
             bubbles: true, cancelable: true, view: globalThis,
-            clientX: cx, clientY: cy, screenX: cx, screenY: cy + 90,
+            clientX: cx, clientY: cy, screenX: _screenXOf(cx), screenY: _screenYOf(cy),
             button: 0, buttons: 1, detail: 1,
         };
         const PE = (typeof PointerEvent === 'function') ? PointerEvent : null;
         const pointer = { pointerType: 'mouse', pointerId: 1, isPrimary: true };
 
-        if (PE) _fireAt(el, PE, 'pointerover', { ...base, buttons: 0, ...pointer, pressure: 0 });
-        _fireAt(el, MouseEvent, 'mouseover', { ...base, buttons: 0 });
-        _fireAt(el, MouseEvent, 'mousemove', { ...base, buttons: 0 });
+        if (PE) _fireAt(target, PE, 'pointerover', { ...base, buttons: 0, ...pointer, pressure: 0 });
+        _fireAt(target, MouseEvent, 'mouseover', { ...base, buttons: 0 });
+        _fireAt(target, MouseEvent, 'mousemove', { ...base, buttons: 0 });
 
         // Settle before pressing — real pointers rest briefly on the target.
         await _sleep(40 + _rand() * 90);
 
-        if (PE) _fireAt(el, PE, 'pointerdown', { ...base, ...pointer, pressure: 0.5 });
-        _fireAt(el, MouseEvent, 'mousedown', base);
+        if (PE) _fireAt(target, PE, 'pointerdown', { ...base, ...pointer, pressure: 0.5 });
+        _fireAt(target, MouseEvent, 'mousedown', base);
         // Moving focus must take it away from wherever it was. Real browsers fire
         // blur/focusout on the outgoing element, and form libraries (react-hook-form
         // among them) commit the field value on that event — without it the form
@@ -645,9 +738,9 @@
         // Press duration. Human mouse clicks cluster around 60-140 ms.
         await _sleep(60 + _rand() * 80);
 
-        if (PE) _fireAt(el, PE, 'pointerup', { ...base, buttons: 0, ...pointer, pressure: 0 });
-        _fireAt(el, MouseEvent, 'mouseup', { ...base, buttons: 0 });
-        const notCancelled = _fireAt(el, MouseEvent, 'click', { ...base, cancelable: true, buttons: 0 });
+        if (PE) _fireAt(target, PE, 'pointerup', { ...base, buttons: 0, ...pointer, pressure: 0 });
+        _fireAt(target, MouseEvent, 'mouseup', { ...base, buttons: 0 });
+        const notCancelled = _fireAt(target, MouseEvent, 'click', { ...base, cancelable: true, buttons: 0 });
         try { _akRecMouse(cx, cy, 'click', 0); } catch (_) {}
         // The click event alone is not a click: a real browser then runs the
         // target's activation behaviour, which is what submits a form. This path
@@ -708,18 +801,44 @@
         _akEvents.typeElement = _humanType;
         _akEvents.typeSelector = (sel, text) => _humanType(document.querySelector(sel), text);
         _akEvents.moveTo = (x, y) => _travelTo(x, y, 30);
+        // The trusted-event minter, for drivers that build their own event
+        // sequences. A drag cannot be expressed through `clickElement`, and an
+        // untrusted `pointerdown` is worth little to a widget that checks
+        // `isTrusted`. Safe to expose: the namespace is symbol-keyed and the
+        // page cannot reach it, which is the same reason the global was revoked.
+        if (_markTrusted) _akEvents.mark = (ev) => { try { _markTrusted(ev); } catch (_) {} };
     } catch (_) {}
 
-    // Ambient motion is opt-out: a driver that issues its own targeted actions may
-    // not want anything moving in between, and the overlay makes stray motion obvious.
-    let _ambientOn = true;
-    try { _akEvents.setAmbient = function (on) { _ambientOn = !!on; }; } catch (_) {}
-    const _cycleIfEnabled = () => { if (_ambientOn) runCycle(); };
-
-    _cycleIfEnabled();
-    // Every ~7 s, jittered. The old fixed 4 s cadence was both busier than a person
-    // and perfectly periodic — a period that regular is itself a signal.
-    (function reschedule() {
-        setTimeout(function () { _cycleIfEnabled(); reschedule(); }, 5000 + _rand() * 4000);
-    })();
+    // Ambient motion is opt-in, and off by default.
+    //
+    // It used to start itself on load and repeat every ~7 s. Those timers ran
+    // underneath whatever the driver was doing, so a targeted click could have
+    // an ambient `mousemove` land between its own `mousedown` and `mouseup` —
+    // and that stray move carries `buttons: 0` while a button is held, a state
+    // no real pointer ever reports. Nothing moves now unless asked; a driver
+    // that wants idle motion turns it on explicitly.
+    let _ambientOn = false;
+    let _ambientTimer = null;
+    const _scheduleAmbient = () => {
+        _ambientTimer = setTimeout(function () {
+            _ambientTimer = null;
+            if (!_ambientOn) return;
+            runCycle();
+            _scheduleAmbient();
+        }, 5000 + _rand() * 4000);
+    };
+    try {
+        _akEvents.setAmbient = function (on) {
+            const next = !!on;
+            if (next === _ambientOn) return;
+            _ambientOn = next;
+            if (next) {
+                runCycle();
+                _scheduleAmbient();
+            } else if (_ambientTimer !== null) {
+                clearTimeout(_ambientTimer);
+                _ambientTimer = null;
+            }
+        };
+    } catch (_) {}
 })();

@@ -144,14 +144,30 @@
             url = url || globalThis.location?.href;
             if (!url || url === "about:blank") return;
             const cookieStr = await ops.op_cookie_get(url);
-            if (!globalThis.__jsCookies) globalThis.__jsCookies = {};
+            const _st = (function () {
+                if (globalThis._browser_oxide) return globalThis._browser_oxide;
+                try {
+                    const syms = Object.getOwnPropertySymbols(globalThis);
+                    for (let i = 0; i < syms.length; i++) {
+                        const v = globalThis[syms[i]];
+                        if (v && v.__bo && v.host) return v.host.bo;
+                    }
+                } catch (_e) { /* ignore */ }
+                return null;
+            })();
+            // Same store `document.cookie` reads — see `_cookieMirror` in
+            // dom_bootstrap.js. Writing to the deleted global left the getter
+            // permanently empty.
+            const _mirror = _st
+                ? (_st.__jsCookies || (_st.__jsCookies = {}))
+                : (globalThis.__jsCookies || (globalThis.__jsCookies = {}));
             if (!cookieStr) return;
             for (const pair of cookieStr.split(";")) {
                 const eq = pair.indexOf("=");
                 if (eq < 0) continue;
                 const k = pair.slice(0, eq).trim();
                 const v = pair.slice(eq + 1).trim();
-                if (k) globalThis.__jsCookies[k] = v;
+                if (k) _mirror[k] = v;
             }
         } catch (e) { /* ignore */ }
     }

@@ -35,20 +35,20 @@ fn default_media_devices(seed: &str) -> Vec<MediaDeviceInfo> {
     ]
 }
 
-/// Chrome 148 on Windows 10.
+/// Chrome 147 on Windows 10.
 pub fn chrome_148_windows() -> StealthProfile {
     StealthProfile {
         enforce_csp: true,
-        user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36".into(),
+        user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36".into(),
         browser_name: "Chrome".into(),
-        browser_version: "148.0.7778.168".into(),
+        browser_version: "147.0.7727.117".into(),
         os_name: "Windows".into(),
         os_version: "10.0".into(),
         platform: "Win32".into(),
         vendor: "Google Inc.".into(),
         vendor_sub: "".into(),
         product_sub: "20030107".into(),
-        app_version: "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36".into(),
+        app_version: "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36".into(),
 
         screen_width: 1920,
         screen_height: 1080,
@@ -108,35 +108,31 @@ pub fn chrome_148_windows() -> StealthProfile {
     }
 }
 
-/// Chrome 148 on macOS 15. Real Chrome shipped 148 in early May 2026 per
-/// chromiumdash.appspot.com: current stable = 148.0.7778.168 (Mac/Windows),
-/// 148.0.7778.167 (Linux). Tracking the current stable version matters because
-/// an outdated Chrome version is itself a reliable signal. The TLS impersonation
-/// label is still `chrome_147` — an internal codename; not on the wire.
+/// Chrome 147 desktop contract on macOS 15.
 ///
-/// **CRITICAL**: navigator.userAgent reports `Chrome/148.0.0.0` (FROZEN minor versions
+/// **CRITICAL**: navigator.userAgent reports `Chrome/147.0.0.0` (FROZEN minor versions
 /// per Chrome's User-Agent reduction since March 2023 / Chrome 110+). The full version
-/// `148.0.7778.168` is ONLY exposed via sec-ch-ua-full-version-list. Sending the full
+/// `147.0.7727.117` is ONLY exposed via sec-ch-ua-full-version-list. Sending the full
 /// version in the UA string is a divergence from real Chrome behavior — confirmed by
 /// comparing real-browser header captures against our pipeline.
 pub fn chrome_148_macos() -> StealthProfile {
     StealthProfile {
         enforce_csp: true,
-        user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36".into(),
+        user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36".into(),
         browser_name: "Chrome".into(),
         // browser_version stores the FULL version — used by sec-ch-ua-full-version-list
         // and by build_sec_ch_ua's major-version split. The UA string above uses
-        // the reduced 148.0.0.0 form per Chrome's UA-reduction policy.
-        browser_version: "148.0.7778.168".into(),
+        // the reduced 147.0.0.0 form per Chrome's UA-reduction policy.
+        browser_version: "147.0.7727.117".into(),
         os_name: "macOS".into(),
         os_version: "15.2".into(),
         platform: "MacIntel".into(),
         vendor: "Google Inc.".into(),
         vendor_sub: "".into(),
         product_sub: "20030107".into(),
-        app_version: "5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36".into(),
+        app_version: "5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36".into(),
 
-        // Phase 7 — match real Chrome 148 on macOS arm64 (M3 MacBook Pro):
+        // Phase 7 — match real Chrome 147 on macOS arm64 (M3 MacBook Pro):
         // 1512x982 viewport, availHeight 949 (982 - 33 top), colorDepth 30,
         // 8 cpu cores. Verified against a real-browser secure-context probe capture.
         screen_width: 1512,
@@ -205,16 +201,16 @@ pub fn chrome_148_macos() -> StealthProfile {
 pub fn chrome_148_linux() -> StealthProfile {
     StealthProfile {
         enforce_csp: true,
-        user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36".into(),
+        user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36".into(),
         browser_name: "Chrome".into(),
-        browser_version: "148.0.7778.168".into(),
+        browser_version: "147.0.7727.117".into(),
         os_name: "Linux".into(),
         os_version: "6.1".into(),
         platform: "Linux x86_64".into(),
         vendor: "Google Inc.".into(),
         vendor_sub: "".into(),
         product_sub: "20030107".into(),
-        app_version: "5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36".into(),
+        app_version: "5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36".into(),
 
         screen_width: 1920,
         screen_height: 1080,
@@ -279,16 +275,16 @@ pub fn chrome_148_linux() -> StealthProfile {
 pub fn chrome_148_ru() -> StealthProfile {
     StealthProfile {
         enforce_csp: true,
-        user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36".into(),
+        user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36".into(),
         browser_name: "Chrome".into(),
-        browser_version: "148.0.7778.168".into(),
+        browser_version: "147.0.7727.117".into(),
         os_name: "Windows".into(),
         os_version: "10.0".into(),
         platform: "Win32".into(),
         vendor: "Google Inc.".into(),
         vendor_sub: "".into(),
         product_sub: "20030107".into(),
-        app_version: "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36".into(),
+        app_version: "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36".into(),
         screen_width: 1920, screen_height: 1080,
         screen_avail_width: 1920, screen_avail_height: 1040,
         screen_avail_top: 0,
@@ -327,16 +323,16 @@ pub fn chrome_148_ru() -> StealthProfile {
 pub fn chrome_148_cn() -> StealthProfile {
     StealthProfile {
         enforce_csp: true,
-        user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36".into(),
+        user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36".into(),
         browser_name: "Chrome".into(),
-        browser_version: "148.0.7778.168".into(),
+        browser_version: "147.0.7727.117".into(),
         os_name: "Windows".into(),
         os_version: "10.0".into(),
         platform: "Win32".into(),
         vendor: "Google Inc.".into(),
         vendor_sub: "".into(),
         product_sub: "20030107".into(),
-        app_version: "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36".into(),
+        app_version: "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36".into(),
         screen_width: 1920, screen_height: 1080,
         screen_avail_width: 1920, screen_avail_height: 1040,
         screen_avail_top: 0,
@@ -662,19 +658,205 @@ pub fn with_locale(
     base
 }
 
-/// Random desktop profile (picks randomly from presets).
+/// A deterministic RNG for reproducing a generated profile from a seed.
+///
+/// A random fingerprint is only useful if a failing run can be replayed with
+/// the exact one that failed.
+pub fn seeded_rng(seed: u64) -> impl rand::RngExt {
+    use rand::SeedableRng;
+    rand::rngs::StdRng::seed_from_u64(seed)
+}
+
+/// A fresh, self-consistent desktop fingerprint for this launch.
+///
+/// Reusing one static profile is itself a signal: the same canvas hash, the
+/// same screen, the same audio surface from every session out of one address
+/// range clusters trivially. This samples every axis a page can read, but not
+/// independently — fingerprinters cross-check related surfaces, so an
+/// `hardwareConcurrency` that disagrees with the claimed GPU, or a timezone
+/// that disagrees with the locale, is worse than repetition.
+///
+/// The sampling therefore goes top-down: an OS family fixes the platform
+/// strings, the GPU pool, the screen shapes, the device-pixel ratio and the
+/// font stack; a locale fixes language, languages and timezone together.
+/// Seeds for canvas and audio are free — they have no cross-surface partner.
 pub fn random_desktop() -> StealthProfile {
-    use rand::RngExt;
-    let mut rng = rand::rng();
-    let mut profile = match rng.random_range(0..3) {
-        0 => chrome_148_windows(),
-        1 => chrome_148_macos(),
-        _ => chrome_148_linux(),
+    random_desktop_with_rng(&mut rand::rng())
+}
+
+/// As [`random_desktop`] but with a caller-supplied RNG, so a run can be
+/// reproduced from a seed.
+pub fn random_desktop_with_rng(rng: &mut impl rand::RngExt) -> StealthProfile {
+    // (language, languages, timezone) — picked as one unit.
+    const LOCALES: &[(&str, &[&str], &str)] = &[
+        ("en-US", &["en-US", "en"], "America/New_York"),
+        ("en-US", &["en-US", "en"], "America/Chicago"),
+        ("en-US", &["en-US", "en"], "America/Los_Angeles"),
+        ("en-GB", &["en-GB", "en"], "Europe/London"),
+        ("de-DE", &["de-DE", "de", "en-US", "en"], "Europe/Berlin"),
+        ("fr-FR", &["fr-FR", "fr", "en-US", "en"], "Europe/Paris"),
+        ("es-ES", &["es-ES", "es", "en"], "Europe/Madrid"),
+        (
+            "pt-BR",
+            &["pt-BR", "pt", "en-US", "en"],
+            "America/Sao_Paulo",
+        ),
+        ("ru-RU", &["ru-RU", "ru", "en-US", "en"], "Europe/Moscow"),
+        ("pl-PL", &["pl-PL", "pl", "en-US", "en"], "Europe/Warsaw"),
+        ("nl-NL", &["nl-NL", "nl", "en-US", "en"], "Europe/Amsterdam"),
+        ("tr-TR", &["tr-TR", "tr", "en-US", "en"], "Europe/Istanbul"),
+    ];
+
+    let mut p = match rng.random_range(0..3) {
+        // macOS keeps its own sampler: Apple silicon constrains chip, cores,
+        // RAM, screen and GPU together, and that logic already exists.
+        0 => chrome_148_macos_sampled_with_rng(rng),
+        1 => sample_windows(rng),
+        _ => sample_linux(rng),
     };
-    // Randomize seeds
-    profile.canvas_seed = rng.random();
-    profile.audio_seed = rng.random();
-    profile
+
+    // Only the timezone is sampled from the locale table. The *language* is
+    // held at English on purpose: it is the one axis here that no detector
+    // scores — English is ordinary from any address — while a localised UI
+    // makes a challenge unreadable to whoever is driving the browser.
+    // `egress::apply_country` follows the same split.
+    let (_, _, tz) = LOCALES[rng.random_range(0..LOCALES.len())];
+    p.language = "en-US".to_string();
+    p.languages = vec!["en-US".to_string(), "en".to_string()];
+    p.timezone = tz.to_string();
+
+    // Free axes: no surface cross-checks them, and they are what makes the
+    // canvas and AudioContext hashes differ between launches.
+    p.canvas_seed = rng.random();
+    p.audio_seed = rng.random();
+    // Both rates ship on real hardware; 48 kHz is the common default on
+    // Windows and Linux, 44.1 kHz remains widespread on macOS.
+    p.audio_sample_rate = if rng.random_range(0..100) < 60 {
+        48000
+    } else {
+        44100
+    };
+
+    // Network conditions a real connection would report.
+    p.connection_rtt = (rng.random_range(0..14) as u32 + 1) * 25;
+    p.connection_downlink = [1.5, 3.0, 5.0, 7.5, 10.0][rng.random_range(0..5)];
+    p.connection_effective_type = if p.connection_downlink < 2.0 {
+        "3g"
+    } else {
+        "4g"
+    }
+    .to_string();
+
+    p.validate()
+        .expect("сгенерированный профиль не прошёл валидацию");
+    p
+}
+
+/// Windows desktop, with the GPU, screen and core count kept consistent.
+fn sample_windows(rng: &mut impl rand::RngExt) -> StealthProfile {
+    let mut p = chrome_148_windows();
+    // (width, height, avail_height) — logical sizes of common Windows panels.
+    const SCREENS: &[(u32, u32, u32)] = &[
+        (1920, 1080, 1040),
+        (2560, 1440, 1400),
+        (1536, 864, 824),
+        (1680, 1050, 1010),
+        (3840, 2160, 2120),
+    ];
+    let (w, h, avail_h) = SCREENS[rng.random_range(0..SCREENS.len())];
+    apply_screen(&mut p, w, h, avail_h, 111);
+    // 125% and 150% scaling are the Windows defaults on high-DPI panels.
+    p.device_pixel_ratio = [1.0, 1.25, 1.5, 2.0][rng.random_range(0..4)];
+    p.cpu_cores = [4, 6, 8, 12, 16, 20][rng.random_range(0..6)];
+    p.device_memory = [8, 16, 32][rng.random_range(0..3)];
+    const GPUS: &[(&str, &str)] = &[
+        (
+            "Google Inc. (NVIDIA)",
+            "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        ),
+        (
+            "Google Inc. (NVIDIA)",
+            "ANGLE (NVIDIA, NVIDIA GeForce RTX 3080 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        ),
+        (
+            "Google Inc. (NVIDIA)",
+            "ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        ),
+        (
+            "Google Inc. (AMD)",
+            "ANGLE (AMD, AMD Radeon RX 6700 XT Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        ),
+        (
+            "Google Inc. (Intel)",
+            "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        ),
+    ];
+    let (vendor, renderer) = GPUS[rng.random_range(0..GPUS.len())];
+    p.webgl_vendor = vendor.to_string();
+    p.webgl_renderer = renderer.to_string();
+    p.gpu_profile.unmasked_vendor = vendor.to_string();
+    p.gpu_profile.unmasked_renderer = renderer.to_string();
+    // Windows 10 and 11 both report "10.0.0" through Client Hints; the
+    // platform version is what separates them.
+    p.platform_version = ["10.0.0", "13.0.0", "15.0.0"][rng.random_range(0..3)].to_string();
+    p
+}
+
+/// Linux desktop. Integer scaling only — fractional DPR is rare there.
+fn sample_linux(rng: &mut impl rand::RngExt) -> StealthProfile {
+    let mut p = chrome_148_linux();
+    const SCREENS: &[(u32, u32, u32)] = &[
+        (1920, 1080, 1053),
+        (2560, 1440, 1413),
+        (1600, 900, 873),
+        (3840, 2160, 2133),
+    ];
+    let (w, h, avail_h) = SCREENS[rng.random_range(0..SCREENS.len())];
+    apply_screen(&mut p, w, h, avail_h, 74);
+    p.device_pixel_ratio = if rng.random_range(0..100) < 80 {
+        1.0
+    } else {
+        2.0
+    };
+    p.cpu_cores = [4, 8, 12, 16][rng.random_range(0..4)];
+    p.device_memory = [8, 16, 32][rng.random_range(0..3)];
+    const GPUS: &[(&str, &str)] = &[
+        (
+            "Google Inc. (Intel)",
+            "ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.6)",
+        ),
+        (
+            "Google Inc. (AMD)",
+            "ANGLE (AMD, AMD Radeon RX 6600 (radeonsi, navi23), OpenGL 4.6)",
+        ),
+        (
+            "Google Inc. (NVIDIA)",
+            "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060/PCIe/SSE2, OpenGL 4.6)",
+        ),
+    ];
+    let (vendor, renderer) = GPUS[rng.random_range(0..GPUS.len())];
+    p.webgl_vendor = vendor.to_string();
+    p.webgl_renderer = renderer.to_string();
+    p.gpu_profile.unmasked_vendor = vendor.to_string();
+    p.gpu_profile.unmasked_renderer = renderer.to_string();
+    p
+}
+
+/// Screen geometry plus the window sizes derived from it.
+///
+/// `chrome_height` is the browser's own vertical furniture — toolbar, tab
+/// strip, bookmarks bar — which differs per platform. Keeping `inner_*`
+/// derived rather than sampled matters: a viewport that does not fit inside
+/// the screen it claims is an instant mismatch.
+fn apply_screen(p: &mut StealthProfile, w: u32, h: u32, avail_h: u32, chrome_height: u32) {
+    p.screen_width = w;
+    p.screen_height = h;
+    p.screen_avail_width = w;
+    p.screen_avail_height = avail_h;
+    p.outer_width = w;
+    p.outer_height = avail_h;
+    p.inner_width = w;
+    p.inner_height = avail_h.saturating_sub(chrome_height);
 }
 
 /// Apple Silicon Chrome 148 profile sampler.
@@ -701,10 +883,9 @@ pub fn random_desktop() -> StealthProfile {
 /// - **canvas_seed / audio_seed** — fully random per call so canvas
 ///   and AudioContext fingerprints differ across instances.
 ///
-/// `inner_width / outer_width` track `screen_width`. `inner_height`
-/// is `screen_height - 111` (the Chrome toolbar+tab-bar height
-/// observed on Chrome 148 macOS with bookmarks bar visible);
-/// `outer_height = screen_height`.
+/// `inner_width / outer_width` track `screen_width`. The window fills the
+/// available area — `outer_height = screen_avail_height` — and `inner_height`
+/// is that minus 111 (the Chrome 148 macOS toolbar + tab bar + bookmarks bar).
 ///
 /// The GPU profile (`unmasked_renderer = "Apple M3"`) is held fixed.
 /// Per-M-chip GPU strings would require parallel changes to
@@ -798,10 +979,16 @@ pub fn chrome_148_macos_sampled_with_rng(rng: &mut impl rand::RngExt) -> Stealth
     p.screen_avail_width = w;
     p.screen_avail_height = ah;
     p.inner_width = w;
+    // A maximised window fills the *available* area, not the whole screen: the
+    // macOS menu bar always keeps its strip. Deriving the window from the screen
+    // height instead made it taller than the space it could occupy — a shape no
+    // real window has, and one that any script comparing `outerHeight` against
+    // `screen.availHeight` can read straight off.
+    p.screen_avail_top = h.saturating_sub(ah);
     // 111 px = Chrome 148 macOS toolbar + tab bar + bookmarks bar.
-    p.inner_height = h.saturating_sub(111);
+    p.inner_height = ah.saturating_sub(111);
     p.outer_width = w;
-    p.outer_height = h;
+    p.outer_height = ah;
 
     // Per-chip GPU profile so navigator.hardwareConcurrency,
     // WEBGL_UNMASKED_RENDERER, and RAM all describe one real device.
@@ -846,16 +1033,16 @@ pub fn chrome_148_macos_sampled_with_rng(rng: &mut impl rand::RngExt) -> Stealth
 pub fn pixel_9_pro_chrome_148() -> StealthProfile {
     StealthProfile {
         enforce_csp: true,
-        user_agent: "Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro Build/AP4A.250105.002) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Mobile Safari/537.36".into(),
+        user_agent: "Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro Build/AP4A.250105.002) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36".into(),
         browser_name: "Chrome".into(),
-        browser_version: "148.0.7778.168".into(),
+        browser_version: "147.0.7727.117".into(),
         os_name: "Android".into(),
         os_version: "15".into(),
         platform: "Linux armv81".into(),
         vendor: "Google Inc.".into(),
         vendor_sub: "".into(),
         product_sub: "20030107".into(),
-        app_version: "5.0 (Linux; Android 15; Pixel 9 Pro Build/AP4A.250105.002) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Mobile Safari/537.36".into(),
+        app_version: "5.0 (Linux; Android 15; Pixel 9 Pro Build/AP4A.250105.002) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36".into(),
 
         // Pixel 9 Pro: 412 × 870 CSS px, fractional DPR 2.625
         screen_width: 412,
@@ -1160,8 +1347,8 @@ mod tests {
         let profile = chrome_148_windows();
         // Chrome UA-reduction freezes minor versions to 0; only major is in the UA string.
         // Full version lives in browser_version for sec-ch-ua-full-version-list.
-        assert!(profile.user_agent.contains("148.0.0.0"));
-        assert_eq!(profile.browser_version, "148.0.7778.168");
+        assert!(profile.user_agent.contains("147.0.0.0"));
+        assert_eq!(profile.browser_version, "147.0.7727.117");
     }
 
     #[test]

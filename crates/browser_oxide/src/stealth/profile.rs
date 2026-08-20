@@ -294,6 +294,43 @@ impl StealthProfile {
         if self.outer_width < self.inner_width {
             errors.push("outer_width < inner_width".into());
         }
+        // The window chain has to nest: viewport inside window, window inside
+        // the available area, available area inside the screen. A profile that
+        // breaks the chain is self-contradicting, and each pair of numbers is
+        // readable from script.
+        if self.inner_height > self.screen_height {
+            errors.push("inner_height > screen_height".into());
+        }
+        if self.outer_height < self.inner_height {
+            errors.push("outer_height < inner_height".into());
+        }
+        if self.outer_width > self.screen_width {
+            errors.push("outer_width > screen_width".into());
+        }
+        if self.outer_height > self.screen_height {
+            errors.push("outer_height > screen_height".into());
+        }
+        if self.screen_avail_width > self.screen_width {
+            errors.push("screen_avail_width > screen_width".into());
+        }
+        if self.screen_avail_height > self.screen_height {
+            errors.push("screen_avail_height > screen_height".into());
+        }
+        if self.screen_avail_top + self.screen_avail_height > self.screen_height {
+            errors.push("available area extends past the bottom of the screen".into());
+        }
+        if self.outer_width > self.screen_avail_width {
+            errors.push("window is wider than the available area".into());
+        }
+        if self.outer_height > self.screen_avail_height {
+            errors.push("window is taller than the available area".into());
+        }
+        if !(self.device_pixel_ratio.is_finite() && self.device_pixel_ratio > 0.0) {
+            errors.push(format!(
+                "device_pixel_ratio must be positive (got {})",
+                self.device_pixel_ratio
+            ));
+        }
 
         // CPU/memory sanity
         if self.cpu_cores == 0 || self.cpu_cores > 128 {

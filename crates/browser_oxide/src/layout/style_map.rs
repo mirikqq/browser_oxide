@@ -35,6 +35,17 @@ pub fn computed_to_taffy(style: &ComputedStyle, ctx: &ResolveContext) -> taffy::
     ts.max_size.width = css_to_dimension(style, &PropertyId::MaxWidth, ctx);
     ts.max_size.height = css_to_dimension(style, &PropertyId::MaxHeight, ctx);
 
+    // Inset — `top` / `right` / `bottom` / `left`.
+    //
+    // Never mapped before, so taffy laid every positioned box out at its normal
+    // flow position: `position: absolute; left: 60px; top: 40px` landed wherever
+    // the box would have been anyway. A widget that positions a panel against
+    // its anchor drew it somewhere unrelated on the page.
+    ts.inset.top = css_to_inset(style, &PropertyId::Top, ctx);
+    ts.inset.right = css_to_inset(style, &PropertyId::Right, ctx);
+    ts.inset.bottom = css_to_inset(style, &PropertyId::Bottom, ctx);
+    ts.inset.left = css_to_inset(style, &PropertyId::Left, ctx);
+
     // Margin
     ts.margin.top = css_to_lpa(style, &PropertyId::MarginTop, ctx);
     ts.margin.right = css_to_lpa(style, &PropertyId::MarginRight, ctx);
@@ -47,11 +58,32 @@ pub fn computed_to_taffy(style: &ComputedStyle, ctx: &ResolveContext) -> taffy::
     ts.padding.bottom = css_to_lp(style, &PropertyId::PaddingBottom, ctx);
     ts.padding.left = css_to_lp(style, &PropertyId::PaddingLeft, ctx);
 
-    // Border
-    ts.border.top = css_to_border(style, &PropertyId::BorderTopWidth, ctx);
-    ts.border.right = css_to_border(style, &PropertyId::BorderRightWidth, ctx);
-    ts.border.bottom = css_to_border(style, &PropertyId::BorderBottomWidth, ctx);
-    ts.border.left = css_to_border(style, &PropertyId::BorderLeftWidth, ctx);
+    // Border. The used width is zero unless a style is set, whatever the
+    // width says — `border-width` alone draws and occupies nothing.
+    ts.border.top = css_to_border(
+        style,
+        &PropertyId::BorderTopWidth,
+        &PropertyId::BorderTopStyle,
+        ctx,
+    );
+    ts.border.right = css_to_border(
+        style,
+        &PropertyId::BorderRightWidth,
+        &PropertyId::BorderRightStyle,
+        ctx,
+    );
+    ts.border.bottom = css_to_border(
+        style,
+        &PropertyId::BorderBottomWidth,
+        &PropertyId::BorderBottomStyle,
+        ctx,
+    );
+    ts.border.left = css_to_border(
+        style,
+        &PropertyId::BorderLeftWidth,
+        &PropertyId::BorderLeftStyle,
+        ctx,
+    );
 
     // Flex
     if let Some(CssValue::FlexDirection(fd)) = style.get(&PropertyId::FlexDirection) {
@@ -127,6 +159,24 @@ fn css_to_dimension(
     }
 }
 
+/// Inset differs from margin in its missing value: an unset inset is `auto`,
+/// which leaves the box where flow put it, while an unset margin is zero.
+fn css_to_inset(
+    style: &ComputedStyle,
+    prop: &PropertyId,
+    ctx: &ResolveContext,
+) -> taffy::LengthPercentageAuto {
+    use crate::css_values::types::length::LengthPercentageAuto as CssLPA;
+    match style.get(prop) {
+        Some(CssValue::LengthPercentageAuto(lpa)) => match lpa {
+            CssLPA::Length(l) => taffy::LengthPercentageAuto::length(resolve_length(l, ctx)),
+            CssLPA::Percentage(p) => taffy::LengthPercentageAuto::percent(*p as f32 / 100.0),
+            CssLPA::Auto | CssLPA::Calc(_) => taffy::LengthPercentageAuto::auto(),
+        },
+        _ => taffy::LengthPercentageAuto::auto(),
+    }
+}
+
 fn css_to_lpa(
     style: &ComputedStyle,
     prop: &PropertyId,
@@ -161,10 +211,21 @@ fn css_to_lp(
 
 fn css_to_border(
     style: &ComputedStyle,
-    prop: &PropertyId,
+    width_prop: &PropertyId,
+    style_prop: &PropertyId,
     ctx: &ResolveContext,
 ) -> taffy::LengthPercentage {
-    match style.get(prop) {
+    // `border-style: none` (the initial value) collapses the used width to
+    // zero. Taking the specified width unconditionally put the initial `medium`
+    // — 3px — on every side of every element in the document.
+    match style.get(style_prop) {
+        Some(CssValue::BorderStyle(bs)) if bs.is_blank() => {
+            return taffy::LengthPercentage::length(0.0)
+        }
+        None => return taffy::LengthPercentage::length(0.0),
+        _ => {}
+    }
+    match style.get(width_prop) {
         Some(CssValue::Length(l)) => taffy::LengthPercentage::length(resolve_length(l, ctx)),
         _ => taffy::LengthPercentage::length(0.0),
     }

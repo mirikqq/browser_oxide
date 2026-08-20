@@ -30,6 +30,10 @@ pub fn parse_property(
         "margin" => return parse_box_shorthand(value_trimmed, important, "margin"),
         "padding" => return parse_box_shorthand(value_trimmed, important, "padding"),
         "overflow" => return parse_overflow_shorthand(value_trimmed, important),
+        "inset" => return parse_box_shorthand(value_trimmed, important, "inset"),
+        "border" | "border-top" | "border-right" | "border-bottom" | "border-left" => {
+            return parse_border_shorthand(value_trimmed, important, &name_lower)
+        }
         _ => {}
     }
 
@@ -41,11 +45,16 @@ pub fn parse_property(
             parse_length_percentage_auto(value_trimmed)?
         }
         "max-width" | "max-height" => parse_length_percentage_auto_none(value_trimmed)?,
+        // Inset. `auto` is the initial value, so the same parser as margin fits.
+        "top" | "right" | "bottom" | "left" => parse_length_percentage_auto(value_trimmed)?,
         "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
             parse_length_percentage_auto(value_trimmed)?
         }
         "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => {
             parse_length_percentage(value_trimmed)?
+        }
+        "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => {
+            parse_border_style(value_trimmed)?
         }
         "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width" => {
             parse_border_width(value_trimmed)?
@@ -195,6 +204,102 @@ fn parse_length_percentage(value: &[ComponentValue<'_>]) -> Result<CssValue, Val
     Err(ValueError::InvalidValue(
         "expected length or percentage".into(),
     ))
+}
+
+fn parse_border_style(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
+    use crate::css_values::types::display::BorderStyle;
+    let ident = value
+        .iter()
+        .find_map(try_ident)
+        .ok_or_else(|| ValueError::InvalidValue("border-style expects a keyword".into()))?;
+    let style = match ident.to_ascii_lowercase().as_str() {
+        "none" => BorderStyle::None,
+        "hidden" => BorderStyle::Hidden,
+        "solid" => BorderStyle::Solid,
+        "dashed" => BorderStyle::Dashed,
+        "dotted" => BorderStyle::Dotted,
+        "double" => BorderStyle::Double,
+        "groove" => BorderStyle::Groove,
+        "ridge" => BorderStyle::Ridge,
+        "inset" => BorderStyle::Inset,
+        "outset" => BorderStyle::Outset,
+        other => {
+            return Err(ValueError::InvalidValue(format!(
+                "invalid border-style: {}",
+                other
+            )))
+        }
+    };
+    Ok(CssValue::BorderStyle(style))
+}
+
+/// `border` and its per-side forms.
+///
+/// The shorthand was not handled at all, so `border: 1px solid #ccc` was dropped
+/// on the floor while the initial `medium` width applied anyway — an author's
+/// thin border came out 3px thick on every side.
+fn parse_border_shorthand(
+    value: &[ComponentValue<'_>],
+    important: bool,
+    name: &str,
+) -> Result<Vec<PropertyDeclaration>, ValueError> {
+    let parts: Vec<&ComponentValue<'_>> = value
+        .iter()
+        .filter(|v| {
+            !matches!(
+                v,
+                ComponentValue::Token(Token {
+                    kind: TokenKind::Whitespace,
+                    ..
+                })
+            )
+        })
+        .collect();
+
+    // Components may appear in any order; each is recognised by its own shape.
+    let mut width: Option<CssValue> = None;
+    let mut style: Option<CssValue> = None;
+    for part in &parts {
+        let one = std::slice::from_ref(*part);
+        if style.is_none() && parse_border_style(one).is_ok() {
+            style = parse_border_style(one).ok();
+            continue;
+        }
+        if width.is_none() {
+            if let Ok(w) = parse_border_width(one) {
+                width = Some(w);
+                continue;
+            }
+        }
+        // Anything else is the colour, which layout does not consume.
+    }
+    // `border: none` and `border: 0` both mean no border box, from either side.
+    let style = style.unwrap_or(CssValue::BorderStyle(
+        crate::css_values::types::display::BorderStyle::None,
+    ));
+    let width = width.unwrap_or(CssValue::Length(Length::Px(3.0)));
+
+    let sides: &[&str] = match name {
+        "border-top" => &["top"],
+        "border-right" => &["right"],
+        "border-bottom" => &["bottom"],
+        "border-left" => &["left"],
+        _ => &["top", "right", "bottom", "left"],
+    };
+    let mut out = Vec::with_capacity(sides.len() * 2);
+    for side in sides {
+        out.push(PropertyDeclaration {
+            property: PropertyId::from_name(&format!("border-{}-width", side)),
+            value: width.clone(),
+            important,
+        });
+        out.push(PropertyDeclaration {
+            property: PropertyId::from_name(&format!("border-{}-style", side)),
+            value: style.clone(),
+            important,
+        });
+    }
+    Ok(out)
 }
 
 fn parse_border_width(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
@@ -768,8 +873,15 @@ fn parse_box_shorthand(
     let values = [top, right, bottom, left];
     let mut declarations = Vec::new();
 
+    // `inset`'s longhands are bare `top`/`right`/`bottom`/`left`, and like
+    // margin they accept `auto`; padding does not.
+    let auto_typed = prefix == "margin" || prefix == "inset";
     for (side, val) in sides.iter().zip(values.iter()) {
-        let prop_name = format!("{}-{}", prefix, side);
+        let prop_name = if prefix == "inset" {
+            (*side).to_string()
+        } else {
+            format!("{}-{}", prefix, side)
+        };
         let cv = if let Some(ident) = try_ident(val) {
             if ident.eq_ignore_ascii_case("auto") {
                 CssValue::LengthPercentageAuto(LengthPercentageAuto::Auto)
@@ -782,14 +894,14 @@ fn parse_box_shorthand(
         } else if let Some(lp) = try_length_percentage(val) {
             match lp {
                 LengthPercentage::Length(l) => {
-                    if prefix == "margin" {
+                    if auto_typed {
                         CssValue::LengthPercentageAuto(LengthPercentageAuto::Length(l))
                     } else {
                         CssValue::LengthPercentage(LengthPercentage::Length(l))
                     }
                 }
                 LengthPercentage::Percentage(p) => {
-                    if prefix == "margin" {
+                    if auto_typed {
                         CssValue::LengthPercentageAuto(LengthPercentageAuto::Percentage(p))
                     } else {
                         CssValue::LengthPercentage(LengthPercentage::Percentage(p))

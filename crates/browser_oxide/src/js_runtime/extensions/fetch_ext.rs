@@ -776,6 +776,131 @@ pub fn op_net_xhr_sync(
     result
 }
 
+/// Result of loading an `<img>` resource.
+#[derive(serde::Serialize)]
+pub struct ImgLoadResult {
+    pub ok: bool,
+    pub width: u32,
+    pub height: u32,
+    /// Id of the decoded pixels in `CanvasState`, so `drawImage(img, …)` has
+    /// something to sample. `-1` when the load failed.
+    pub id: i32,
+}
+
+/// Fetch and decode an image, returning its intrinsic size.
+///
+/// `<img>` used to be a pure stub: no request was ever made, `complete` was a
+/// hardcoded `true`, and `naturalWidth`/`naturalHeight` read the `width`/
+/// `height` *content attributes* — so an image without those attributes
+/// reported `0x0` while claiming to be complete, a combination a real browser
+/// cannot produce. Nothing rendered, and neither `load` nor `error` ever fired,
+/// so any widget that waits for its images (hCaptcha's challenge tiles, for
+/// one) waited forever.
+///
+/// Goes through the page's own session client, so cookies, TLS fingerprint and
+/// headers match every other request the document makes.
+#[op2(async(lazy), fast)]
+#[serde]
+pub async fn op_img_load(
+    state: std::rc::Rc<std::cell::RefCell<OpState>>,
+    #[string] url: String,
+) -> ImgLoadResult {
+    let fail = ImgLoadResult {
+        ok: false,
+        width: 0,
+        height: 0,
+        id: -1,
+    };
+
+    /// Keep the pixels: a decoded `<img>` is a valid `drawImage` source, and
+    /// without the bytes on hand every such draw is a no-op.
+    fn store(
+        state: &std::rc::Rc<std::cell::RefCell<OpState>>,
+        decoded: Option<(Vec<u8>, u32, u32)>,
+    ) -> Option<ImgLoadResult> {
+        let (rgba, w, h) = decoded?;
+        let mut op_state = state.borrow_mut();
+        let id = op_state
+            .borrow_mut::<crate::js_runtime::extensions::canvas_ext::CanvasState>()
+            .store_image(rgba, w, h);
+        Some(ImgLoadResult {
+            ok: true,
+            width: w,
+            height: h,
+            id,
+        })
+    }
+
+    // `data:` images carry their own bytes — no network, and the session client
+    // cannot fetch them anyway.
+    if let Some(rest) = url.strip_prefix("data:") {
+        let Some((meta, payload)) = rest.split_once(',') else {
+            return fail;
+        };
+        let bytes = if meta.ends_with(";base64") {
+            match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload.trim())
+            {
+                Ok(b) => b,
+                Err(_) => return fail,
+            }
+        } else {
+            percent_decode_bytes(payload)
+        };
+        return store(&state, crate::canvas::Canvas2D::decode_image(&bytes)).unwrap_or(fail);
+    }
+
+    // `blob:` has no network behind it — the bytes are already in the registry
+    // that `URL.createObjectURL` filled. A page that fetches an image itself and
+    // shows it through an object URL (hCaptcha's challenge tiles among them)
+    // would otherwise get an `error` for a picture it already holds.
+    if url.starts_with("blob:") {
+        let bytes = crate::js_runtime::extensions::worker_ext::blob_bytes(&url);
+        return match bytes.and_then(|b| crate::canvas::Canvas2D::decode_image(&b)) {
+            Some(decoded) => store(&state, Some(decoded)).unwrap_or(fail),
+            None => fail,
+        };
+    }
+
+    let Some(client) = FETCH_CLIENT.with(|c| c.borrow().clone()) else {
+        return fail;
+    };
+    // Bounded, because an `<img>` whose fetch never returns is an element that
+    // never fires `load` *or* `error` and stays `complete === false` for good.
+    // A browser gives up and reports an error; without that, a widget waiting
+    // on its images waits forever — measured on hCaptcha's tile grid, where a
+    // few tiles sat on their loading placeholder permanently.
+    const IMG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+    let fetched = tokio::time::timeout(IMG_TIMEOUT, client.get(&url)).await;
+    let Ok(Ok(resp)) = fetched else {
+        return fail;
+    };
+    if !resp.ok() {
+        return fail;
+    }
+    // A 200 that is not a decodable image is an `error` for the element,
+    // exactly as in a browser.
+    store(&state, crate::canvas::Canvas2D::decode_image(&resp.body)).unwrap_or(fail)
+}
+
+/// Minimal `%XX` decoding for non-base64 `data:` payloads.
+fn percent_decode_bytes(s: &str) -> Vec<u8> {
+    let raw = s.as_bytes();
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'%' && i + 2 < raw.len() {
+            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(raw[i]);
+        i += 1;
+    }
+    out
+}
+
 deno_core::extension!(
     fetch_extension,
     ops = [
@@ -785,6 +910,7 @@ deno_core::extension!(
         op_cookie_set_sync,
         op_net_fetch_sync,
         op_net_xhr_sync,
-        op_drain_csp_violations
+        op_drain_csp_violations,
+        op_img_load
     ],
 );

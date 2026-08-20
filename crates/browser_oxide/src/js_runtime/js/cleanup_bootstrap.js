@@ -679,7 +679,11 @@
         '_customElementsRegistry',
         '__bootstrap',
         '__browser_oxide',
-        '__syncCookiesFromNet',
+        // NOT '__syncCookiesFromNet': this purge runs before the host-move
+        // block below, so listing it here deleted the function before it could
+        // be preserved — and the engine's post-navigation call then silently
+        // did nothing, leaving `document.cookie` empty for the page's whole
+        // life while cookies kept flowing correctly at the HTTP layer.
         '__documentReadyState',
         '__drainCspViolations',
         '__onNodeInserted',
@@ -778,23 +782,37 @@
         // does NOT re-install it on the warm path. So snapshot the values
         // at baseline and RESTORE them, which nulls page assignments while
         // preserving the engine's.
+        // `on*` names from the object *and* its prototype chain. Own names alone
+        // used to be enough, because a page's `document.onclick = fn` created an
+        // own property. It no longer does: those handlers are now accessors on
+        // `Document.prototype` (Chrome's shape) writing to a private store, so an
+        // own-names sweep saw nothing and a page-authored handler survived into
+        // the next navigation on a pooled page.
+        const _onNames = (target) => {
+            const names = new Set();
+            let o = target;
+            while (o && o !== Object.prototype) {
+                try {
+                    for (const k of Object.getOwnPropertyNames(o)) {
+                        if (k.startsWith('on')) names.add(k);
+                    }
+                } catch (_e) { /* ignore */ }
+                try { o = Object.getPrototypeOf(o); } catch (_e) { break; }
+            }
+            return names;
+        };
         const _snapshotOnHandlers = (target) => {
             const m = new Map();
             if (!target) return m;
-            let names;
-            try { names = Object.getOwnPropertyNames(target); } catch (_e) { return m; }
-            for (const k of names) {
-                if (!k.startsWith('on')) continue;
+            for (const k of _onNames(target)) {
                 try { m.set(k, target[k]); } catch (_e) {}
             }
             return m;
         };
         const _restoreOnHandlers = (target, baseline) => {
             if (!target || !baseline) return;
-            let names;
-            try { names = Object.getOwnPropertyNames(target); } catch (_e) { return; }
+            const names = _onNames(target);
             for (const k of names) {
-                if (!k.startsWith('on')) continue;
                 try {
                     if (typeof target[k] !== 'function') continue;
                     const orig = baseline.get(k);
@@ -980,7 +998,7 @@
                 '__bgSetTimeout', '__boResult', '__cancelAllListeners',
                 '__cancelAllTimers', '__markGlobalsBaseline', '__pendingNavigation',
                 '__resetCustomElements', '__resetDomRegistries', '__resetPageGlobals',
-                '__ifAppendCount', '__jsCookies',
+                '__ifAppendCount', '__jsCookies', '__syncCookiesFromNet',
             ]) {
                 if (name in globalThis) host[name] = globalThis[name];
                 try { delete globalThis[name]; } catch (_e) {}
@@ -989,6 +1007,50 @@
             Object.defineProperty(_ns, 'host', {
                 value: host, writable: true, enumerable: false, configurable: true,
             });
+        }
+    } catch (_e) { /* best effort */ }
+
+    // WebIDL interface objects are non-enumerable; attributes and operations
+    // are not. Bootstraps that install a constructor with a plain
+    // `globalThis.X = …` make it enumerable, so it shows up in
+    // `Object.keys(window)` where a real Chrome has nothing — 51 of them,
+    // measured against a real-browser capture. Fixed here rather than at each
+    // install site, so a constructor added later cannot reintroduce it.
+    try {
+        for (const name of Object.keys(globalThis)) {
+            const first = name.charCodeAt(0);
+            if (first < 65 || first > 90) continue;
+            const d = Object.getOwnPropertyDescriptor(globalThis, name);
+            if (!d || !d.enumerable || !d.configurable) continue;
+            const v = d.value;
+            if (typeof v !== 'function' || !v.prototype) continue;
+            Object.defineProperty(globalThis, name, {
+                value: v,
+                writable: d.writable !== false,
+                enumerable: false,
+                configurable: true,
+            });
+        }
+    } catch (_e) { /* best effort */ }
+
+    // `queueMicrotask` is an operation, not an interface object, so Chrome
+    // enumerates it. Ours was replaced above by assignment, which keeps
+    // whatever enumerability deno_core gave it.
+    try {
+        const d = Object.getOwnPropertyDescriptor(globalThis, 'queueMicrotask');
+        if (d && !d.enumerable && d.configurable) {
+            Object.defineProperty(globalThis, 'queueMicrotask', { ...d, enumerable: true });
+        }
+    } catch (_e) { /* best effort */ }
+
+    // Legacy quota constants Chrome still carries on `window`, both enumerable.
+    try {
+        for (const [name, value] of [['TEMPORARY', 0], ['PERSISTENT', 1]]) {
+            if (!(name in globalThis)) {
+                Object.defineProperty(globalThis, name, {
+                    value, writable: false, enumerable: true, configurable: false,
+                });
+            }
         }
     } catch (_e) { /* best effort */ }
 

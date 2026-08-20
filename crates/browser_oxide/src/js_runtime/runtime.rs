@@ -210,10 +210,12 @@ pub fn create_runtime_with_signals(
     // session (cookie/profile-consistent with the nav). Built before
     // `stealth_profile` is moved into StealthState below. Without it, module
     // SPA bundles throw SyntaxError and are dropped (the thin-render gap).
+    let module_base = crate::js_runtime::module_loader::DocumentBaseUrl::default();
     let module_loader: Option<std::rc::Rc<dyn deno_core::ModuleLoader>> =
         options.stealth_profile.as_ref().map(|p| {
             std::rc::Rc::new(crate::js_runtime::module_loader::BrowserModuleLoader::new(
                 p.clone(),
+                module_base.clone(),
             )) as std::rc::Rc<dyn deno_core::ModuleLoader>
         });
 
@@ -286,6 +288,7 @@ pub fn create_runtime_with_signals(
     let nav_signal = NavSignal::new();
 
     // Insert states into OpState
+    runtime.op_state().borrow_mut().put(module_base);
     runtime.op_state().borrow_mut().put(state);
     runtime.op_state().borrow_mut().put(TimerState::new());
     runtime.op_state().borrow_mut().put(PerfState::new());

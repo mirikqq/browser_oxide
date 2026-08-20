@@ -40,18 +40,44 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// The document's base URL, shared between the loader and the page that
+/// navigates it.
+///
+/// A dynamic `import()` issued from a *classic* script is resolved by
+/// deno_core against that script's name, which is not a URL — so
+/// `import('/dist/app.js')` failed with "relative URL without a base" and every
+/// code-split bundle died silently. A browser resolves it against the
+/// document's base URL, which is what this carries.
+#[derive(Clone, Default)]
+pub struct DocumentBaseUrl(std::rc::Rc<std::cell::RefCell<Option<ModuleSpecifier>>>);
+
+impl DocumentBaseUrl {
+    pub fn set(&self, url: &str) {
+        *self.0.borrow_mut() = ModuleSpecifier::parse(url).ok();
+    }
+
+    fn get(&self) -> Option<ModuleSpecifier> {
+        self.0.borrow().clone()
+    }
+}
+
 /// Fetches ES-module sources through browser_oxide's shared HTTP session.
 pub struct BrowserModuleLoader {
     profile: StealthProfile,
     /// Cached client on the shared session jar (cookie-consistent with the
     /// page nav). `None` only if the connector failed to build.
     client: Option<HttpClient>,
+    base: DocumentBaseUrl,
 }
 
 impl BrowserModuleLoader {
-    pub fn new(profile: StealthProfile) -> Self {
+    pub fn new(profile: StealthProfile, base: DocumentBaseUrl) -> Self {
         let client = HttpClient::shared(&profile).ok();
-        Self { profile, client }
+        Self {
+            profile,
+            client,
+            base,
+        }
     }
 }
 
@@ -63,7 +89,21 @@ impl ModuleLoader for BrowserModuleLoader {
         _kind: ResolutionKind,
     ) -> Result<ModuleSpecifier, ModuleLoaderError> {
         // Spec-compliant relative-specifier resolution against the referrer.
-        resolve_import(specifier, referrer).map_err(|e| ModuleLoaderError::generic(e.to_string()))
+        match resolve_import(specifier, referrer) {
+            Ok(url) => Ok(url),
+            Err(e) => {
+                // The referrer is not a usable base — a dynamic `import()` out
+                // of a classic script, whose "referrer" is the script name
+                // deno_core was handed. Resolve against the document's base
+                // URL, as a browser does.
+                match self.base.get() {
+                    Some(base) => base
+                        .join(specifier)
+                        .map_err(|e| ModuleLoaderError::generic(e.to_string())),
+                    None => Err(ModuleLoaderError::generic(e.to_string())),
+                }
+            }
+        }
     }
 
     fn load(
