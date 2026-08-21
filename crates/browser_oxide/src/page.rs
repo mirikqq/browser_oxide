@@ -8,6 +8,60 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+const DEVVIEW_CANVAS_MANIFEST_JS: &str = r#"(function(){return JSON.stringify([].map.call(document.querySelectorAll('canvas'),function(c,i){var r=c.getBoundingClientRect(),s=getComputedStyle(c);return{canvas_index:i,id:c._canvasId|0,rect:[r.left,r.top,r.width,r.height],viewport:[innerWidth,innerHeight],dpr:devicePixelRatio||1,visible:s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)>0&&r.width>0&&r.height>0};}));})()"#;
+
+/// Stable address of a document realm in the diagnostic frame tree.
+#[doc(hidden)]
+pub type FramePath = Vec<u32>;
+
+/// Canvas surface identity. `generation` prevents a recreated document from
+/// accidentally reusing a bitmap cached for its predecessor.
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevviewCanvasKey {
+    pub frame_path: FramePath,
+    pub generation: u64,
+    pub canvas_id: i32,
+}
+
+/// Engine geometry and backing-store state for one visible canvas.
+#[doc(hidden)]
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevviewCanvasMeta {
+    pub key: DevviewCanvasKey,
+    pub canvas_index: usize,
+    pub revision: u64,
+    pub backing_size: [u32; 2],
+    pub css_rect: [f64; 4],
+    pub viewport: [f64; 2],
+    pub dpr: f64,
+    pub visible: bool,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevviewFrameSnapshot {
+    pub frame_path: FramePath,
+    pub parent_path: FramePath,
+    pub slot: Option<usize>,
+    pub generation: u64,
+    pub css_rect: [f64; 4],
+    pub html: String,
+}
+
+#[derive(serde::Deserialize)]
+struct DevviewCanvasNode {
+    canvas_index: usize,
+    id: i32,
+    rect: [f64; 4],
+    viewport: [f64; 2],
+    dpr: f64,
+    visible: bool,
+}
+
 /// Whether a URL is a "secure context" per WICG/secure-contexts §3.2.
 /// Secure: https, wss, file, plus http://localhost / http://127.0.0.1 /
 /// http://[::1] / *.localhost loopback exceptions. Drives `isSecureContext`
@@ -1077,6 +1131,8 @@ impl Page {
             // able to reach back.
             let js = format!(
                 "(function(){{var m={json};\
+                 var ro=(globalThis.location&&globalThis.location.origin)||'null';\
+                 if(m.targetOrigin&&m.targetOrigin!=='*'&&m.targetOrigin!==ro)return;\
                  var ev=new MessageEvent('message',\
                    {{data:m.data,origin:m.origin,source:globalThis.parent||null}});\
                  globalThis.dispatchEvent(ev);}})()"
@@ -1106,6 +1162,8 @@ impl Page {
         for (node_id, json) in inbound {
             let js = format!(
                 "(function(){{var m={json};\
+                 var ro=(globalThis.location&&globalThis.location.origin)||'null';\
+                 if(m.targetOrigin&&m.targetOrigin!=='*'&&m.targetOrigin!==ro)return;\
                  var src=null;\
                  try{{src={NS_RESOLVE}.frames.windowForNode({node_id});}}catch(_){{}}\
                  var ev=new MessageEvent('message',{{data:m.data,origin:m.origin,source:src}});\
@@ -1114,6 +1172,11 @@ impl Page {
             if self.event_loop.execute_script(&js).is_ok() {
                 to_parent += 1;
             }
+        }
+        for child in &mut self.children {
+            let (nested_down, nested_up) = child.pump_descendant_messages();
+            to_children += nested_down;
+            to_parent += nested_up;
         }
         (to_children, to_parent)
     }
@@ -1177,9 +1240,7 @@ impl Page {
     pub async fn drive_children(&mut self, slice: Duration) -> usize {
         let mut n = 0;
         for child in self.children.iter_mut() {
-            if child.event_loop.run_until_idle(slice).await.is_ok() {
-                n += 1;
-            }
+            n += child.drive_descendants(slice).await;
         }
         n
     }
@@ -1206,10 +1267,16 @@ impl Page {
                 .try_borrow::<crate::js_runtime::extensions::stealth_ext::StealthState>()
                 .and_then(|s| s.profile.clone())
         }?;
-        let n = self.rematerialize_iframes(&url, &client, &profile).await;
+        let mut n = self.rematerialize_iframes(&url, &client, &profile).await;
+        for child in &mut self.children {
+            n += child.materialize_descendants(&client, &profile).await;
+        }
         // Fresh realms start without a box; give them one before any script in
         // them reads `innerWidth` or places an event.
         self.sync_frame_geometry();
+        for child in &mut self.children {
+            child.sync_descendant_geometry();
+        }
         Some(n)
     }
 
@@ -1265,34 +1332,11 @@ impl Page {
             let dom_state = state.borrow_mut::<crate::js_runtime::state::DomState>();
             std::mem::take(&mut dom_state.invalidated_frames)
         };
-        if !invalidated.is_empty() {
-            // A mutation only says the frame *may* have navigated. Rebuilding on
-            // the signal alone is an unbounded fetch loop — widgets re-append and
-            // re-attribute their own frames on every tick — so the realm is
-            // discarded only when its element is gone or its source actually
-            // changed.
-            let live: std::collections::HashMap<u32, String> = iframes
-                .iter()
-                .map(|i| {
-                    let src = i
-                        .srcdoc
-                        .clone()
-                        .or_else(|| i.src.clone())
-                        .unwrap_or_default();
-                    (i.node_id.to_raw(), src)
-                })
-                .collect();
-            self.children.retain(|c| {
-                let id = c.node_id.to_raw();
-                if !invalidated.contains(&id) {
-                    return true;
-                }
-                match live.get(&id) {
-                    None => false,
-                    Some(src) => src == &c.source,
-                }
-            });
-        }
+        let live: Vec<u32> = iframes.iter().map(|i| i.node_id.to_raw()).collect();
+        self.children.retain(|child| {
+            let id = child.node_id.to_raw();
+            live.contains(&id) && !invalidated.contains(&id)
+        });
 
         let already: Vec<_> = self.children.iter().map(|c| c.node_id).collect();
         let mut materialized = 0usize;
@@ -1338,6 +1382,281 @@ impl Page {
             }
         }
         materialized
+    }
+
+    fn devview_canvas_manifest_for(
+        event_loop: &mut BrowserEventLoop,
+        frame_path: FramePath,
+        generation: u64,
+    ) -> Vec<DevviewCanvasMeta> {
+        let Ok(json) = event_loop.execute_script(DEVVIEW_CANVAS_MANIFEST_JS) else {
+            return Vec::new();
+        };
+        let Ok(nodes) = serde_json::from_str::<Vec<DevviewCanvasNode>>(&json) else {
+            return Vec::new();
+        };
+        let op_state = event_loop.runtime_mut().op_state();
+        let state = op_state.borrow();
+        let Some(canvases) =
+            state.try_borrow::<crate::js_runtime::extensions::canvas_ext::CanvasState>()
+        else {
+            return Vec::new();
+        };
+        nodes
+            .into_iter()
+            .filter_map(|node| {
+                let (revision, width, height) = canvases.devview_meta(node.id)?;
+                Some(DevviewCanvasMeta {
+                    key: DevviewCanvasKey {
+                        frame_path: frame_path.clone(),
+                        generation,
+                        canvas_id: node.id,
+                    },
+                    canvas_index: node.canvas_index,
+                    revision,
+                    backing_size: [width, height],
+                    css_rect: node.rect,
+                    viewport: node.viewport,
+                    dpr: node.dpr,
+                    visible: node.visible,
+                })
+            })
+            .collect()
+    }
+
+    fn devview_canvas_manifest_children(
+        children: &mut [iframe::ChildIframe],
+        parent_path: &[u32],
+        out: &mut Vec<DevviewCanvasMeta>,
+    ) {
+        for child in children {
+            let mut path = parent_path.to_vec();
+            path.push(child.node_id.to_raw());
+            out.extend(Self::devview_canvas_manifest_for(
+                &mut child.event_loop,
+                path.clone(),
+                child.generation,
+            ));
+            Self::devview_canvas_manifest_children(&mut child.children, &path, out);
+        }
+    }
+
+    /// Full canvas manifest for Devview. This bypasses page-visible canvas
+    /// serialization and therefore never applies fingerprint jitter.
+    #[doc(hidden)]
+    pub fn devview_canvas_manifest(&mut self) -> Vec<DevviewCanvasMeta> {
+        let mut out = Self::devview_canvas_manifest_for(&mut self.event_loop, Vec::new(), 0);
+        Self::devview_canvas_manifest_children(&mut self.children, &[], &mut out);
+        out
+    }
+
+    fn devview_frame_slots(event_loop: &mut BrowserEventLoop) -> Vec<u32> {
+        event_loop
+            .execute_script(&format!(
+                "(function(){{var ns={NS_RESOLVE};if(!ns||!ns.frames)return '';\
+                 var f=document.querySelectorAll('iframe'),out=[];\
+                 for(var i=0;i<f.length;i++)out.push(ns.frames.nodeIdOf(f[i]));\
+                 return out.join(',');}})()"
+            ))
+            .unwrap_or_default()
+            .trim_matches('"')
+            .split(',')
+            .filter_map(|value| value.trim().parse().ok())
+            .collect()
+    }
+
+    fn devview_frame_snapshots_in(
+        event_loop: &mut BrowserEventLoop,
+        children: &mut [iframe::ChildIframe],
+        parent_path: &[u32],
+        serialize_js: &str,
+        out: &mut Vec<DevviewFrameSnapshot>,
+    ) {
+        let slots = Self::devview_frame_slots(event_loop);
+        let rects: std::collections::HashMap<u32, [f64; 4]> = {
+            let op_state = event_loop.runtime_mut().op_state();
+            let mut state = op_state.borrow_mut();
+            let Some(dom_state) = state.try_borrow_mut::<crate::js_runtime::state::DomState>()
+            else {
+                return;
+            };
+            children
+                .iter()
+                .map(|child| {
+                    let rect = dom_state
+                        .layout_engine
+                        .get_bounding_rect(&dom_state.dom, child.node_id);
+                    (
+                        child.node_id.to_raw(),
+                        [rect.x, rect.y, rect.width, rect.height],
+                    )
+                })
+                .collect()
+        };
+        for child in children {
+            let mut path = parent_path.to_vec();
+            path.push(child.node_id.to_raw());
+            let html = child.evaluate(serialize_js).unwrap_or_default();
+            out.push(DevviewFrameSnapshot {
+                frame_path: path.clone(),
+                parent_path: parent_path.to_vec(),
+                slot: slots
+                    .iter()
+                    .position(|node_id| *node_id == child.node_id.to_raw()),
+                generation: child.generation,
+                css_rect: rects
+                    .get(&child.node_id.to_raw())
+                    .copied()
+                    .unwrap_or([0.0; 4]),
+                html,
+            });
+            Self::devview_frame_snapshots_in(
+                &mut child.event_loop,
+                &mut child.children,
+                &path,
+                serialize_js,
+                out,
+            );
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn devview_frame_snapshots(&mut self, serialize_js: &str) -> Vec<DevviewFrameSnapshot> {
+        let mut out = Vec::new();
+        Self::devview_frame_snapshots_in(
+            &mut self.event_loop,
+            &mut self.children,
+            &[],
+            serialize_js,
+            &mut out,
+        );
+        out
+    }
+
+    fn devview_canvas_png_in(
+        children: &mut [iframe::ChildIframe],
+        path: &[u32],
+        generation: u64,
+        canvas_id: i32,
+        revision: u64,
+    ) -> Option<String> {
+        let (node, rest) = path.split_first()?;
+        let child = children
+            .iter_mut()
+            .find(|child| child.node_id.to_raw() == *node)?;
+        if rest.is_empty() {
+            if child.generation != generation {
+                return None;
+            }
+            let op_state = child.event_loop.runtime_mut().op_state();
+            let state = op_state.borrow();
+            return state
+                .try_borrow::<crate::js_runtime::extensions::canvas_ext::CanvasState>()?
+                .devview_png(canvas_id, revision);
+        }
+        Self::devview_canvas_png_in(&mut child.children, rest, generation, canvas_id, revision)
+    }
+
+    /// Lossless full-resolution PNG for the exact revision requested by
+    /// Devview. A mismatched revision asks the caller to refresh its manifest.
+    #[doc(hidden)]
+    pub fn devview_canvas_png(&mut self, key: &DevviewCanvasKey, revision: u64) -> Option<String> {
+        if !key.frame_path.is_empty() {
+            return Self::devview_canvas_png_in(
+                &mut self.children,
+                &key.frame_path,
+                key.generation,
+                key.canvas_id,
+                revision,
+            );
+        }
+        if key.generation != 0 {
+            return None;
+        }
+        let op_state = self.event_loop.runtime_mut().op_state();
+        let state = op_state.borrow();
+        state
+            .try_borrow::<crate::js_runtime::extensions::canvas_ext::CanvasState>()?
+            .devview_png(key.canvas_id, revision)
+    }
+
+    fn devview_frame_in<'a>(
+        children: &'a mut [iframe::ChildIframe],
+        path: &[u32],
+    ) -> Option<&'a mut iframe::ChildIframe> {
+        let (node, rest) = path.split_first()?;
+        let child = children
+            .iter_mut()
+            .find(|child| child.node_id.to_raw() == *node)?;
+        if rest.is_empty() {
+            Some(child)
+        } else {
+            Self::devview_frame_in(&mut child.children, rest)
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn devview_evaluate_in_frame(
+        &mut self,
+        path: &[u32],
+        generation: u64,
+        js: &str,
+    ) -> Result<String, deno_core::error::AnyError> {
+        let child = Self::devview_frame_in(&mut self.children, path)
+            .ok_or_else(|| deno_core::error::AnyError::msg("frame path is stale"))?;
+        if child.generation != generation {
+            return Err(deno_core::error::AnyError::msg("frame generation is stale"));
+        }
+        child.evaluate(js)
+    }
+
+    fn devview_trace_from(
+        event_loop: &mut BrowserEventLoop,
+        frame_path: &[u32],
+        generation: u64,
+        clear: bool,
+        out: &mut Vec<String>,
+    ) {
+        let js = format!(
+            "(function(){{var ns={NS_RESOLVE},t=ns&&ns.trace;if(!t)return '';\
+             var out=t.dump(2000);{}return out;}})()",
+            if clear { "t.clear();" } else { "" }
+        );
+        if let Ok(raw) = event_loop.execute_script(&js) {
+            for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+                if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("framePath".into(), serde_json::json!(frame_path));
+                        object.insert("generation".into(), serde_json::json!(generation));
+                    }
+                    if let Ok(line) = serde_json::to_string(&value) {
+                        out.push(line);
+                    }
+                }
+            }
+        }
+    }
+
+    fn devview_trace_children(
+        children: &mut [iframe::ChildIframe],
+        parent_path: &[u32],
+        clear: bool,
+        out: &mut Vec<String>,
+    ) {
+        for child in children {
+            let mut path = parent_path.to_vec();
+            path.push(child.node_id.to_raw());
+            Self::devview_trace_from(&mut child.event_loop, &path, child.generation, clear, out);
+            Self::devview_trace_children(&mut child.children, &path, clear, out);
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn devview_trace_jsonl(&mut self, clear: bool) -> String {
+        let mut out = Vec::new();
+        Self::devview_trace_from(&mut self.event_loop, &[], 0, clear, &mut out);
+        Self::devview_trace_children(&mut self.children, &[], clear, &mut out);
+        out.join("\n")
     }
 
     /// Evaluate arbitrary JavaScript and return the result as a string.

@@ -676,11 +676,11 @@ async fn mouse_event_has_properties() {
         eval(
             r#"
         const e = new MouseEvent('click', { clientX: 100, clientY: 200, button: 1 });
-        e.clientX + ',' + e.clientY + ',' + e.button
+        e.clientX + ',' + e.clientY + ',' + e.x + ',' + e.y + ',' + e.button
     "#
         )
         .await,
-        "100,200,1"
+        "100,200,100,200,1"
     );
 }
 

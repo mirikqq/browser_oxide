@@ -150,6 +150,11 @@
         // event was trusted, and nothing was ever selected or picked up.
         get offsetX() { return _mouseOffset(this, true); }
         get offsetY() { return _mouseOffset(this, false); }
+        // Standard aliases used by hCaptcha's parallel motion stream. Missing
+        // accessors stringify as `null` inside its [x,y,time] arrays even while
+        // clientX/clientY are valid.
+        get x() { return this.clientX; }
+        get y() { return this.clientY; }
         // Relative to the nearest positioned ancestor in Chrome; page
         // coordinates match that whenever nothing in the chain is positioned,
         // and they are what code falling back from `offsetX` expects to find.

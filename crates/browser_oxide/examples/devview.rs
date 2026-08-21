@@ -11,7 +11,9 @@
 //! by the behaviour generator, so the overlay draws where the engine believes the
 //! cursor is, sample by sample.
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
@@ -24,7 +26,14 @@ const PAGE: &str = include_str!("devview.html");
 ///
 /// Cleared on a view's `resync`, which is the only reliable signal that somebody
 /// is holding nothing.
-static LAST_FRAME_DOCS: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
+static LAST_FRAME_DOCS: Mutex<Vec<(String, u64, String)>> = Mutex::new(Vec::new());
+
+/// Last full-resolution bitmap delivered for each surface. A changed revision
+/// is encoded at most 15 times/s; unchanged revisions carry metadata only.
+static LAST_CANVAS_REVISIONS: LazyLock<Mutex<HashMap<String, (u64, Instant)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static FORCE_CANVAS_FLUSH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Resolves the engine's symbol-keyed internal namespace (see `page.rs`).
 const NS_RESOLVE: &str = "(function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()";
@@ -107,44 +116,8 @@ const SNAPSHOT_JS: &str = r#"
         box: [Math.round(r.width), Math.round(r.height)]
       };
     });
-  // Same canvas inlining as the frame path — see SERIALIZE_WITH_CANVAS.
   function __boSerialize() {
-    var cs = document.querySelectorAll('canvas');
-    var touched = [], budget = 4;
-    for (var i = 0; i < cs.length && budget > 0; i++) {
-      var c = cs[i];
-      if ((c.width | 0) < 24 || (c.height | 0) < 24) continue;
-      var url = '';
-      try {
-        // Bounded thumbnail, not the full surface: a full-resolution PNG of a
-        // large canvas is hundreds of KB on every tick.
-        var MAX = 320, cw = c.width | 0, chh = c.height | 0;
-        var sc = Math.min(1, MAX / Math.max(cw, chh));
-        var tw = Math.max(1, Math.round(cw * sc)), th = Math.max(1, Math.round(chh * sc));
-        var t = document.createElement('canvas');
-        t.width = tw; t.height = th;
-        var xx = t.getContext('2d');
-        xx.drawImage(c, 0, 0, cw, chh, 0, 0, tw, th);
-        url = t.toDataURL();
-      } catch (e) { continue; }
-      if (!url || url.length < 32) continue;
-      c.setAttribute('data-bo-shot', url);
-      c.setAttribute('data-bo-cidx', String(i));
-      c.setAttribute('data-bo-cw', String(c.width | 0));
-      c.setAttribute('data-bo-ch', String(c.height | 0));
-      touched.push(c);
-      budget--;
-    }
-    var html = document.documentElement.outerHTML;
-    for (var j = 0; j < touched.length; j++) {
-      try {
-      touched[j].removeAttribute('data-bo-shot');
-      touched[j].removeAttribute('data-bo-cidx');
-      touched[j].removeAttribute('data-bo-cw');
-      touched[j].removeAttribute('data-bo-ch');
-    } catch (e) {}
-    }
-    return html;
+    return document.documentElement.outerHTML;
   }
   return JSON.stringify({
     url: location.href,
@@ -356,6 +329,10 @@ async fn run() {
             );
             println!("готово — открой {open_url}");
 
+            if std::env::var_os("BROWSER_OXIDE_FRAME_TRACE").is_some() {
+                let _ = page.evaluate(include_str!("../src/js/frame_trace.js"));
+            }
+
             // Uncaught errors and rejected promises never reach `console.*` on their
             // own, and they are exactly what a stalled third-party widget produces.
             let _ = page.evaluate(
@@ -383,6 +360,18 @@ async fn run() {
                     // between two ticks, so the count never looks any different.
                     if raw.contains("\"resync\"") {
                         LAST_FRAME_DOCS.lock().unwrap().clear();
+                        LAST_CANVAS_REVISIONS.lock().unwrap().clear();
+                        FORCE_CANVAS_FLUSH.store(true, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                    if raw.contains("\"action\":\"trace\"") {
+                        let op = field(&raw, "op");
+                        let clear = op == "clear";
+                        let jsonl = page.devview_trace_jsonl(clear);
+                        emit(
+                            "trace",
+                            format!("\"op\":{},\"jsonl\":{}", json_str(&op), json_str(&jsonl)),
+                        );
                         continue;
                     }
                     // `frame` evaluates inside a child realm instead of the page —
@@ -546,22 +535,37 @@ async fn run() {
                     // Raw pointer forwarding: the viewer's own gesture, step by step.
                     if raw.contains("\"pointer\"") {
                         let phase = field(&raw, "phase");
+                        if phase == "up" {
+                            FORCE_CANVAS_FLUSH
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                         let sel = field(&raw, "sel").replace('`', "\\`");
-                        let ox = field(&raw, "ox");
-                        let oy = field(&raw, "oy");
-                        let rx = field(&raw, "rx");
-                        let ry = field(&raw, "ry");
+                        let u = field(&raw, "u");
+                        let v = field(&raw, "v");
+                        let surface = parse_surface_key(&field(&raw, "surface"));
                         let idx_raw = field(&raw, "index");
                         let js = POINTER_JS
-                            .replace("__CIDX__", &field(&raw, "cidx"))
+                            .replace(
+                                "__CANVAS_ID__",
+                                &surface
+                                    .as_ref()
+                                    .map_or_else(|| "-1".into(), |key| key.canvas_id.to_string()),
+                            )
                             .replace("__SEL__", &sel)
-                            .replace("__OX__", if ox.is_empty() { "0" } else { &ox })
-                            .replace("__OY__", if oy.is_empty() { "0" } else { &oy })
-                            .replace("__RX__", if rx.is_empty() { "0" } else { &rx })
-                            .replace("__RY__", if ry.is_empty() { "0" } else { &ry })
+                            .replace("__U__", if u.is_empty() { "NaN" } else { &u })
+                            .replace("__V__", if v.is_empty() { "NaN" } else { &v })
                             .replace("__PHASE__", &phase);
-                        let out = if idx_raw.is_empty() {
+                        let out = if surface.as_ref().is_some_and(|key| key.frame_path.is_empty())
+                            || (surface.is_none() && idx_raw.is_empty())
+                        {
                             page.evaluate(&js).unwrap_or_else(|e| format!("ошибка: {e}"))
+                        } else if let Some(key) = surface.as_ref() {
+                            page.devview_evaluate_in_frame(
+                                &key.frame_path,
+                                key.generation,
+                                &js,
+                            )
+                            .unwrap_or_else(|e| format!("ошибка: {e}"))
                         } else {
                             let idx = realm_for_dom_slot(
                                 &mut page,
@@ -760,29 +764,66 @@ fn push_snapshot(
         // Only when it changed: a captcha frame's document is ~600 KB and the loop
         // ticks five times a second, which is megabytes per second of unchanged
         // markup. `null` means "keep what you have".
-        let frame_docs: Vec<String> = {
-            let slots = page.child_frame_dom_slots();
-            let width = slots
+        let (frame_docs, frame_realms, frame_tree): (Vec<String>, Vec<String>, Vec<String>) = {
+            let snapshots = page.devview_frame_snapshots(&serialize_js());
+            let width = snapshots
                 .iter()
-                .filter_map(|(_, at)| *at)
+                .filter(|frame| frame.parent_path.is_empty())
+                .filter_map(|frame| frame.slot)
                 .max()
-                .map_or(0, |m| m + 1);
+                .map_or(0, |slot| slot + 1);
             let mut out = vec!["null".to_string(); width];
+            let mut realms = Vec::new();
+            let mut tree = Vec::new();
             let mut last = LAST_FRAME_DOCS.lock().unwrap();
-            for (realm, (node_id, at)) in slots.iter().enumerate() {
-                let Some(at) = *at else { continue };
-                let html = page
-                    .child_iframe(realm)
-                    .and_then(|c| c.evaluate(&serialize_js()).ok())
-                    .unwrap_or_default();
-                match last.iter_mut().find(|(id, _)| id == node_id) {
-                    Some((_, prev)) if *prev == html => continue,
-                    Some((_, prev)) => *prev = html.clone(),
-                    None => last.push((*node_id, html.clone())),
+            for frame in snapshots {
+                let path = frame
+                    .frame_path
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let changed = match last.iter_mut().find(|(key, _, _)| key == &path) {
+                    Some((_, old_generation, prev))
+                        if *old_generation == frame.generation && *prev == frame.html =>
+                    {
+                        false
+                    }
+                    Some((_, old_generation, prev)) => {
+                        *old_generation = frame.generation;
+                        *prev = frame.html.clone();
+                        true
+                    }
+                    None => {
+                        last.push((path.clone(), frame.generation, frame.html.clone()));
+                        true
+                    }
+                };
+                let slot = frame
+                    .slot
+                    .map_or_else(|| "null".into(), |slot| slot.to_string());
+                let path_json = serde_json::to_string(&frame.frame_path).unwrap_or_default();
+                let parent_json = serde_json::to_string(&frame.parent_path).unwrap_or_default();
+                let rect_json = serde_json::to_string(&frame.css_rect).unwrap_or_default();
+                let html_json = changed
+                    .then(|| json_str(&frame.html))
+                    .unwrap_or_else(|| "null".into());
+                tree.push(format!(
+                    "{{\"framePath\":{path_json},\"parentPath\":{parent_json},\"slot\":{slot},\"generation\":{},\"cssRect\":{rect_json},\"html\":{html_json}}}",
+                    frame.generation
+                ));
+                if frame.parent_path.is_empty() {
+                    let Some(slot) = frame.slot else { continue };
+                    realms.push(format!(
+                        "{{\"slot\":{slot},\"framePath\":{path_json},\"generation\":{}}}",
+                        frame.generation
+                    ));
+                    if changed {
+                        out[slot] = json_str(&frame.html);
+                    }
                 }
-                out[at] = json_str(&html);
             }
-            out
+            (out, realms, tree)
         };
 
         let console: Vec<String> = page
@@ -790,13 +831,88 @@ fn push_snapshot(
             .iter()
             .map(|(level, text)| format!("{{\"level\":\"{level}\",\"text\":{}}}", json_str(text)))
             .collect();
+        let force = FORCE_CANVAS_FLUSH.swap(false, std::sync::atomic::Ordering::Relaxed);
+        let now = Instant::now();
+        let canvas_updates: Vec<String> = page
+            .devview_canvas_manifest()
+            .into_iter()
+            .map(|meta| {
+                let key = serde_json::to_string(&meta.key).unwrap_or_default();
+                let send_png = {
+                    let cache = LAST_CANVAS_REVISIONS.lock().unwrap();
+                    match cache.get(&key) {
+                        None => true,
+                        Some((revision, sent_at)) => {
+                            force
+                                || (*revision != meta.revision
+                                    && now.duration_since(*sent_at) >= Duration::from_millis(66))
+                        }
+                    }
+                };
+                let png = send_png
+                    .then(|| page.devview_canvas_png(&meta.key, meta.revision))
+                    .flatten();
+                if let Some(ref png) = png {
+                    trace_canvas_update(page, &meta, png);
+                }
+                if png.is_some() {
+                    LAST_CANVAS_REVISIONS
+                        .lock()
+                        .unwrap()
+                        .insert(key, (meta.revision, now));
+                }
+                format!(
+                    "{{\"meta\":{},\"png\":{}}}",
+                    serde_json::to_string(&meta).unwrap_or_else(|_| "null".into()),
+                    png.as_deref()
+                        .map(json_str)
+                        .unwrap_or_else(|| "null".into())
+                )
+            })
+            .collect();
         let _ = events.send(format!(
             "{{\"kind\":\"snapshot\",\"inspect\":{ins},\"net\":{},\"console\":[{}],\
-             \"frameDocs\":[{}],\"data\":{json}}}",
+             \"frameDocs\":[{}],\"frameRealms\":[{}],\"frameTree\":[{}],\"canvasUpdates\":[{}],\"data\":{json}}}",
             drain_netlog(),
             console.join(","),
-            frame_docs.join(",")
+            frame_docs.join(","),
+            frame_realms.join(","),
+            frame_tree.join(","),
+            canvas_updates.join(",")
         ));
+    }
+}
+
+fn trace_canvas_update(
+    page: &mut browser_oxide::Page,
+    meta: &browser_oxide::DevviewCanvasMeta,
+    png: &str,
+) {
+    if std::env::var_os("BROWSER_OXIDE_FRAME_TRACE").is_none() {
+        return;
+    }
+    let hash = png.bytes().fold(2166136261u32, |hash, byte| {
+        (hash ^ byte as u32).wrapping_mul(16777619)
+    });
+    let detail = serde_json::json!({
+        "kind": "canvas",
+        "event": "revision",
+        "revision": meta.revision,
+        "pngHash": format!("{hash:08x}"),
+        "pngBytes": png.len(),
+        "backingSize": meta.backing_size,
+        "cssRect": meta.css_rect,
+        "viewport": meta.viewport,
+        "dpr": meta.dpr,
+    });
+    let js = format!(
+        "(function(){{var ns={NS_RESOLVE};if(ns&&ns.trace)ns.trace.record('canvas revision',{});}})()",
+        detail
+    );
+    if meta.key.frame_path.is_empty() {
+        let _ = page.evaluate(&js);
+    } else {
+        let _ = page.devview_evaluate_in_frame(&meta.key.frame_path, meta.key.generation, &js);
     }
 }
 
@@ -825,7 +941,7 @@ fn drain_netlog() -> String {
             format!(
                 "{{\"seq\":{},\"method\":{},\"url\":{},\"status\":{},\"kind\":{},\
                  \"mime\":{},\"size\":{},\"headers\":[{}],\"body\":{},\
-                 \"reqHeaders\":[{}],\"reqBody\":{}}}",
+                 \"reqHeaders\":[{}],\"reqSize\":{},\"reqBodyTruncated\":{},\"reqBody\":{}}}",
                 r.seq,
                 json_str(&r.method),
                 json_str(&r.url),
@@ -836,6 +952,8 @@ fn drain_netlog() -> String {
                 hdrs,
                 json_str(&r.body),
                 req_hdrs,
+                r.req_size,
+                r.req_body_truncated,
                 json_str(&r.req_body)
             )
         })
@@ -912,38 +1030,19 @@ fn wrap_action(inner: &str) -> String {
 /// page hands it to humanize.js, which captures and revokes it, so there the
 /// engine's own input API is used instead.
 const POINTER_JS: &str = r#"(function(){
-  // A gesture aimed at a canvas arrives by index, not by selector: the mirror
-  // draws a scaled <img> in its place, so a selector built there names a node
-  // this document does not have.
-  var cidx = '__CIDX__';
-  var el = cidx !== ''
-    ? document.querySelectorAll('canvas')[cidx | 0]
+  var canvasId = Number('__CANVAS_ID__');
+  var el = canvasId >= 0
+    ? [].find.call(document.querySelectorAll('canvas'), function(c){ return (c._canvasId|0) === canvasId; })
     : document.querySelector(`__SEL__`);
   if (!el) return 'нет элемента';
   var r = el.getBoundingClientRect();
-  // A canvas gesture arrives in the bitmap's own pixels: the mirror shows a
-  // scaled snapshot and scales the offsets back up by `data-bo-cw`/`ch`. A
-  // selector gesture arrives in CSS pixels inside the element. A canvas is
-  // normally sized in CSS and drawn at devicePixelRatio, so the two differ by
-  // that factor — reading bitmap pixels as CSS pixels put every press near the
-  // bottom-right corner or past the element entirely, so nothing inside the
-  // canvas was ever hit and no drag could start.
-  var kx = 1, ky = 1;
-  if (cidx !== '' && el.width && el.height && r.width && r.height) {
-    kx = r.width / el.width;
-    ky = r.height / el.height;
-  }
-  // The mirror and engine have different viewport widths. For ordinary DOM
-  // elements replay a relative point against the engine's computed box; canvas
-  // gestures retain bitmap coordinates because the bitmap is the interaction
-  // surface itself.
-  var rx = Number(__RX__), ry = Number(__RY__);
-  var x = cidx !== ''
-    ? r.left + (__OX__) * kx
-    : r.left + (isFinite(rx) ? Math.max(0, Math.min(1, rx)) * r.width : (__OX__));
-  var y = cidx !== ''
-    ? r.top + (__OY__) * ky
-    : r.top + (isFinite(ry) ? Math.max(0, Math.min(1, ry)) * r.height : (__OY__));
+  var rawU = __U__, rawV = __V__;
+  if (typeof rawU !== 'number' || typeof rawV !== 'number'
+      || !Number.isFinite(rawU) || !Number.isFinite(rawV)) return 'некорректные координаты';
+  var u = Math.max(0, Math.min(1, rawU));
+  var v = Math.max(0, Math.min(1, rawV));
+  var x = r.left + u * r.width;
+  var y = r.top + v * r.height;
   // Event coordinates are CSS viewport pixels. Clamp after converting the
   // mirror offset: neither a canvas backing-store coordinate nor a stale mirror
   // rect may place a pointer outside the browser profile's viewport.
@@ -988,9 +1087,10 @@ const POINTER_JS: &str = r#"(function(){
 
   if (phase === 'down') {
     var target = underPointer();
-    st.down = { x: x, y: y, target: target, dragged: false };
     fire('pointerover', P, target); fire('pointerenter', P, target);
     fire('mouseover', globalThis.MouseEvent, target); fire('mouseenter', globalThis.MouseEvent, target);
+    fire('pointermove', P, target); fire('mousemove', globalThis.MouseEvent, target);
+    st.down = { x: x, y: y, target: target, dragged: false };
     fire('pointerdown', P, target); fire('mousedown', globalThis.MouseEvent, target);
     try { target.focus && target.focus(); } catch (e) {}
   } else if (phase === 'move') {
@@ -1010,6 +1110,15 @@ const POINTER_JS: &str = r#"(function(){
     st.down = null;
   }
   st.at = { x: x, y: y };
+  if (ns && ns.trace && ns.trace.record) {
+    try { ns.trace.record('pointer transport', {
+      kind:'input', phase:phase, uv:[u,v], client:[x,y],
+      backing:[u * (Number(el.width)||r.width), v * (Number(el.height)||r.height)],
+      screen:[(Number(globalThis.screenX)||0)+x,(Number(globalThis.screenY)||0)+y],
+      target:(underPointer().id ? '#'+underPointer().id : underPointer().tagName),
+      buttons:phase==='up'?0:(st.down?1:0), hitTest:true
+    }); } catch (_) {}
+  }
   return phase + ' @' + Math.round(x) + ',' + Math.round(y)
     + ' → ' + (el.id ? '#' + el.id : el.tagName.toLowerCase())
     + (mark ? ' [trusted]' : ' [untrusted]');
@@ -1120,29 +1229,6 @@ const KEY_JS: &str = r#"(function(){
   return 'keydown ' + key + ' → ' + JSON.stringify(String(el.value)).slice(0, 40);
 })()"#;
 
-/// A canvas snapshot small enough to ship on every tick.
-///
-/// The full-resolution PNG of a captcha's 1000x940 surface is ~800 KB, and a
-/// snapshot carrying one pushed the whole message past 1.4 MB — five times a
-/// second, which the broadcast channel simply drops. This downscales to a
-/// bounded width first: enough to see what the engine drew, ~40x smaller.
-const CANVAS_THUMB_FN: &str = r#"
-  function __boThumb(c) {
-    var MAX = 320;
-    var w = c.width | 0, h = c.height | 0;
-    if (!w || !h) return '';
-    var scale = Math.min(1, MAX / Math.max(w, h));
-    var tw = Math.max(1, Math.round(w * scale));
-    var th = Math.max(1, Math.round(h * scale));
-    var t = document.createElement('canvas');
-    t.width = tw; t.height = th;
-    var x = t.getContext('2d');
-    if (!x) return '';
-    x.drawImage(c, 0, 0, w, h, 0, 0, tw, th);
-    return t.toDataURL();
-  }
-"#;
-
 /// Inline everything the mirror cannot resolve on its own.
 ///
 /// The mirror is markup rendered by the viewer's browser, so a `blob:` URL —
@@ -1177,7 +1263,25 @@ const INLINE_BLOBS_FN: &str = r#"
       } catch (e) {}
       // background-image: url(blob:…)
       try {
-        var bg = getComputedStyle(el).backgroundImage;
+        var css = getComputedStyle(el);
+        var bg = css.backgroundImage;
+        if (bg && bg !== 'none') {
+          var rect = el.getBoundingClientRect();
+          var width = rect.width || parseFloat(css.width) || 0;
+          var height = rect.height || parseFloat(css.height) || 0;
+          // A positioned background sprite can have a valid used size even
+          // while our layout box is still zero. Prefer its explicit CSS size;
+          // hCaptcha's square tiles also publish that size in background-size.
+          if (!height) {
+            var size = /^([\d.]+)px(?:\s+([\d.]+)px)?/.exec(css.backgroundSize || '');
+            if (size) height = parseFloat(size[2] || size[1]) || 0;
+          }
+          if (width > 0 || height > 0) {
+            var oldBox = el.getAttribute('data-bo-box');
+            el.setAttribute('data-bo-box', Math.round(width) + ',' + Math.round(height));
+            undo.push([el, 'data-bo-box', oldBox]);
+          }
+        }
         if (bg && bg.indexOf('blob:') >= 0) {
           var m = /url\(["']?(blob:[^"')]+)["']?\)/.exec(bg);
           if (m) {
@@ -1204,51 +1308,25 @@ const INLINE_BLOBS_FN: &str = r#"
   }
 "#;
 
-/// Serialise a document with every canvas' pixels inlined.
-///
-/// A `<canvas>` carries no markup: its bitmap lives in the engine, so the
-/// mirror — which is HTML — always drew an empty box where the page has a
-/// picture. Stamping `toDataURL()` onto the element as an attribute lets the
-/// view swap in an `<img>` and show what the engine actually rendered.
-///
-/// Bounded on purpose: only canvases big enough to matter, and only a few of
-/// them, because each PNG is a few hundred KB and this runs on every snapshot.
+/// Serialise document structure only. Canvas pixels travel independently in
+/// `canvasUpdates`, keyed by backing-surface revision.
 const SERIALIZE_WITH_CANVAS_BODY: &str = r#"(function(){
-  __THUMB__
+  __BLOBS__
   var blobUndo = __boInlineBlobs();
-  var cs = document.querySelectorAll('canvas');
-  var touched = [];
-  var budget = 4;
-  for (var i = 0; i < cs.length && budget > 0; i++) {
-    var c = cs[i];
-    var w = c.width | 0, h = c.height | 0;
-    if (w < 24 || h < 24) continue;
-    var url = '';
-    try { url = __boThumb(c); } catch (e) { continue; }
-    if (!url || url.length < 32) continue;
-    c.setAttribute('data-bo-shot', url);
-    // Index among this document's canvases plus the intrinsic size: the view
-    // needs both to aim a gesture back at the real element. The mirror shows a
-    // scaled <img>, so a selector built there would name the wrong node and its
-    // offsets would be in thumbnail pixels.
-    c.setAttribute('data-bo-cidx', String(i));
-    c.setAttribute('data-bo-cw', String(w));
-    c.setAttribute('data-bo-ch', String(h));
-    touched.push(c);
-    budget--;
+  var frames = document.querySelectorAll('iframe'), tagged = [];
+  for (var i = 0; i < frames.length; i++) {
+    try { frames[i].setAttribute('data-bo-frame', String(i)); tagged.push(frames[i]); } catch (_) {}
   }
   var html = document.documentElement.outerHTML;
   __boUndoBlobs(blobUndo);
-  // The attribute is a view-only artefact — the page must never see it.
-  for (var j = 0; j < touched.length; j++) {
-    try { touched[j].removeAttribute('data-bo-shot'); } catch (e) {}
+  for (var j = 0; j < tagged.length; j++) {
+    try { tagged[j].removeAttribute('data-bo-frame'); } catch (_) {}
   }
   return html;
 })()"#;
 
-/// The frame serialiser with the thumbnail helper spliced in.
 fn serialize_js() -> String {
-    SERIALIZE_WITH_CANVAS_BODY.replace("__THUMB__", &format!("{CANVAS_THUMB_FN}{INLINE_BLOBS_FN}"))
+    SERIALIZE_WITH_CANVAS_BODY.replace("__BLOBS__", INLINE_BLOBS_FN)
 }
 
 /// Minimal base64 decode for the canvas snapshot command.
@@ -1295,6 +1373,29 @@ fn realm_for_dom_slot(page: &mut browser_oxide::Page, wanted: usize) -> usize {
         }
     }
     wanted
+}
+
+fn parse_surface_key(raw: &str) -> Option<browser_oxide::DevviewCanvasKey> {
+    let mut parts = raw.split('~');
+    let path = parts.next()?;
+    let generation = parts.next()?.parse().ok()?;
+    let canvas_id = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let frame_path = if path.is_empty() {
+        Vec::new()
+    } else {
+        path.split('.')
+            .map(str::parse)
+            .collect::<Result<_, _>>()
+            .ok()?
+    };
+    Some(browser_oxide::DevviewCanvasKey {
+        frame_path,
+        generation,
+        canvas_id,
+    })
 }
 
 fn field(raw: &str, key: &str) -> String {
@@ -1394,6 +1495,99 @@ fn action_to_js(raw: &str) -> String {
         ),
         "eval" => text,
         other => format!("'неизвестное действие: {other}'"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{serialize_js, PAGE, POINTER_JS};
+
+    #[test]
+    fn canvas_substitution_is_not_applied_twice() {
+        assert_eq!(
+            PAGE.matches(r#"<canvas\b(?![^>]*data-bo-canvas)[^>]*>"#)
+                .count(),
+            2
+        );
+    }
+
+    fn pointer(phase: &str, u: f64, v: f64) -> String {
+        POINTER_JS
+            .replace("__CANVAS_ID__", "-1")
+            .replace("__SEL__", "#target")
+            .replace("__U__", &u.to_string())
+            .replace("__V__", &v.to_string())
+            .replace("__PHASE__", phase)
+    }
+
+    #[tokio::test]
+    async fn pointer_drag_has_approach_pressed_moves_and_no_click() {
+        let mut page = browser_oxide::Page::from_html(
+            r#"<div id="target" style="width:200px;height:100px"></div><script>
+               globalThis.events=[];
+               for(const type of ['pointermove','pointerdown','pointerup','click'])
+                 document.getElementById('target').addEventListener(type,e=>events.push(type+':'+e.buttons));
+               </script>"#,
+            None::<browser_oxide::stealth::StealthProfile>,
+        )
+        .await
+        .unwrap();
+        page.evaluate(&pointer("move", 0.1, 0.5)).unwrap();
+        page.evaluate(&pointer("down", 0.2, 0.5)).unwrap();
+        page.evaluate(&pointer("move", 0.8, 0.5)).unwrap();
+        page.evaluate(&pointer("up", 0.8, 0.5)).unwrap();
+        let events = page.evaluate("JSON.stringify(events)").unwrap();
+        assert_eq!(
+            events,
+            r#"["pointermove:0","pointermove:0","pointerdown:1","pointermove:1","pointerup:0"]"#
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_pointer_coordinates_are_not_dispatched_at_origin() {
+        let mut page = browser_oxide::Page::from_html(
+            r#"<div id="target" style="width:200px;height:100px"></div><script>
+               globalThis.moves=0;
+               document.getElementById('target').addEventListener('mousemove',()=>moves++);
+               </script>"#,
+            None::<browser_oxide::stealth::StealthProfile>,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            page.evaluate(&pointer("move", f64::NAN, 0.5)).unwrap(),
+            "некорректные координаты"
+        );
+        assert_eq!(page.evaluate("String(moves)").unwrap(), "0");
+    }
+
+    #[tokio::test]
+    async fn background_snapshot_carries_used_box_without_mutating_page() {
+        let mut page = browser_oxide::Page::from_html(
+            r#"<div id="image" style="width:120px;height:80px;background-image:url(data:image/png;base64,AA==)"></div>"#,
+            None::<browser_oxide::stealth::StealthProfile>,
+        )
+        .await
+        .unwrap();
+        let html = page.evaluate(&serialize_js()).unwrap();
+        assert!(html.contains(r#"data-bo-box="120,80""#), "{html}");
+        assert_eq!(
+            page.evaluate("document.querySelector('#image').getAttribute('data-bo-box')")
+                .unwrap(),
+            "null"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_snapshot_recovers_zero_height_from_background_size() {
+        let mut page = browser_oxide::Page::from_html(
+            r#"<div id="image" style="position:absolute;width:120px;height:0;background-image:url(data:image/png;base64,AA==);background-size:120px 120px"></div>"#,
+            None::<browser_oxide::stealth::StealthProfile>,
+        )
+        .await
+        .unwrap();
+        let html = page.evaluate(&serialize_js()).unwrap();
+        assert!(html.contains(r#"data-bo-box="120,120""#), "{html}");
     }
 }
 

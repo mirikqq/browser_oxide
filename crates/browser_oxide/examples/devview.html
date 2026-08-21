@@ -102,6 +102,7 @@
 
 <aside>
   <header><b>devview</b><span id="chalbadge" class="dim"></span><span id="conn" class="off">●&nbsp;нет связи</span></header>
+  <div><button id="tdump">trace</button><button id="tclear">clear trace</button><button id="tdownload">download</button></div>
   <div id="counts" class="dim"></div>
   <div id="status" class="dim">запуск…</div>
   <nav>
@@ -145,7 +146,12 @@
   let lastKeyAt = 0;
   const KEY_QUIET_MS = 700;
   let lastFrameDocs = [];
+  let lastFrameRealms = [];
   let framesDirty = false;
+  const canvasMeta = new Map(), canvasPng = new Map();
+  const frameDocsByPath = new Map(), frameMetaByPath = new Map();
+  const canvasKey = key => JSON.stringify(key || {});
+  const surfaceKey = key => (key.framePath || []).join('.') + '~' + key.generation + '~' + key.canvasId;
   let trail = [], t0 = Date.now();
   const $ = (id) => document.getElementById(id);
 
@@ -184,6 +190,9 @@
 
   $('click').onclick = () => picked && send({ action: 'click', sel: picked, text: '' });
   $('fill').onclick = () => picked && send({ action: 'fill', sel: picked, text: $('text').value });
+  $('tdump').onclick = () => send({ action: 'trace', op: 'dump' });
+  $('tclear').onclick = () => send({ action: 'trace', op: 'clear' });
+  $('tdownload').onclick = () => send({ action: 'trace', op: 'download' });
 
   const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
   function log(text, cls) {
@@ -241,6 +250,16 @@
   function handle(msg) {
     if (msg.kind === 'status') { log(msg.text, 'ok'); return; }
     if (msg.kind === 'log') { log(msg.text, 'warn'); return; }
+    if (msg.kind === 'trace') {
+      if (msg.op === 'download') {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([msg.jsonl || ''], { type: 'application/jsonl' }));
+        a.download = 'browser-oxide-trace.jsonl'; a.click(); URL.revokeObjectURL(a.href);
+      } else if (msg.op === 'dump') {
+        addConsole(String(msg.jsonl || '').split('\n').filter(Boolean).map(text => ({ level: 'info', text })));
+      } else log('trace очищен', 'ok');
+      return;
+    }
     if (msg.kind === 'action') {
       const ms = msg.ms != null ? ` (${msg.ms} мс)` : '';
       log(`${msg.raw} → ${msg.state}${ms}`, msg.state.startsWith('ошибк') ? 'bad' : '');
@@ -249,6 +268,27 @@
     if (msg.kind !== 'snapshot') return;
     if (msg.net && msg.net.length) addNet(msg.net);
     if (msg.console && msg.console.length) addConsole(msg.console);
+    lastFrameRealms = msg.frameRealms || lastFrameRealms;
+    if (msg.frameTree) {
+      for (const frame of msg.frameTree) {
+        const key = (frame.framePath || []).join('.');
+        const previous = frameMetaByPath.get(key);
+        if (previous && previous.generation !== frame.generation) frameDocsByPath.delete(key);
+        frameMetaByPath.set(key, frame);
+        if (frame.html !== null) {
+          frameDocsByPath.set(key, frame.html);
+          framesDirty = true;
+        }
+      }
+    }
+    if (msg.canvasUpdates) {
+      for (const update of msg.canvasUpdates) {
+        if (!update || !update.meta) continue;
+        const key = canvasKey(update.meta.key);
+        canvasMeta.set(key, update.meta);
+        if (update.png) canvasPng.set(key, update.png);
+      }
+    }
     // `null` for a frame means "unchanged" — keep what we already have.
     if (msg.frameDocs) {
       // A frame's document arrives in its own snapshot, after the one that
@@ -266,12 +306,10 @@
       //
       // Structure decides whether to rebuild; the bitmaps are swapped into the
       // live <img> elements afterwards, which costs no layout at all.
-      const withoutShots = (d) => String(d == null ? '' : d).replace(/ data-bo-shot="[^"]*"/g, '');
       msg.frameDocs.forEach(function (d, i) {
         if (d === null || d === lastFrameDocs[i]) return;
-        const structural = withoutShots(d) !== withoutShots(lastFrameDocs[i]);
         lastFrameDocs[i] = d;
-        if (structural) framesDirty = true;
+        framesDirty = true;
       });
       // Deliberately not truncated to the incoming length. `null` means "unchanged",
       // so this array is the only copy — and the engine will not resend a document
@@ -341,7 +379,7 @@
       <h4>Заголовки запроса</h4>
       <pre>${esc(fmt(r.reqHeaders))}</pre>
       <h4>Тело запроса</h4>
-      <pre>${bodyOr(r.reqBody, 'без тела')}</pre>
+      <pre>${bodyOr(r.reqBody, 'без тела')}${r.reqBodyTruncated ? `\n<span class="bad">обрезано: показано ${kb(r.reqBody.length)} из ${kb(r.reqSize)}</span>` : ''}</pre>
       <h4>Ответ</h4>
       <pre class="kv">${r.status} · ${esc(r.mime || 'без Content-Type')} · ${kb(r.size)}</pre>
       <h4>Заголовки ответа</h4>
@@ -376,51 +414,79 @@
 
   // Turns one serialised <iframe …data-bo-frame="N"…> into a box carrying the
   // child realm's own document.
-  // A <canvas> in the mirror is always blank: its bitmap lives in the engine,
-  // not in the markup. The snapshot stamps `data-bo-shot` with the engine's own
-  // `toDataURL()`, so here it becomes an <img> showing what was actually drawn.
+  // A <canvas> bitmap lives outside markup. `canvasUpdates` supplies a lossless
+  // backing-store PNG, so the mirror substitutes a keyed <img> without touching
+  // the frame document.
   // Backgrounds the engine inlined for us: the element carries the picture as
   // a data URL because its own `blob:` reference means nothing in this browser.
   function applyBlobBackgrounds(root) {
-    root.querySelectorAll('[data-bo-bg]').forEach(el => {
+    root.querySelectorAll('[data-bo-bg],[data-bo-box]').forEach(el => {
       const d = el.getAttribute('data-bo-bg');
       if (d) el.style.backgroundImage = 'url("' + d + '")';
+      const box = String(el.getAttribute('data-bo-box') || '').split(',').map(Number);
+      if (box.length === 2) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width <= 0 && box[0] > 0) el.style.width = box[0] + 'px';
+        if (rect.height <= 0 && box[1] > 0) el.style.height = box[1] + 'px';
+      }
     });
   }
 
-  function canvasShot(tag) {
-    const shot = /data-bo-shot="([^"]*)"/.exec(tag);
-    const w = (/\bwidth="(\d+)"/.exec(tag) || [])[1];
-    const h = (/\bheight="(\d+)"/.exec(tag) || [])[1];
-    const style = (/\bstyle="([^"]*)"/.exec(tag) || [])[1] || '';
-    const size = (w ? ' width="' + w + '"' : '') + (h ? ' height="' + h + '"' : '');
-    // Carried through so a gesture can be aimed back at the real canvas: its
-    // index in the document, and its intrinsic size for scaling the offsets.
-    const cidx = (/data-bo-cidx="(\d+)"/.exec(tag) || [])[1] || '0';
-    const cw = (/data-bo-cw="(\d+)"/.exec(tag) || [])[1] || w || '0';
-    const ch = (/data-bo-ch="(\d+)"/.exec(tag) || [])[1] || h || '0';
-    const meta = ' data-bo-cidx="' + cidx + '" data-bo-cw="' + cw + '" data-bo-ch="' + ch + '"';
-    if (!shot || !shot[1]) {
-      // No snapshot (too small, or nothing drawn) — keep the space it occupies,
-      // and stay targetable: a canvas can be interactive before it has pixels.
-      return '<div data-bo-canvas="пусто"' + meta + ' style="' + style +
-             ';display:block;width:100%;height:100%;background:#141821;' +
-             'outline:1px dashed #2a3242"></div>';
-    }
-    // Laid out by the author's own CSS, not by the bitmap's pixel size. A
-    // canvas is usually sized in CSS and drawn at devicePixelRatio, so pinning
-    // the <img> to the bitmap's width made it render at twice its intended box
-    // — and every gesture aimed at it then landed on the wrong coordinates.
-    return '<img data-bo-canvas="1"' + meta + ' src="' + shot[1] + '"' +
-           ' style="' + style + ';display:block;width:100%;height:100%;' +
-           'object-fit:fill">';
+  // Some challenge canvases are intentionally positioned across the header,
+  // with the prompt kept readable by a higher sibling stacking layer. Preserve
+  // that relationship even when the mirror has lost the runtime-applied class.
+  function repairCanvasPromptLayers(root) {
+    root.querySelectorAll('[data-bo-canvas="1"]').forEach(canvas => {
+      const cr = canvas.getBoundingClientRect();
+      root.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(heading => {
+        if (!heading.textContent.trim()) return;
+        const hr = heading.getBoundingClientRect();
+        if (hr.right <= cr.left || hr.left >= cr.right || hr.bottom <= cr.top || hr.top >= cr.bottom) return;
+        let common = heading.parentElement;
+        while (common && !common.contains(canvas)) common = common.parentElement;
+        if (!common) return;
+        let promptLayer = heading, canvasLayer = canvas;
+        while (promptLayer.parentElement !== common) promptLayer = promptLayer.parentElement;
+        while (canvasLayer.parentElement !== common) canvasLayer = canvasLayer.parentElement;
+        if (promptLayer === canvasLayer) return;
+        const promptStyle = getComputedStyle(promptLayer);
+        if (promptStyle.position === 'static') promptLayer.style.position = 'relative';
+        const z = Math.max(Number.parseInt(getComputedStyle(canvasLayer).zIndex, 10) || 0,
+                           Number.parseInt(getComputedStyle(canvas).zIndex, 10) || 0);
+        promptLayer.style.zIndex = String(Math.max(z + 1, Number.parseInt(promptStyle.zIndex, 10) || 0));
+      });
+    });
   }
 
+  let canvasRealm = { framePath: [], generation: 0, index: 0 };
+  function canvasShot(tag) {
+    const index = canvasRealm.index++;
+    const meta = Array.from(canvasMeta.values()).find(m =>
+      m.canvasIndex === index && m.key.generation === canvasRealm.generation &&
+      JSON.stringify(m.key.framePath || []) === JSON.stringify(canvasRealm.framePath));
+    const opening = /^<canvas\b([^>]*)>/i.exec(tag);
+    let attrs = opening ? opening[1] : '';
+    const style = (/\bstyle="([^"]*)"/.exec(attrs) || [])[1] || '';
+    attrs = attrs.replace(/\sstyle="[^"]*"/i, '');
+    if (!meta) return '<span data-bo-canvas="missing" style="' + style + '"></span>';
+    const key = canvasKey(meta.key);
+    const w = Math.max(0, meta.cssRect[2]), h = Math.max(0, meta.cssRect[3]);
+    return '<canvas' + attrs + ' data-bo-canvas="1" data-bo-key="' + encodeURIComponent(key) +
+           '" data-bo-surface="' + surfaceKey(meta.key) + '"' +
+           ' style="' + style + ';display:block;width:' + w + 'px;height:' + h +
+           'px;background-color:#141821;background-size:100% 100%;background-repeat:no-repeat"></canvas>';
+  }
+
+  let frameRenderParentPath = [];
   function frameBox(tag) {
     const m = /data-bo-frame="(\d+)"/.exec(tag);
     const i = m ? Number(m[1]) : -1;
-    const meta = (lastFrames && lastFrames[i]) || null;
-    const w = meta ? meta.box[0] : 0, h = meta ? meta.box[1] : 0;
+    const realm = Array.from(frameMetaByPath.values()).find(frame =>
+      frame.slot === i && JSON.stringify(frame.parentPath || []) === JSON.stringify(frameRenderParentPath));
+    const topMeta = frameRenderParentPath.length === 0 && lastFrames ? lastFrames[i] : null;
+    const meta = topMeta || null;
+    const w = meta ? meta.box[0] : (realm && realm.cssRect ? realm.cssRect[2] : 0);
+    const h = meta ? meta.box[1] : (realm && realm.cssRect ? realm.cssRect[3] : 0);
     const src = meta ? meta.src : 'iframe';
     // Parse the role from the *unmodified* src: stripping `&` first glued the
     // next parameter onto it ("checkbox" + "id" → "checkboxid").
@@ -439,16 +505,25 @@
       return '<div class="bo-frame" data-bo-idx="' + i + '" title="frame ' + i + ' · ' +
              label + ' · скрыт" style="width:' + w + 'px;height:' + h + 'px"></div>';
     }
-    let inner = lastFrameDocs[i] || '';
+    let inner = realm ? (frameDocsByPath.get((realm.framePath || []).join('.')) || '')
+                      : (lastFrameDocs[i] || '');
     // The child document gets the same treatment as the top one, recursively:
-    // no scripts, no nested frames.
+    // no scripts; nested frames are substituted recursively from the frame tree.
+    const canvasFrame = realm || lastFrameRealms.find(r => r.slot === i) ||
+      { framePath: [], generation: 0 };
+    const previousCanvasRealm = canvasRealm;
+    const previousFramePath = frameRenderParentPath;
+    canvasRealm = { framePath: canvasFrame.framePath || [], generation: canvasFrame.generation || 0, index: 0 };
+    frameRenderParentPath = canvasFrame.framePath || [];
     inner = String(inner)
       .replace(/<script[\s\S]*?<\/script>/gi, '')
-      .replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi, '')
-      .replace(/<iframe\b[^>]*>/gi, '')
+      .replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi, frameBox)
+      .replace(/<iframe\b[^>]*>/gi, frameBox)
       .replace(/<noscript[\s\S]*?<\/noscript>/gi, '')
       .replace(/<canvas\b[^>]*>[\s\S]*?<\/canvas>/gi, canvasShot)
-      .replace(/<canvas\b[^>]*>/gi, canvasShot);
+      .replace(/<canvas\b(?![^>]*data-bo-canvas)[^>]*>/gi, canvasShot);
+    canvasRealm = previousCanvasRealm;
+    frameRenderParentPath = previousFramePath;
     const size = (w && h) ? (w + '×' + h) : 'без размера';
     // No visible label: the index is only needed by the click router (it rides in
     // the attribute) and the role/size are already shown in the selector line when
@@ -477,33 +552,37 @@
   // pointermove and the viewer watched a frozen picture. Only the <img> src is
   // swapped here — no node is replaced and no layout is rebuilt, so the gesture
   // survives while the drawing keeps up.
-  function refreshCanvasShots(s) {
+  function refreshCanvasShots() {
     const f = $('mirror');
     const d = f && f.contentDocument;
     if (!d) return;
-    const apply = (html, root, scoped) => {
-      if (!html || !root) return;
-      const re = /<canvas\b[^>]*>/gi;
-      let m;
-      while ((m = re.exec(html))) {
-        const shot = /data-bo-shot="([^"]*)"/.exec(m[0]);
-        if (!shot || !shot[1]) continue;
-        const cidx = (/data-bo-cidx="(\d+)"/.exec(m[0]) || [])[1] || '0';
-        const sel = 'img[data-bo-canvas="1"][data-bo-cidx="' + cidx + '"]';
-        let img;
-        if (scoped) {
-          img = root.querySelector(sel);
-        } else {
-          img = Array.prototype.find.call(
-            root.querySelectorAll(sel), n => !n.closest('.bo-frame'));
-        }
-        if (img && img.getAttribute('src') !== shot[1]) img.setAttribute('src', shot[1]);
+    for (const img of d.querySelectorAll('[data-bo-canvas="1"][data-bo-key]')) {
+      let key;
+      try { key = decodeURIComponent(img.getAttribute('data-bo-key')); } catch (_) { continue; }
+      // A page may replace the DOM canvas at the same document slot without
+      // changing its serialised HTML. Keep the live <img> bound to that slot,
+      // otherwise it retains the previous surface id and every pointer event is
+      // evaluated against a canvas which no longer exists.
+      const previous = canvasMeta.get(key);
+      const meta = previous && Array.from(canvasMeta.values()).reverse().find(m =>
+        m.canvasIndex === previous.canvasIndex &&
+        m.key.generation === previous.key.generation &&
+        JSON.stringify(m.key.framePath || []) === JSON.stringify(previous.key.framePath || [])
+      ) || previous;
+      if (!meta) continue;
+      const currentKey = canvasKey(meta.key);
+      const shot = canvasPng.get(currentKey);
+      if (shot && img.style.backgroundImage !== 'url("' + shot + '")') {
+        img.style.backgroundImage = 'url("' + shot + '")';
       }
-    };
-    apply(s.html, d, false);
-    for (let i = 0; i < lastFrameDocs.length; i++) {
-      apply(lastFrameDocs[i], d.querySelector('.bo-frame[data-bo-idx="' + i + '"]'), true);
+      if (currentKey !== key) {
+        img.setAttribute('data-bo-key', encodeURIComponent(currentKey));
+        img.setAttribute('data-bo-surface', surfaceKey(meta.key));
+      }
+      img.style.width = Math.max(0, meta.cssRect[2]) + 'px';
+      img.style.height = Math.max(0, meta.cssRect[3]) + 'px';
     }
+    repairCanvasPromptLayers(d);
   }
 
   function paint(s) {
@@ -513,7 +592,7 @@
 
     // Bitmaps are always swapped in place — during a gesture, when a redraw is
     // held back, and on an ordinary tick where nothing structural changed.
-    refreshCanvasShots(s);
+    refreshCanvasShots();
 
     if (s.html && (s.html !== lastHtml || framesDirty)) {
       if (dragging || Date.now() - lastKeyAt < KEY_QUIET_MS) { pendingSnap = s; return; }
@@ -538,6 +617,7 @@
            element the widget keeps hidden. */
         [style*="opacity: 0;"]:not(.bo-frame *),[style$="opacity: 0"]:not(.bo-frame *){opacity:1!important;}
       </style>`;
+      canvasRealm = { framePath: [], generation: 0, index: 0 };
       const html = s.html
         // The mirror deliberately runs without allow-scripts — re-running the SPA
         // here would show Chrome's render, not the engine's DOM. Strip what that
@@ -551,7 +631,7 @@
         //  · crossorigin on fonts fails CORS from 127.0.0.1
         .replace(/<noscript[\s\S]*?<\/noscript>/gi, '')
         .replace(/<canvas\b[^>]*>[\s\S]*?<\/canvas>/gi, canvasShot)
-        .replace(/<canvas\b[^>]*>/gi, canvasShot)
+        .replace(/<canvas\b(?![^>]*data-bo-canvas)[^>]*>/gi, canvasShot)
         // Frames are substituted, not dropped. A real <iframe> here cannot help:
         // the mirror runs without allow-scripts, so it would render blank, and
         // allowing scripts would re-run the third party inside the viewer's own
@@ -603,6 +683,7 @@
         }, true);
         d.addEventListener('submit', ev => ev.preventDefault(), true);
         applyBlobBackgrounds(d);
+        refreshCanvasShots();
 
         // ---- raw pointer forwarding -------------------------------------
         // The viewer's own gesture goes to the engine step by step. A drag
@@ -618,49 +699,37 @@
           let oy = Math.round(ev.clientY - r.top);
           const frame = box ? box.getAttribute('data-bo-idx') : null;
 
-          // A canvas is one element whose *inside* is the interface — a drag or
-          // a click there is a coordinate, not a node. The mirror shows a scaled
-          // snapshot of it, so the offsets have to be rescaled to the canvas'
-          // own pixels and the target named by index, since the <img> standing
-          // in for it does not exist in the engine's document. Challenges that
-          // are ordinary divs with images keep going through selectors.
+          // Canvas input carries only a stable surface identity and normalized
+          // coordinates. The child realm resolves those against its current
+          // engine rect, never against bitmap or mirror pixels.
           const shot = el.closest && el.closest('[data-bo-canvas]');
           if (shot) {
             const sr = shot.getBoundingClientRect();
-            const cw = Number(shot.getAttribute('data-bo-cw')) || sr.width || 1;
-            const ch = Number(shot.getAttribute('data-bo-ch')) || sr.height || 1;
-            const sx = sr.width ? cw / sr.width : 1;
-            const sy = sr.height ? ch / sr.height : 1;
-            const t = {
-              cidx: shot.getAttribute('data-bo-cidx') || '0',
-              sel: 'canvas',
-              ox: Math.round((ev.clientX - sr.left) * sx),
-              oy: Math.round((ev.clientY - sr.top) * sy),
-              rx: Math.max(0, Math.min(1, (ev.clientX - sr.left) / Math.max(1, sr.width))),
-              ry: Math.max(0, Math.min(1, (ev.clientY - sr.top) / Math.max(1, sr.height))),
+            return {
+              surface: shot.getAttribute('data-bo-surface') || '',
+              u: Math.max(0, Math.min(1, (ev.clientX - sr.left) / Math.max(1, sr.width))),
+              v: Math.max(0, Math.min(1, (ev.clientY - sr.top) / Math.max(1, sr.height))),
             };
-            if (frame !== null) t.index = frame;
-            return t;
           }
           if (box) {
             const body = box.querySelector('.bo-frame-body');
             if (!body || !body.contains(el)) return null;
-            return { index: frame, sel: selectorWithin(body, el), ox, oy,
-              rx: Math.max(0, Math.min(1, ox / Math.max(1, r.width))),
-              ry: Math.max(0, Math.min(1, oy / Math.max(1, r.height))) };
+            return { index: frame, sel: selectorWithin(body, el),
+              u: Math.max(0, Math.min(1, ox / Math.max(1, r.width))),
+              v: Math.max(0, Math.min(1, oy / Math.max(1, r.height))) };
           }
-          return { index: null, sel: selectorFor(el), ox, oy,
-            rx: Math.max(0, Math.min(1, ox / Math.max(1, r.width))),
-            ry: Math.max(0, Math.min(1, oy / Math.max(1, r.height))) };
+          return { index: null, sel: selectorFor(el),
+            u: Math.max(0, Math.min(1, ox / Math.max(1, r.width))),
+            v: Math.max(0, Math.min(1, oy / Math.max(1, r.height))) };
         };
         let lastPointer = null;
         const sendPointer = (phase, ev) => {
           const t = targetOf(ev);
           if (!t) return;
-          const msg = { action: 'pointer', phase, sel: t.sel, ox: t.ox, oy: t.oy };
-          msg.rx = t.rx; msg.ry = t.ry;
+          const msg = { action: 'pointer', phase, u: t.u, v: t.v };
+          if (t.sel) msg.sel = t.sel;
+          if (t.surface) msg.surface = t.surface;
           if (t.index !== null && t.index !== undefined) msg.index = String(t.index);
-          if (t.cidx !== undefined) msg.cidx = String(t.cidx);
           lastPointer = msg;
           send(msg);
         };
@@ -674,7 +743,7 @@
           // reads the cadence, so the stream is thinned only enough to stay
           // ahead of the socket — 40 ms produced a visibly robotic 25 Hz.
           const now = Date.now();
-          if (now - lastMoveSent < 8) return;
+          if (!dragging && now - lastMoveSent < 8) return;
           lastMoveSent = now;
           sendPointer('move', ev);
         }, true);

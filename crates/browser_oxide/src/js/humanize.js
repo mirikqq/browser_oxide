@@ -361,9 +361,12 @@
     };
 
     function _fireMove(x, y, prev) {
-        const cx = Math.round(x), cy = Math.round(y);
-        const mx = prev ? Math.round(x - prev[0]) : 0;
-        const my = prev ? Math.round(y - prev[1]) : 0;
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+        const [vw, vh] = _viewport();
+        const cx = Math.max(0, Math.min(Math.max(0, vw - 1), Math.round(x)));
+        const cy = Math.max(0, Math.min(Math.max(0, vh - 1), Math.round(y)));
+        const mx = prev && Number.isFinite(prev[0]) ? Math.round(cx - prev[0]) : 0;
+        const my = prev && Number.isFinite(prev[1]) ? Math.round(cy - prev[1]) : 0;
         const mouseEv = new MouseEvent('mousemove', {
             bubbles: true, cancelable: true, view: window,
             clientX: cx, clientY: cy,
@@ -391,7 +394,8 @@
                 _dispatch(_hitTarget(cx, cy), pEv);
             }
         } catch (_) {}
-        _akRecMouse(x, y, 0, 0); // 0 = move, button 0 = left
+        _akRecMouse(cx, cy, 0, 0); // 0 = move, button 0 = left
+        return true;
     }
 
     // Fire a `wheel` + `scroll` pair simulating a scroll-down step.
@@ -654,9 +658,9 @@
         for (const p of traj) {
             await _sleep((p.t_ms || 0) - prevT);
             prevT = p.t_ms || 0;
-            try { _fireMove(p.x, p.y, prev); } catch (_) {}
-            try { _akRecMouse(Math.round(p.x), Math.round(p.y), 'move', 0); } catch (_) {}
-            prev = [p.x, p.y];
+            try {
+                if (_fireMove(p.x, p.y, prev)) prev = [Math.round(p.x), Math.round(p.y)];
+            } catch (_) {}
         }
         try { _boNs.input._lastPos = [x, y]; } catch (_) {}
     }

@@ -618,6 +618,7 @@ pub struct Canvas2D {
     state: CanvasState,
     state_stack: Vec<CanvasState>,
     path: Path2D,
+    revision: u64,
 }
 
 impl Canvas2D {
@@ -635,6 +636,7 @@ impl Canvas2D {
             state: CanvasState::default(),
             state_stack: Vec::new(),
             path: Path2D::new(),
+            revision: 0,
         })
     }
 
@@ -644,6 +646,14 @@ impl Canvas2D {
 
     pub fn height(&self) -> u32 {
         self.height
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn mark_drawn(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Raw premultiplied-RGBA pixel buffer. Used for PNG encoding and
@@ -820,6 +830,7 @@ impl Canvas2D {
             canvas.draw_rect(rect, &paint);
             canvas.restore();
         });
+        self.mark_drawn();
     }
 
     pub fn stroke_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
@@ -832,6 +843,7 @@ impl Canvas2D {
             canvas.draw_rect(rect, &paint);
             canvas.restore();
         });
+        self.mark_drawn();
     }
 
     pub fn clear_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
@@ -845,6 +857,7 @@ impl Canvas2D {
             canvas.draw_rect(rect, &paint);
             canvas.restore();
         });
+        self.mark_drawn();
     }
 
     // --- Path ops ---
@@ -911,6 +924,7 @@ impl Canvas2D {
             canvas.draw_path(&sk_path, &paint);
             canvas.restore();
         });
+        self.mark_drawn();
     }
 
     pub fn stroke(&mut self) {
@@ -925,6 +939,7 @@ impl Canvas2D {
             canvas.draw_path(&sk_path, &paint);
             canvas.restore();
         });
+        self.mark_drawn();
     }
 
     // --- Pixel ops ---
@@ -980,6 +995,7 @@ impl Canvas2D {
         self.pixels = vec![0; (width as usize) * (height as usize) * 4];
         self.state = CanvasState::default();
         self.state_stack.clear();
+        self.mark_drawn();
     }
 
     /// `drawImage`: crop a source rectangle and paint it into a destination
@@ -1045,9 +1061,11 @@ impl Canvas2D {
             );
             canvas.restore();
         });
+        self.mark_drawn();
     }
 
     pub fn put_image_data(&mut self, data: &[u8], x: u32, y: u32, w: u32, h: u32) {
+        let mut changed = false;
         let stride = self.width as usize * 4;
         for row in 0..h.min(self.height.saturating_sub(y)) {
             for col in 0..w.min(self.width.saturating_sub(x)) {
@@ -1065,7 +1083,11 @@ impl Canvas2D {
                 self.pixels[dst_offset + 1] = ((g as u16 * a as u16) / 255) as u8;
                 self.pixels[dst_offset + 2] = ((b as u16 * a as u16) / 255) as u8;
                 self.pixels[dst_offset + 3] = a;
+                changed = true;
             }
+        }
+        if changed {
+            self.mark_drawn();
         }
     }
 
@@ -1116,6 +1138,9 @@ impl Canvas2D {
             for glyph in &glyphs {
                 text::composite_glyph(glyph, &mut self.pixels, w, h);
             }
+            if !glyphs.is_empty() {
+                self.mark_drawn();
+            }
             return;
         };
         let mut font = Font::from_typeface(typeface, Some(size_px));
@@ -1142,6 +1167,7 @@ impl Canvas2D {
             canvas.draw_glyphs_at(&ids, &pos[..], Point::new(0.0, 0.0), &font, &paint);
             canvas.restore();
         });
+        self.mark_drawn();
     }
 
     /// Stroke text at `(x, y)` (alphabetic baseline). Builds a Path2D
@@ -1173,6 +1199,7 @@ impl Canvas2D {
             canvas.draw_path(&sk_path, &paint);
             canvas.restore();
         });
+        self.mark_drawn();
     }
 
     // --- Image compositing ---

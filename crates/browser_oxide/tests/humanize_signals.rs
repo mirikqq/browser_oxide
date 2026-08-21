@@ -55,6 +55,32 @@ const HTML: &str = r#"<!doctype html><html><head><title>humanize</title></head><
 </body></html>"#;
 
 #[tokio::test]
+async fn humanize_motion_has_finite_alias_coordinates() {
+    let mut page = Page::from_html(
+        r#"<button style="position:absolute;left:280px;top:180px;width:80px;height:40px">target</button>
+           <script>globalThis.__moves=[];document.addEventListener('mousemove',e=>__moves.push([e.x,e.y,e.clientX,e.clientY]));</script>"#,
+        Some(chrome_148_macos()),
+    )
+    .await
+    .unwrap();
+    page.evaluate(include_str!("../src/js/humanize.js"))
+        .unwrap();
+    let _ = page
+        .evaluate_async(
+            r#"(async()=>{let ns=null;for(const s of Object.getOwnPropertySymbols(globalThis)){const v=globalThis[s];if(v&&v.__bo){ns=v;break}}if(!ns||!ns.input)throw Error('no input');await ns.input.moveTo(320,200)})()"#,
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+    assert_eq!(
+        page.evaluate(
+            r#"String(__moves.length>5&&__moves.every(p=>p.every(Number.isFinite)&&p[0]===p[2]&&p[1]===p[3]&&(p[0]!==0||p[1]!==0)))"#,
+        )
+        .unwrap(),
+        "true"
+    );
+}
+
+#[tokio::test]
 #[ignore = "not yet implemented: wheel-event emission in the synthetic input path"]
 async fn humanize_emits_full_signal_set() {
     // navigate_humanized installs humanize.js as an init script; from_html

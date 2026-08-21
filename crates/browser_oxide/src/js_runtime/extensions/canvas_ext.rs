@@ -31,6 +31,16 @@ impl CanvasState {
             next_id: 1,
         }
     }
+
+    pub(crate) fn devview_meta(&self, id: i32) -> Option<(u64, u32, u32)> {
+        let canvas = self.canvases.get(&id)?;
+        Some((canvas.revision(), canvas.width(), canvas.height()))
+    }
+
+    pub(crate) fn devview_png(&self, id: i32, revision: u64) -> Option<String> {
+        let canvas = self.canvases.get(&id)?;
+        (canvas.revision() == revision).then(|| canvas.to_data_url())
+    }
 }
 
 #[op2(fast)]

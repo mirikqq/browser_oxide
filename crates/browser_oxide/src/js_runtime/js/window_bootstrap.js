@@ -4772,6 +4772,9 @@
 
         globalThis.postMessage = ({
         postMessage(message, targetOrigin, transfer) {
+            const recipientOrigin = globalThis.location?.origin || "null";
+            const wanted = targetOrigin == null ? "/" : String(targetOrigin);
+            if (wanted !== "*" && wanted !== "/" && wanted !== recipientOrigin) return;
             // Use structuredClone if available to match browser behavior.
             // If not available (e.g. during very early bootstrap), fall back to reference.
             let cloned = message;
@@ -4787,7 +4790,8 @@
             Promise.resolve().then(() => {
                 const event = new MessageEvent("message", {
                     data: cloned,
-                    origin: targetOrigin || globalThis.location?.origin || "",
+                    origin: recipientOrigin,
+                    source: globalThis,
                 });
                 globalThis.dispatchEvent(event);
             });

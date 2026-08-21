@@ -116,6 +116,46 @@ fn presentational_declarations(
     out
 }
 
+/// Intrinsic replaced-element size for an outer SVG. Author CSS and explicit
+/// width/height attributes are appended later and therefore keep precedence.
+fn svg_intrinsic_declarations(
+    elem: &crate::dom::node::ElementData,
+) -> HashMap<PropertyId, CssValue> {
+    use crate::css_values::types::length::{Length as CssLength, LengthPercentageAuto as CssLpa};
+    let mut out = HashMap::new();
+    if !elem.name.local.eq_ignore_ascii_case("svg") {
+        return out;
+    }
+    let attr = |name: &str| elem.attrs.iter().find(|a| a.name.local == name);
+    let view_box = attr("viewBox").or_else(|| attr("viewbox")).map(|a| {
+        a.value
+            .split(|c: char| c.is_ascii_whitespace() || c == ',')
+            .filter_map(|part| part.parse::<f64>().ok())
+            .collect::<Vec<_>>()
+    });
+    let ratio = view_box
+        .as_deref()
+        .filter(|parts| parts.len() == 4 && parts[2] > 0.0 && parts[3] > 0.0)
+        .map(|parts| parts[2] / parts[3]);
+    let width = attr("width").and_then(|a| a.value.trim().parse::<f64>().ok());
+    let height = attr("height").and_then(|a| a.value.trim().parse::<f64>().ok());
+    let (fallback_width, fallback_height) = match (width, height, ratio) {
+        (Some(w), None, Some(r)) => (w, w / r),
+        (None, Some(h), Some(r)) => (h * r, h),
+        (None, None, Some(r)) => (300.0, 300.0 / r),
+        _ => (300.0, 150.0),
+    };
+    out.insert(
+        PropertyId::Width,
+        CssValue::LengthPercentageAuto(CssLpa::Length(CssLength::Px(fallback_width))),
+    );
+    out.insert(
+        PropertyId::Height,
+        CssValue::LengthPercentageAuto(CssLpa::Length(CssLength::Px(fallback_height))),
+    );
+    out
+}
+
 /// Elements the UA stylesheet hides.
 ///
 /// Nothing supplied per-tag defaults, so `<head>` and everything in it was laid
@@ -341,6 +381,16 @@ impl LayoutEngine {
                     }
                     // Schedule Finish first so it pops after all children.
                     stack.push(Work::Finish(node_id, self.abs_pending.len()));
+                    // An outer SVG is a replaced element in HTML layout. Its
+                    // graphics tree has its own viewport and must not size the
+                    // surrounding flex/grid box (including foreignObject).
+                    if dom
+                        .get(node_id)
+                        .and_then(|n| n.as_element())
+                        .is_some_and(|e| e.name.local.eq_ignore_ascii_case("svg"))
+                    {
+                        continue;
+                    }
                     // Push children in reverse for document order on pop.
                     let kids = dom.children(node_id);
                     for c in kids.into_iter().rev() {
@@ -408,6 +458,7 @@ impl LayoutEngine {
                 // UA defaults go in first so author rules and inline styles
                 // still win over them.
                 let mut declarations = ua_declarations(&elem.name.local);
+                declarations.extend(svg_intrinsic_declarations(elem));
                 declarations.extend(presentational_declarations(elem));
                 declarations.extend(self.match_rules(dom, node_id));
                 declarations.extend(self.parse_inline_style(elem));

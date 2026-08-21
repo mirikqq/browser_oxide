@@ -4740,12 +4740,15 @@
             // to the framed doc as the delivered event's `source`, NOT as
             // `parent`, so the parent-identity invariant is preserved.
             const _parentOrigin = (globalThis.location && globalThis.location.origin) || "";
-            const _postToParent = function postMessage(msg, origin) {
+            const _rawChildOrigin = _xOrigin(el.getAttribute && el.getAttribute("src"));
+            const _childOrigin = _rawChildOrigin === "null" ? _parentOrigin : _rawChildOrigin;
+            const _postToParent = function postMessage(msg, targetOrigin) {
+                if (targetOrigin != null && targetOrigin !== "*" && String(targetOrigin) !== _parentOrigin) return;
                 Promise.resolve().then(() => {
                     try {
                         globalThis.dispatchEvent(new MessageEvent("message", {
                             data: msg,
-                            origin: (origin && origin !== "*") ? String(origin) : _parentOrigin,
+                            origin: _childOrigin,
                             source: cw,
                         }));
                     } catch (_) {}
@@ -4763,11 +4766,12 @@
             // window.postMessage) deliver a 'message' INTO the child realm. Data
             // crosses the realm boundary as a JSON literal; the event's source
             // is the reply-routing proxy above.
-            const _pm = function postMessage(msg, origin) {
+            const _pm = function postMessage(msg, targetOrigin) {
+                if (targetOrigin != null && targetOrigin !== "*" && String(targetOrigin) !== _childOrigin) return;
                 Promise.resolve().then(() => {
                     try {
                         const _dj = JSON.stringify(msg === undefined ? null : msg);
-                        const _oj = JSON.stringify((origin && origin !== "*") ? String(origin) : _parentOrigin);
+                        const _oj = JSON.stringify(_parentOrigin);
                         ops.op_eval_in_child_realm(_realmId,
                             "try{globalThis.__deliverMessage((" + _dj + ")," + _oj + ",(globalThis.__msgSource||null));}catch(_){}"
                         );

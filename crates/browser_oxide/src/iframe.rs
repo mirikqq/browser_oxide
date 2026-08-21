@@ -11,6 +11,8 @@ use crate::js_runtime::BrowserJsRuntime;
 use std::time::Duration;
 use tracing;
 
+static NEXT_FRAME_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Info about an iframe found in the DOM.
 pub struct IframeInfo {
     pub node_id: NodeId,
@@ -60,6 +62,8 @@ const INSTALL_PARENT_BRIDGE: &str = r#"
 /// A child iframe with its own V8 runtime and DOM.
 pub struct ChildIframe {
     pub node_id: NodeId,
+    pub generation: u64,
+    pub children: Vec<ChildIframe>,
     pub event_loop: BrowserEventLoop,
     /// The `src` or `srcdoc` value this realm was built from, exactly as the
     /// attribute held it.
@@ -150,6 +154,175 @@ fn install_frame_trace(event_loop: &mut BrowserEventLoop) {
 }
 
 impl ChildIframe {
+    pub fn materialize_descendants<'a>(
+        &'a mut self,
+        client: &'a crate::net::HttpClient,
+        profile: &'a crate::stealth::StealthProfile,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = usize> + 'a>> {
+        Box::pin(async move {
+            let base_url = self
+                .evaluate("String(location.href)")
+                .unwrap_or_else(|_| self.source.clone());
+            let infos = {
+                let op_state = self.event_loop.runtime_mut().op_state();
+                let state = op_state.borrow();
+                let dom_state = state.borrow::<crate::js_runtime::state::DomState>();
+                find_iframes(&dom_state.dom)
+            };
+            let invalidated = {
+                let op_state = self.event_loop.runtime_mut().op_state();
+                let mut state = op_state.borrow_mut();
+                let dom_state = state.borrow_mut::<crate::js_runtime::state::DomState>();
+                std::mem::take(&mut dom_state.invalidated_frames)
+            };
+            let live: Vec<NodeId> = infos.iter().map(|info| info.node_id).collect();
+            self.children.retain(|child| {
+                live.contains(&child.node_id) && !invalidated.contains(&child.node_id.to_raw())
+            });
+
+            let mut created = 0;
+            for info in infos {
+                if self
+                    .children
+                    .iter()
+                    .any(|child| child.node_id == info.node_id)
+                {
+                    continue;
+                }
+                let child = if let Some(srcdoc) = info.srcdoc {
+                    Self::from_srcdoc(info.node_id, &srcdoc, profile).await.ok()
+                } else if let Some(src) = info.src {
+                    let full = url::Url::parse(&base_url)
+                        .ok()
+                        .and_then(|base| base.join(&src).ok())
+                        .map(|url| url.to_string());
+                    match full {
+                        Some(full) => {
+                            Box::pin(Self::from_url(info.node_id, &full, client, Some(profile)))
+                                .await
+                                .ok()
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(child) = child {
+                    self.children.push(child);
+                    created += 1;
+                }
+            }
+            for child in &mut self.children {
+                created += child.materialize_descendants(client, profile).await;
+            }
+            self.sync_descendant_geometry();
+            created
+        })
+    }
+
+    pub fn sync_descendant_geometry(&mut self) {
+        let boxes: Vec<(usize, f64, f64, f64, f64)> = {
+            let op_state = self.event_loop.runtime_mut().op_state();
+            let mut state = op_state.borrow_mut();
+            let Some(dom_state) = state.try_borrow_mut::<crate::js_runtime::state::DomState>()
+            else {
+                return;
+            };
+            self.children
+                .iter()
+                .enumerate()
+                .map(|(index, child)| {
+                    let rect = dom_state
+                        .layout_engine
+                        .get_bounding_rect(&dom_state.dom, child.node_id);
+                    (index, rect.x, rect.y, rect.width, rect.height)
+                })
+                .collect()
+        };
+        for (index, x, y, width, height) in boxes {
+            if let Some(child) = self.children.get_mut(index) {
+                if width > 0.0 && height > 0.0 {
+                    child.set_frame_geometry(x, y, width, height);
+                }
+                child.sync_descendant_geometry();
+            }
+        }
+    }
+
+    pub fn drive_descendants<'a>(
+        &'a mut self,
+        slice: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = usize> + 'a>> {
+        Box::pin(async move {
+            let mut count = usize::from(self.event_loop.run_until_idle(slice).await.is_ok());
+            for child in &mut self.children {
+                count += child.drive_descendants(slice).await;
+            }
+            count
+        })
+    }
+
+    pub fn pump_descendant_messages(&mut self) -> (usize, usize) {
+        const NS: &str = "(function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()";
+        let outbound: Vec<String> = self
+            .event_loop
+            .execute_script(&format!("JSON.stringify({NS}.frames.takeChildMessages())"))
+            .ok()
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
+        let mut down = 0;
+        for pair in outbound.chunks(2) {
+            let (Some(node), Some(json)) = (pair.first(), pair.get(1)) else {
+                continue;
+            };
+            let Ok(node) = node.parse::<u32>() else {
+                continue;
+            };
+            let Some(child) = self
+                .children
+                .iter_mut()
+                .find(|child| child.node_id.to_raw() == node)
+            else {
+                continue;
+            };
+            let js = format!(
+                "(function(){{var m={json},ro=(location&&location.origin)||'null';\
+                 if(m.targetOrigin&&m.targetOrigin!=='*'&&m.targetOrigin!==ro)return;\
+                 dispatchEvent(new MessageEvent('message',{{data:m.data,origin:m.origin,source:parent||null}}));}})()"
+            );
+            down += usize::from(child.event_loop.execute_script(&js).is_ok());
+        }
+
+        let mut inbound = Vec::new();
+        for child in &mut self.children {
+            let node = child.node_id.to_raw();
+            if let Ok(raw) = child
+                .event_loop
+                .execute_script(&format!("JSON.stringify({NS}.frames.takeParentMessages())"))
+            {
+                if let Ok(messages) = serde_json::from_str::<Vec<String>>(&raw) {
+                    inbound.extend(messages.into_iter().map(|json| (node, json)));
+                }
+            }
+        }
+        let mut up = 0;
+        for (node, json) in inbound {
+            let js = format!(
+                "(function(){{var m={json},ro=(location&&location.origin)||'null';\
+                 if(m.targetOrigin&&m.targetOrigin!=='*'&&m.targetOrigin!==ro)return;\
+                 var src=null;try{{src={NS}.frames.windowForNode({node});}}catch(_){{}}\
+                 dispatchEvent(new MessageEvent('message',{{data:m.data,origin:m.origin,source:src}}));}})()"
+            );
+            up += usize::from(self.event_loop.execute_script(&js).is_ok());
+        }
+        for child in &mut self.children {
+            let (nested_down, nested_up) = child.pump_descendant_messages();
+            down += nested_down;
+            up += nested_up;
+        }
+        (down, up)
+    }
+
     /// Create a child iframe from srcdoc HTML.
     pub async fn from_srcdoc(
         node_id: NodeId,
@@ -196,6 +369,8 @@ impl ChildIframe {
 
         Ok(Self {
             node_id,
+            generation: NEXT_FRAME_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            children: Vec::new(),
             event_loop,
             source: html.to_string(),
             frame_box: None,
@@ -405,6 +580,8 @@ impl ChildIframe {
 
         Ok(Self {
             node_id,
+            generation: NEXT_FRAME_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            children: Vec::new(),
             event_loop,
             source: url.to_string(),
             frame_box: None,

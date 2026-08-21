@@ -14,6 +14,9 @@ use std::sync::{Mutex, OnceLock};
 
 /// Bodies above this are truncated — a DevTools-style preview, not an archive.
 const MAX_BODY: usize = 16 * 1024;
+/// Keep ordinary diagnostic submissions (including checkcaptcha) intact while
+/// still excluding multi-megabyte uploads from the ring buffer.
+const MAX_REQUEST_BODY: usize = 128 * 1024;
 /// Oldest records are dropped past this.
 const MAX_RECORDS: usize = 600;
 
@@ -37,6 +40,9 @@ pub struct NetRecord {
     /// the question is almost always what was sent — which headers carried the
     /// session, what the payload actually contained.
     pub req_headers: Vec<(String, String)>,
+    /// Original request body length in bytes, before the diagnostic cap.
+    pub req_size: usize,
+    pub req_body_truncated: bool,
     pub req_body: String,
 }
 
@@ -162,10 +168,10 @@ pub fn record_full(
         headers: hdrs,
         body: preview,
         req_headers: req_headers.to_vec(),
+        req_size: req_body.len(),
+        req_body_truncated: req_body.len() > MAX_REQUEST_BODY,
         req_body: {
-            // Same truncation rule as the response, and the same reason: a
-            // multi-megabyte upload must not sit in the ring buffer.
-            let cut = req_body.len().min(MAX_BODY);
+            let cut = req_body.len().min(MAX_REQUEST_BODY);
             String::from_utf8_lossy(&req_body[..cut]).into_owned()
         },
     };
@@ -240,5 +246,26 @@ mod tests {
         assert_eq!(last.kind, "img");
         assert!(last.body.is_empty());
         assert_eq!(last.size, 3);
+    }
+
+    #[test]
+    fn ordinary_large_request_is_not_cut_at_response_preview_limit() {
+        enable();
+        clear();
+        let request = vec![b'x'; 55 * 1024];
+        record_full(
+            "POST",
+            "https://api.hcaptcha.com/checkcaptcha/test",
+            200,
+            &HashMap::new(),
+            b"ok",
+            &[],
+            &request,
+        );
+        let got = since(0);
+        let last = got.last().expect("record was stored");
+        assert_eq!(last.req_size, request.len());
+        assert_eq!(last.req_body.len(), request.len());
+        assert!(!last.req_body_truncated);
     }
 }
