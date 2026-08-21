@@ -254,8 +254,24 @@
       // A frame's document arrives in its own snapshot, after the one that
       // carried the page markup — and the page markup then stops changing. Without
       // marking the mirror dirty the frame box renders once, empty, forever.
+      // A changed canvas bitmap is not a changed document.
+      //
+      // The snapshot embeds each canvas as a data URL inside the frame's
+      // markup, so an animating canvas made every document differ on every
+      // tick — and the mirror answered by rebuilding its whole srcdoc several
+      // times a second. The iframe reloaded each time: the captcha flickered,
+      // its heading re-laid out mid-webfont, and an open challenge looked like
+      // it was closing itself. While the canvas was blank this never showed,
+      // because a blank bitmap encodes to the same bytes every time.
+      //
+      // Structure decides whether to rebuild; the bitmaps are swapped into the
+      // live <img> elements afterwards, which costs no layout at all.
+      const withoutShots = (d) => String(d == null ? '' : d).replace(/ data-bo-shot="[^"]*"/g, '');
       msg.frameDocs.forEach(function (d, i) {
-        if (d !== null && d !== lastFrameDocs[i]) { lastFrameDocs[i] = d; framesDirty = true; }
+        if (d === null || d === lastFrameDocs[i]) return;
+        const structural = withoutShots(d) !== withoutShots(lastFrameDocs[i]);
+        lastFrameDocs[i] = d;
+        if (structural) framesDirty = true;
       });
       // Deliberately not truncated to the incoming length. `null` means "unchanged",
       // so this array is the only copy — and the engine will not resend a document
@@ -495,8 +511,9 @@
     $('counts').textContent = s.counts
       ? `${s.counts.elements} эл · ${s.counts.inputs} input · ${s.counts.buttons} button` : '';
 
-    // A held-back redraw still shows the drawing: only the bitmaps move.
-    if (dragging || Date.now() - lastKeyAt < KEY_QUIET_MS) refreshCanvasShots(s);
+    // Bitmaps are always swapped in place — during a gesture, when a redraw is
+    // held back, and on an ordinary tick where nothing structural changed.
+    refreshCanvasShots(s);
 
     if (s.html && (s.html !== lastHtml || framesDirty)) {
       if (dragging || Date.now() - lastKeyAt < KEY_QUIET_MS) { pendingSnap = s; return; }
@@ -507,11 +524,18 @@
       // the app pins body{overflow:hidden} for a scroll container it never wires up.
       const unfinished = `<style>
         html,body{overflow:auto!important;}
+        /* The frame boxes need their styling *inside* the mirror: this markup
+           lives in the iframe's srcdoc, which the viewer page's own stylesheet
+           never reaches. Without the positioning, a frame box was static, so an
+           absolutely positioned element inside a frame — hCaptcha pins its
+           Privacy/Terms links with bottom/right — resolved against the mirror's
+           body and flew to the corner of the page. Clipping matches what a
+           real iframe does with content past its edge. */
+        .bo-frame{position:relative;display:inline-block;overflow:hidden;vertical-align:top;}
         /* Only in the top document. Inside a frame box this was a lie: hCaptcha
-           hides its own error banner with `opacity: 0`, and forcing it visible
-           made "Please try again" show permanently — plus every element the
-           widget keeps hidden appeared, which is why its logo and the
-           Privacy/Terms links looked misplaced. */
+           hides its own error banner with opacity 0, and forcing it visible
+           made "Please try again" show permanently, along with every other
+           element the widget keeps hidden. */
         [style*="opacity: 0;"]:not(.bo-frame *),[style$="opacity: 0"]:not(.bo-frame *){opacity:1!important;}
       </style>`;
       const html = s.html

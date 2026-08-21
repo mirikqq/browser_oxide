@@ -207,7 +207,27 @@ async fn run() {
     let (events_tx, _) = broadcast::channel::<String>(1024);
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<String>();
 
-    serve_http(port, ws_port).await;
+    // The static page gets its own thread and its own runtime.
+    //
+    // Everything else shares one current-thread runtime with the engine, and
+    // while the engine is inside V8 tokio polls nothing — V8 does not yield.
+    // The socket was bound, so the kernel completed the handshake and the
+    // browser sat waiting for a response that could not be written until the
+    // page finished building, twenty-odd seconds later. Serving the page from
+    // a thread of its own means the view is up the moment the process is.
+    {
+        let (p, wp) = (port, ws_port);
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("devview: cannot build the http runtime");
+            rt.block_on(async move {
+                serve_http(p, wp).await;
+                std::future::pending::<()>().await;
+            });
+        });
+    }
     serve_ws(ws_port, events_tx.clone(), cmd_tx).await;
 
     let open_url = format!("http://127.0.0.1:{port}/");
@@ -292,14 +312,33 @@ async fn run() {
             if let Ok(script) = std::env::var("INIT") {
                 init.push(script);
             }
-            // Challenge widgets are a lifecycle-sensitive path: a pooled navigation
-            // can retain a prior document's state and intentionally skips the cold
-            // challenge-follow loop. Devview is used to diagnose those widgets, so
-            // it must reproduce a fresh browser navigation rather than optimize it.
-            let mut page = match browser_oxide::Page::navigate_with_init(
-                &url, profile, 4, init,
-            )
-            .await
+            // Warm navigation by default; `DEVVIEW_COLD=1` for the cold loop.
+            //
+            // The cold path re-runs a whole fetch-build-drain cycle per
+            // iteration to follow challenge redirects and cookie diffs. That is
+            // worth it in a harness; here it is a minute of black window before
+            // anything is on screen, measured at roughly 25 s against 4 s for
+            // the warm path. The pool is created fresh for this one navigation,
+            // so nothing carries over from an earlier document — what the warm
+            // path actually gives up is the challenge-follow loop, and a driver
+            // sitting in front of the view can simply reload.
+            let cold = std::env::var_os("DEVVIEW_COLD").is_some();
+            let navigated = if cold {
+                browser_oxide::Page::navigate_with_init(&url, profile, 4, init).await
+            } else {
+                let pool = browser_oxide::PagePool::new(1);
+                match pool.acquire(Some(profile)).await {
+                    // The pool's own `navigate_with_init` would run humanize a
+                    // second time, after the page's scripts; it has to go in
+                    // before them, which is what the init list is for.
+                    Ok(mut p) => match p.navigate_warm_with_init(&url, &init).await {
+                        Ok(()) => Ok(p),
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e),
+                }
+            };
+            let mut page = match navigated
             {
                 Ok(p) => p,
                 Err(e) => {

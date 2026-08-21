@@ -2572,9 +2572,45 @@
         createComment(text) {
             return _wrapNode(ops.op_dom_create_comment(text === undefined ? "" : String(text)));
         }
-        createEvent(type) {
-            // Legacy event factory
-            return new Event(type);
+        /// Legacy event factory. Its argument is an *interface* name, not an
+        /// event type: `createEvent('MouseEvent')` hands back an uninitialised
+        /// MouseEvent whose `type` is empty until `initEvent` fills it in.
+        /// Treating the argument as the type produced an `Event` called
+        /// "MouseEvent" that nothing ever listened for.
+        createEvent(iface) {
+            const name = String(iface || "").toLowerCase();
+            const g = globalThis;
+            const table = {
+                event: g.Event, events: g.Event, htmlevents: g.Event,
+                customevent: g.CustomEvent,
+                uievent: g.UIEvent, uievents: g.UIEvent,
+                mouseevent: g.MouseEvent, mouseevents: g.MouseEvent,
+                keyboardevent: g.KeyboardEvent, keyevents: g.KeyboardEvent,
+                focusevent: g.FocusEvent,
+                wheelevent: g.WheelEvent,
+                touchevent: g.TouchEvent,
+                dragevent: g.DragEvent,
+                messageevent: g.MessageEvent,
+                storageevent: g.StorageEvent,
+                hashchangeevent: g.HashChangeEvent,
+                popstateevent: g.PopStateEvent,
+                progressevent: g.ProgressEvent,
+                compositionevent: g.CompositionEvent,
+                animationevent: g.AnimationEvent,
+                transitionevent: g.TransitionEvent,
+            };
+            const Ctor = table[name];
+            if (typeof Ctor !== "function") {
+                throw new DOMException(
+                    "Failed to execute 'createEvent' on 'Document': The provided event type " +
+                    "('" + iface + "') is invalid.",
+                    "NotSupportedError");
+            }
+            const ev = new Ctor("");
+            // Uninitialised until `initEvent`, as in a browser.
+            ev.bubbles = false;
+            ev.cancelable = false;
+            return ev;
         }
         createRange() {
             return new Range();

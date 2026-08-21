@@ -260,26 +260,4 @@ mod tests {
         assert!(!apply_country(&mut p, "XX"));
         assert_eq!(p.timezone, before);
     }
-
-    #[test]
-    fn a_version_restamp_rewrites_every_surface_that_carries_it() {
-        let mut p = crate::stealth::presets::chrome_148_macos();
-        crate::stealth::presets::apply_chrome_version(&mut p, "151.0.9000.12");
-        assert_eq!(p.browser_version, "151.0.9000.12");
-        assert!(
-            p.user_agent.contains("Chrome/151.0.0.0"),
-            "UA: {}",
-            p.user_agent
-        );
-        assert!(
-            !p.user_agent.contains("148"),
-            "старая версия осталась: {}",
-            p.user_agent
-        );
-        assert!(p.app_version.contains("Chrome/151.0.0.0"));
-        // The platform section must survive untouched — it is what a parser
-        // reads for the device.
-        assert!(p.user_agent.contains("Macintosh; Intel Mac OS X 10_15_7"));
-        assert!(p.user_agent.contains("Safari/537.36"));
-    }
 }

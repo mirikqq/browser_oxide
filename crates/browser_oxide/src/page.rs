@@ -64,13 +64,18 @@ mod is_secure_url_tests {
 /// responsible for catching that and bailing out of the iteration.
 struct V8DeadlineWatcher {
     cancel: Arc<AtomicBool>,
+    fired: Arc<AtomicBool>,
+    isolate: deno_core::v8::IsolateHandle,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl V8DeadlineWatcher {
     fn new(isolate: deno_core::v8::IsolateHandle, deadline: Duration) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
+        let fired = Arc::new(AtomicBool::new(false));
         let cancel_clone = cancel.clone();
+        let fired_clone = fired.clone();
+        let isolate_clone = isolate.clone();
         let handle = std::thread::spawn(move || {
             let start = std::time::Instant::now();
             // Poll the cancel flag at 100 ms granularity so drop is fast.
@@ -81,16 +86,18 @@ impl V8DeadlineWatcher {
                 std::thread::sleep(Duration::from_millis(100));
             }
             if !cancel_clone.load(Ordering::Relaxed) {
-                eprintln!(
-                    "[V8DeadlineWatcher] deadline {}ms expired — firing terminate_execution",
-                    deadline.as_millis()
+                fired_clone.store(true, Ordering::Relaxed);
+                tracing::debug!(
+                    deadline_ms = deadline.as_millis() as u64,
+                    "navigation deadline expired — terminating V8 execution"
                 );
-                let ok = isolate.terminate_execution();
-                eprintln!("[V8DeadlineWatcher] terminate_execution returned {}", ok);
+                isolate_clone.terminate_execution();
             }
         });
         Self {
             cancel,
+            fired,
+            isolate,
             handle: Some(handle),
         }
     }
@@ -102,6 +109,16 @@ impl Drop for V8DeadlineWatcher {
         if let Some(h) = self.handle.take() {
             // Best-effort join — watcher polls every 100 ms so this returns fast.
             let _ = h.join();
+        }
+        // Clearing the termination state is not optional.
+        //
+        // `terminate_execution` latches: until it is cancelled, *every* later
+        // script on that isolate throws "execution terminated" — so a page whose
+        // navigation hit the deadline came back permanently dead, and a driver
+        // holding it (devview does) could not run a single line in it again.
+        // The deadline is meant to bound one navigation, not retire the page.
+        if self.fired.load(Ordering::Relaxed) {
+            self.isolate.cancel_terminate_execution();
         }
     }
 }
@@ -2844,12 +2861,33 @@ impl Page {
         } else {
             host_budget_default_ms
         };
-        let mut nav_budget = Duration::from_millis(
-            std::env::var("BROWSER_OXIDE_NAV_BUDGET_MS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(host_budget_default_ms),
-        );
+        // The whole-chain budget is opt-in.
+        //
+        // It is a batch-harness device: a sweep over many sites in parallel
+        // processes has to terminate on its own, so each navigation gets a wall
+        // clock. Outside that it does nothing useful and quietly does harm — it
+        // charges a redirect chain against the same clock as its first hop, so
+        // a 303 late in the chain inherits whatever seconds are left, and a page
+        // a driver means to keep working with is cut off mid-load. A browser has
+        // no such timer.
+        //
+        // Left unset it is effectively unbounded (a day, so the arithmetic below
+        // stays plain `Duration` addition). What still bounds a runaway page is
+        // the per-iteration deadline watcher, which is the only mechanism that
+        // can stop JS that never yields.
+        const UNBOUNDED_MS: u64 = 24 * 60 * 60 * 1000;
+        let explicit_budget_ms = std::env::var("BROWSER_OXIDE_NAV_BUDGET_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok());
+        let budget_requested = explicit_budget_ms.is_some()
+            || std::env::var_os("BROWSER_OXIDE_HOST_BUDGET_MS").is_some()
+            || started_as_awswaf_challenge
+            || started_as_seccpt_challenge;
+        let mut nav_budget = Duration::from_millis(match explicit_budget_ms {
+            Some(ms) => ms,
+            None if budget_requested => host_budget_default_ms,
+            None => UNBOUNDED_MS,
+        });
         let nav_budget_extend = Duration::from_millis(
             std::env::var("BROWSER_OXIDE_NAV_BUDGET_EXTEND_MS")
                 .ok()
@@ -2922,33 +2960,51 @@ impl Page {
             )
             .await?;
 
-            // Install the V8 deadline watcher for the remainder of the
-            // wall-clock budget — but always with a minimum 5s floor so
-            // even iterations past the nominal budget have a safety net.
-            // Without the floor, a budget-exhausted iteration could spin
-            // forever in V8 (no watcher → tokio::time::timeout can't
-            // preempt CPU-bound JS).
-            let remaining = nav_budget
-                .saturating_sub(nav_t0.elapsed())
-                .max(Duration::from_secs(5));
-            eprintln!(
-                "[navigate] iter={} installing V8DeadlineWatcher with {}ms remaining",
-                iter,
-                remaining.as_millis()
-            );
-            let _watcher =
-                V8DeadlineWatcher::new(page.event_loop().runtime_mut().isolate_handle(), remaining);
-
             // Drain the event loop. Use the remaining nav budget (floored at 8s)
             // so that heavy PoW challenges (the VM can take 30+ seconds) can
-            // complete their /tl POST AFTER the PoW finishes. The V8DeadlineWatcher
-            // installed above provides the hard kill for analytics loops that never
-            // reach idle on their own — once V8 is terminated, run_event_loop()
-            // returns and the drain exits naturally.
+            // complete their /tl POST AFTER the PoW finishes.
             let drain_timeout = {
                 let remaining = nav_budget.saturating_sub(nav_t0.elapsed());
-                remaining.max(Duration::from_secs(8))
+                let base = remaining.max(Duration::from_secs(8));
+                // Without a requested budget the remainder is a day, and this
+                // drain would wait that long on any page that never reaches
+                // idle — analytics loops and long-poll sockets never do. The
+                // chain is unbounded; a single drain is not. A harness that
+                // asked for a budget keeps the old behaviour, because heavy
+                // proof-of-work pages need a drain measured in minutes and set
+                // a budget to say so.
+                if budget_requested {
+                    base
+                } else {
+                    Duration::from_secs(8)
+                }
             };
+
+            // The watcher backs the drain up, so its deadline comes from the
+            // drain — not from what is left of the whole-chain budget.
+            //
+            // Deriving it from the chain remainder inverted the guarantee: the
+            // two had different floors (5s against the drain's 8s), so on any
+            // iteration with under 8s left — which is exactly where a redirect
+            // near the end of a chain lands — the watcher fired while the drain
+            // was still entitled to run, killing the load of the page it had
+            // just followed a redirect to. Early iterations meanwhile got a
+            // deadline of tens of seconds and no real protection at all.
+            //
+            // `tokio::time::timeout` cannot preempt CPU-bound JS, which is the
+            // only reason this exists; a couple of seconds past the drain's own
+            // limit is where "the script never yielded" starts.
+            let watcher_deadline = drain_timeout + Duration::from_secs(2);
+            tracing::debug!(
+                iter,
+                drain_ms = drain_timeout.as_millis() as u64,
+                deadline_ms = watcher_deadline.as_millis() as u64,
+                "installing navigation deadline watcher"
+            );
+            let _watcher = V8DeadlineWatcher::new(
+                page.event_loop().runtime_mut().isolate_handle(),
+                watcher_deadline,
+            );
             if let Err(e) = page.event_loop().run_until_idle(drain_timeout).await {
                 tracing::warn!(error = %e, "navigate event loop error");
             }
@@ -5588,5 +5644,27 @@ mod tests {
         // No match → baseline; malformed entry is ignored, not fatal.
         assert_eq!(host_budget_default_ms(Some("other.test")), 15_000);
         std::env::remove_var("BROWSER_OXIDE_HOST_BUDGET_MS");
+    }
+    /// The navigation deadline bounds one navigation; it must not retire the
+    /// page. `terminate_execution` latches until cancelled, so without the
+    /// cancel in `Drop` every later script on that isolate throws.
+    #[tokio::test]
+    async fn deadline_watcher_leaves_the_isolate_usable() {
+        let mut page = Page::from_html(
+            "<!DOCTYPE html><html><body></body></html>",
+            None::<crate::stealth::StealthProfile>,
+        )
+        .await
+        .unwrap();
+        {
+            let watcher = V8DeadlineWatcher::new(
+                page.event_loop().runtime_mut().isolate_handle(),
+                Duration::from_millis(150),
+            );
+            // CPU-bound JS that does not yield: only the watcher can cut it off.
+            let _ = page.evaluate("var t = Date.now(); while (Date.now() - t < 4000) {} 'x'");
+            drop(watcher);
+        }
+        assert_eq!(page.evaluate("1 + 1").unwrap(), "2");
     }
 }

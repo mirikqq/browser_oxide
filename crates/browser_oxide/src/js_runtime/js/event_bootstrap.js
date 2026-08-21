@@ -39,6 +39,14 @@
         preventDefault() {
             if (this.cancelable) this.defaultPrevented = true;
         }
+        /// Legacy initialiser, still used by plenty of shipped code — including
+        /// hCaptcha's own error path, which threw `initEvent is not a function`
+        /// and in doing so swallowed whatever error it was reporting.
+        initEvent(type, bubbles, cancelable) {
+            this.type = String(type);
+            this.bubbles = !!bubbles;
+            this.cancelable = !!cancelable;
+        }
         stopPropagation() { this._stopped = true; }
         stopImmediatePropagation() { this._stopped = true; this._stoppedImmediate = true; }
         composedPath() {
@@ -87,6 +95,11 @@
 
     // --- UI Event hierarchy ---
     class UIEvent extends Event {
+        initUIEvent(type, bubbles, cancelable, view, detail) {
+            this.initEvent(type, bubbles, cancelable);
+            this.view = view || null;
+            this.detail = detail || 0;
+        }
         constructor(type, options = {}) {
             super(type, options);
             this.view = options.view || globalThis;
@@ -143,6 +156,21 @@
         get layerX() { return this.pageX; }
         get layerY() { return this.pageY; }
         get which() { return this.button + 1; }
+        initMouseEvent(type, bubbles, cancelable, view, detail, screenX, screenY,
+                       clientX, clientY, ctrlKey, altKey, shiftKey, metaKey,
+                       button, relatedTarget) {
+            this.initUIEvent(type, bubbles, cancelable, view, detail);
+            this.screenX = screenX || 0;
+            this.screenY = screenY || 0;
+            this.clientX = clientX || 0;
+            this.clientY = clientY || 0;
+            this.ctrlKey = !!ctrlKey;
+            this.altKey = !!altKey;
+            this.shiftKey = !!shiftKey;
+            this.metaKey = !!metaKey;
+            this.button = button || 0;
+            this.relatedTarget = relatedTarget || null;
+        }
         getModifierState(key) { return false; }
     }
 

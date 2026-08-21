@@ -70,6 +70,52 @@ fn measure_text(
     }
 }
 
+/// Presentational size hints: `width` / `height` written as attributes.
+///
+/// `<svg width="44" height="46">` — and the same on `<img>`, `<canvas>`,
+/// `<iframe>` and friends — is how a great deal of markup states its size.
+/// Nothing mapped them into the cascade, so those elements computed
+/// `height: auto` and laid out zero pixels tall: an inline SVG logo occupied
+/// its width and no height at all, and everything drawn inside it collapsed
+/// with it. They enter the cascade below author CSS, which is where the spec
+/// puts presentational hints.
+fn presentational_declarations(
+    elem: &crate::dom::node::ElementData,
+) -> HashMap<PropertyId, CssValue> {
+    const SIZED: &[&str] = &[
+        "img", "svg", "canvas", "iframe", "embed", "object", "video", "input",
+    ];
+    use crate::css_values::types::length::{Length as CssLength, LengthPercentageAuto as CssLpa};
+    let mut out = HashMap::new();
+    if !SIZED.contains(&&*elem.name.local) {
+        return out;
+    }
+    for (attr, prop) in [("width", PropertyId::Width), ("height", PropertyId::Height)] {
+        let Some(raw) = elem
+            .attrs
+            .iter()
+            .find(|a| a.name.local == *attr)
+            .map(|a| a.value.trim())
+        else {
+            continue;
+        };
+        let value = if let Some(pct) = raw.strip_suffix('%') {
+            pct.trim()
+                .parse::<f64>()
+                .ok()
+                .map(|n| CssValue::LengthPercentageAuto(CssLpa::Percentage(n)))
+        } else {
+            raw.parse::<f64>()
+                .ok()
+                .map(|n| CssValue::LengthPercentageAuto(CssLpa::Length(CssLength::Px(n))))
+        };
+        if let Some(v) = value {
+            out.insert(prop, v);
+        }
+    }
+    out
+}
+
 /// Elements the UA stylesheet hides.
 ///
 /// Nothing supplied per-tag defaults, so `<head>` and everything in it was laid
@@ -116,6 +162,9 @@ pub struct LayoutEngine {
     /// Each built node's `position`, so a parent can tell which of its children
     /// are out of flow. Filled as the post-order walk finishes each node.
     css_position: HashMap<u32, Position>,
+    /// Each built node's `display`, so a parent can tell whether its children
+    /// are inline-level and therefore share a line.
+    css_display: HashMap<u32, Display>,
 }
 
 impl LayoutEngine {
@@ -125,6 +174,7 @@ impl LayoutEngine {
             dom_to_taffy: HashMap::new(),
             abs_pending: Vec::new(),
             css_position: HashMap::new(),
+            css_display: HashMap::new(),
             viewport,
             dirty: true,
             root_taffy: None,
@@ -165,6 +215,7 @@ impl LayoutEngine {
         self.dom_to_taffy.clear();
         self.abs_pending.clear();
         self.css_position.clear();
+        self.css_display.clear();
 
         let ctx = ResolveContext {
             font_size: 16.0,
@@ -357,6 +408,7 @@ impl LayoutEngine {
                 // UA defaults go in first so author rules and inline styles
                 // still win over them.
                 let mut declarations = ua_declarations(&elem.name.local);
+                declarations.extend(presentational_declarations(elem));
                 declarations.extend(self.match_rules(dom, node_id));
                 declarations.extend(self.parse_inline_style(elem));
                 let computed = ComputedStyle::resolve(&declarations, None);
@@ -380,7 +432,41 @@ impl LayoutEngine {
                     }
                 }
                 self.css_position.insert(node_id.to_raw(), position);
-                let taffy_style = computed_to_taffy(&computed, ctx);
+                let display = match computed.get(&PropertyId::Display) {
+                    Some(CssValue::Display(d)) => *d,
+                    _ => Display::Inline,
+                };
+                self.css_display.insert(node_id.to_raw(), display);
+                let mut taffy_style = computed_to_taffy(&computed, ctx);
+
+                // Inline-level children share a line.
+                //
+                // Every box is a taffy block, so a container holding
+                // `display: inline-block` children stacked them vertically —
+                // a captcha's checkbox, its label and its logo came out in a
+                // column, and the last of them fell outside the widget's own
+                // box. Laying such a container out as a wrapping row is not a
+                // line-box implementation, but it puts inline-level siblings
+                // where they belong instead of under each other.
+                if taffy_style.display == taffy::Display::Block && children.len() > 1 {
+                    let inline_kids = dom
+                        .children(node_id)
+                        .into_iter()
+                        .filter_map(|c| self.css_display.get(&c.to_raw()))
+                        .filter(|d| {
+                            matches!(
+                                d,
+                                Display::Inline | Display::InlineBlock | Display::InlineFlex
+                            )
+                        })
+                        .count();
+                    if inline_kids > 0 {
+                        taffy_style.display = taffy::Display::Flex;
+                        taffy_style.flex_direction = taffy::FlexDirection::Row;
+                        taffy_style.flex_wrap = taffy::FlexWrap::Wrap;
+                        taffy_style.align_items = Some(taffy::AlignItems::CENTER);
+                    }
+                }
                 match self.tree.new_with_children(taffy_style, &children) {
                     Ok(id) => id,
                     Err(_) => return,
