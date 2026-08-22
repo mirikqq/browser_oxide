@@ -336,12 +336,38 @@ fn nth_of_index<E: Element>(element: &E, sel_list: &SelectorList, from_end: bool
     index
 }
 
+// ponytail: unmemoized `:has()` scan bounded by a visit budget instead of
+// real caching. There's no rule-bucketing in this engine — `match_rules`
+// tests every stylesheet rule against every element — so a `:has()` rule on
+// a real-world SPA (MUI/Emotion pages routinely nest 15+ levels and ship
+// thousands of generated rules) can multiply into a scan large enough to
+// wedge the single-threaded page task for minutes, which looks exactly like
+// a crash from outside. The budget trades perfect `:has()` correctness on
+// such pathological trees for the page actually finishing. Upgrade path:
+// memoize subtree-match results bottom-up per `LayoutEngine::compute` pass
+// (post-order layout already visits children first) if legitimate deep
+// `:has()` usage starts hitting the cap.
+const HAS_DESCENDANT_BUDGET: usize = 20_000;
+
 fn has_matching_descendant<E: Element>(element: &E, selector: &Selector) -> bool {
+    let mut budget = HAS_DESCENDANT_BUDGET;
+    has_matching_descendant_bounded(element, selector, &mut budget)
+}
+
+fn has_matching_descendant_bounded<E: Element>(
+    element: &E,
+    selector: &Selector,
+    budget: &mut usize,
+) -> bool {
     for child in element.child_elements() {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
         if matches_selector(&child, selector) {
             return true;
         }
-        if has_matching_descendant(&child, selector) {
+        if has_matching_descendant_bounded(&child, selector, budget) {
             return true;
         }
     }

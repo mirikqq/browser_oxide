@@ -829,6 +829,30 @@
     globalThis.__browser_oxide._wrapNode = _wrapNode;
     globalThis.__browser_oxide._setCurrentScript = _setCurrentScript;
 
+    // `dispatchEvent` (event_bootstrap.js) needs to read and clear pointer
+    // capture, but `_pointerCaptures` lives in this file's closure — bridged
+    // the same way `activate`/`images`/`frames` are. NOT on `__browser_oxide`:
+    // that object is deleted by cleanup_bootstrap.js before any page script
+    // runs, and `_dispatchEvent` fires for the whole life of the page, long
+    // after cleanup. The first version of this fix used `__browser_oxide` and
+    // was silently inert on every real page for exactly that reason — it only
+    // ever ran during the bootstrap-time smoke check, not once a page loaded.
+    try {
+        Object.defineProperty(_boNs, 'capturedTarget', {
+            value: (pointerId) => _pointerCaptures.get(pointerId | 0) || null,
+            writable: false, configurable: true, enumerable: false,
+        });
+        Object.defineProperty(_boNs, 'releaseCapture', {
+            value: (pointerId, el) => {
+                const id = pointerId | 0;
+                if (_pointerCaptures.get(id) !== el) return;
+                _pointerCaptures.delete(id);
+                _firePointerCapture(el, "lostpointercapture", id);
+            },
+            writable: false, configurable: true, enumerable: false,
+        });
+    } catch (_e) { /* ignore */ }
+
     // The same three, where the host can still reach them. `__browser_oxide` is
     // a named global and the cleanup pass deletes it — correctly, since a page
     // can enumerate globals — but the host drives `document.currentScript` from
@@ -1182,9 +1206,12 @@
         // drag was in progress: the events registered, nothing moved, and the
         // gesture never produced an answer to submit.
         //
-        // Retargeting is not needed here — pointer events are dispatched at the
-        // element under the pointer and bubble — so this tracks the capture and
-        // fires the two events the spec pairs with it.
+        // Retargeting itself lives in `_dispatchEvent` (event_bootstrap.js),
+        // which is the one place that sees every pointer/mouse event
+        // regardless of caller — a fix here would only cover our own
+        // synthetic-input paths, not a page dispatching its own events into a
+        // captured element. This method just tracks the capture and fires the
+        // two events the spec pairs with it.
         setPointerCapture(pointerId) {
             const id = pointerId | 0;
             const prev = _pointerCaptures.get(id);
@@ -1704,17 +1731,30 @@
     };
     _defineHyperlinkUtils(HTMLAnchorElement);
     class HTMLImageElement extends HTMLElement {}
+    // Per spec, `img.width`/`.height` with no content attribute fall back to
+    // the loaded image's intrinsic size — `img.width === img.naturalWidth` is
+    // true in every real browser for a plain `new Image()`. These returned a
+    // bare `0` instead, and site code that scales input by `elementX /
+    // this._image.width` divided by zero: `x / 0` is `Infinity` in JS, not an
+    // exception, so `Math.round(anything / Infinity)` is silently `0` for
+    // every point — every click landed at local (0, 0) no matter where the
+    // pointer actually was, and every subsequent hit-test against an entity's
+    // bounding box failed the same silent way regardless of input. A widget
+    // sizing anything from an unattributed image's `.width` was reading zero
+    // from a fully loaded, correctly-decoded picture.
     Object.defineProperty(HTMLImageElement.prototype, "width", {
         get() {
             const attr = this.getAttribute("width");
-            return attr ? parseInt(attr, 10) : 0;
+            if (attr) return parseInt(attr, 10);
+            return _imgStateOf(this).w;
         },
         enumerable: true, configurable: true
     });
     Object.defineProperty(HTMLImageElement.prototype, "height", {
         get() {
             const attr = this.getAttribute("height");
-            return attr ? parseInt(attr, 10) : 0;
+            if (attr) return parseInt(attr, 10);
+            return _imgStateOf(this).h;
         },
         enumerable: true, configurable: true
     });

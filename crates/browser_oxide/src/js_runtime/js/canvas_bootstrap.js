@@ -1,4 +1,28 @@
 ((globalThis) => {
+    // data: URL base64 payload → Uint8Array. `toBlob` used to wrap the whole
+    // `"data:image/png;base64,...."` *string* in a `Blob`, which text-encodes
+    // it — so the resulting Blob's bytes were the literal ASCII of the data
+    // URL, not the PNG it names. Nothing that read the blob back (an
+    // `<img>.src = URL.createObjectURL(blob)`, a canvas-to-blob upload, a
+    // hash of the pixels) saw a real image.
+    const _dataUrlToBytes = (dataUrl) => {
+        const comma = dataUrl.indexOf(",");
+        const b64 = comma >= 0 ? dataUrl.slice(comma + 1) : "";
+        const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const clean = b64.replace(/[^A-Za-z0-9+/=]/g, "");
+        const len = clean.length;
+        const out = new Uint8Array(Math.floor(len * 3 / 4));
+        let o = 0;
+        for (let i = 0; i < len; i += 4) {
+            const a = chars.indexOf(clean[i]), b = chars.indexOf(clean[i + 1]);
+            const c = chars.indexOf(clean[i + 2]), d = chars.indexOf(clean[i + 3]);
+            out[o++] = (a << 2) | (b >> 4);
+            if (c !== -1 && c !== 64) out[o++] = ((b & 15) << 4) | (c >> 2);
+            if (d !== -1 && d !== 64) out[o++] = ((c & 3) << 6) | d;
+        }
+        return out.subarray(0, o);
+    };
+
     const ops = Deno.core.ops;
 
     // -- Canvas-based font detection support -----------------------------
@@ -1443,7 +1467,13 @@
             return null;
         }
         toDataURL(type) { return ops.op_canvas_to_data_url(this.#canvasId); }
-        toBlob(cb, type) { cb(new Blob([this.toDataURL()])); }
+        toBlob(cb, type) {
+            const url = this.toDataURL();
+            queueMicrotask(() => {
+                try { cb(new Blob([_dataUrlToBytes(url)], { type: type || "image/png" })); }
+                catch (_e) {}
+            });
+        }
         // Minimal Node API
         appendChild(child) { this.childNodes.push(child); return child; }
         removeChild(child) {
@@ -1715,7 +1745,7 @@
                 const url = this._canvasId ? ops.op_canvas_to_data_url(this._canvasId) : "data:,";
                 queueMicrotask(() => {
                     try {
-                        cb(new Blob([url], { type: type || "image/png" }));
+                        cb(new Blob([_dataUrlToBytes(url)], { type: type || "image/png" }));
                     } catch (_e) {}
                 });
             },

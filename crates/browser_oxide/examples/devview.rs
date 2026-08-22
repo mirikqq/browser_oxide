@@ -1031,23 +1031,47 @@ fn wrap_action(inner: &str) -> String {
 /// engine's own input API is used instead.
 const POINTER_JS: &str = r#"(function(){
   var canvasId = Number('__CANVAS_ID__');
-  var el = canvasId >= 0
-    ? [].find.call(document.querySelectorAll('canvas'), function(c){ return (c._canvasId|0) === canvasId; })
-    : document.querySelector(`__SEL__`);
-  if (!el) return 'нет элемента';
-  var r = el.getBoundingClientRect();
   var rawU = __U__, rawV = __V__;
   if (typeof rawU !== 'number' || typeof rawV !== 'number'
       || !Number.isFinite(rawU) || !Number.isFinite(rawV)) return 'некорректные координаты';
   var u = Math.max(0, Math.min(1, rawU));
   var v = Math.max(0, Math.min(1, rawV));
-  var x = r.left + u * r.width;
-  var y = r.top + v * r.height;
+  var vw = Math.max(1, Number(globalThis.innerWidth) || 1);
+  var vh = Math.max(1, Number(globalThis.innerHeight) || 1);
+  var el, x, y;
+  if (canvasId >= 0) {
+    el = [].find.call(document.querySelectorAll('canvas'), function(c){ return (c._canvasId|0) === canvasId; });
+    if (!el) return 'нет элемента';
+    // A canvas's own box, not the frame's: drawImage-space math needs offsets
+    // relative to the surface itself.
+    var r = el.getBoundingClientRect();
+    x = r.left + u * r.width;
+    y = r.top + v * r.height;
+  } else {
+    // Position, not a stale selector, finds the target here.
+    //
+    // `__SEL__` is a `:nth-of-type` path computed against the *mirror's*
+    // snapshot of the DOM, moments before this runs against the *engine's*
+    // own, independently-mutating copy. hCaptcha's widgets mutate constantly
+    // — an error banner, a class toggle, anything that changes a sibling
+    // count anywhere in the ancestor chain — and every `:nth-of-type(n)`
+    // after that point then names a different element than the one the
+    // mirror saw. A click on Verify landed on a grid tile three levels down
+    // a path that had quietly gone stale. `u`/`v` here are normalized against
+    // the frame's own viewport (matching how the mirror computed them), so
+    // the live element under that point — found fresh, the same way a real
+    // click would hit-test — is what actually receives the gesture. The
+    // selector survives only as a fallback for the rare page where the exact
+    // point is occluded by something `elementFromPoint` prefers.
+    x = u * vw;
+    y = v * vh;
+    try { el = document.elementFromPoint(x, y); } catch (e) { el = null; }
+    if (!el) { try { el = document.querySelector(`__SEL__`); } catch (e2) { el = null; } }
+    if (!el) return 'нет элемента';
+  }
   // Event coordinates are CSS viewport pixels. Clamp after converting the
   // mirror offset: neither a canvas backing-store coordinate nor a stale mirror
   // rect may place a pointer outside the browser profile's viewport.
-  var vw = Math.max(1, Number(globalThis.innerWidth) || 1);
-  var vh = Math.max(1, Number(globalThis.innerHeight) || 1);
   x = Math.max(0, Math.min(vw - 1, x));
   y = Math.max(0, Math.min(vh - 1, y));
   var ns = (function(){try{var s=Object.getOwnPropertySymbols(globalThis);

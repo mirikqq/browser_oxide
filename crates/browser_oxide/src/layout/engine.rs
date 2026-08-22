@@ -248,6 +248,14 @@ impl LayoutEngine {
         self.dirty = true;
     }
 
+    /// Whether a mutation has happened since the layout tree was last built.
+    /// Callers outside this module use it to know when a value they derived
+    /// from the DOM (e.g. a cached `getComputedStyle` result) is safe to
+    /// reuse rather than recompute.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
     /// Compute layout for the entire DOM tree.
     pub fn compute(&mut self, dom: &Dom) {
         // Clear previous tree

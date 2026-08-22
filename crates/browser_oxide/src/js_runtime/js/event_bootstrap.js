@@ -1,4 +1,19 @@
 ((globalThis) => {
+    // Looked up once at module load — dom_bootstrap.js runs first and has
+    // already installed it — rather than scanning
+    // `Object.getOwnPropertySymbols(globalThis)` on every single dispatch,
+    // which `_dispatchEvent` is.
+    const _boNs = (function () {
+        try {
+            const syms = Object.getOwnPropertySymbols(globalThis);
+            for (let i = 0; i < syms.length; i++) {
+                const v = globalThis[syms[i]];
+                if (v && v.__bo) return v;
+            }
+        } catch (_e) { /* ignore */ }
+        return null;
+    })();
+
     // ---- Trusted-event authenticity (v0.1.0 behavioral E1) ----------------
     // `isTrusted` MUST be both unforgeable and shaped like a real browser's:
     //   * a GETTER on Event.prototype — NOT an own data property. Scripts
@@ -450,19 +465,49 @@
         if (idx !== -1) listeners.splice(idx, 1);
     };
 
+    // Pointer capture retargeting.
+    //
+    // `setPointerCapture` had no effect on dispatch at all: `_pointerCaptures`
+    // (dom_bootstrap.js) recorded the capture and fired `gotpointercapture`,
+    // but every later `pointermove`/`pointerup` still went to whatever
+    // `elementFromPoint` said, exactly as if nothing had been captured. A drag
+    // implementation that captures on `pointerdown` — the standard pattern,
+    // and the one a "move this piece" challenge uses — lost track of what it
+    // was dragging the moment the pointer drifted off the piece's own box,
+    // which a fast or coarse synthetic path does constantly. The widget's own
+    // drag state then answered a question that was never actually asked:
+    // where the piece ended up relative to nothing it was tracking.
+    const _RETARGETS_ON_CAPTURE = new Set([
+        "pointermove", "pointerup", "pointercancel", "mousemove", "mouseup",
+    ]);
+    // Implicit release happens after `mouseup`, not `pointerup`: every caller
+    // in this engine fires pointerup then its mouse-compat pairing for the
+    // same up gesture (POINTER_JS, humanize.js), so releasing only after the
+    // second means both still see the same capture. `pointercancel` has no
+    // such pairing and releases on its own.
+    const _RELEASES_CAPTURE = new Set(["mouseup", "pointercancel"]);
+
     const _dispatchEvent = function dispatchEvent(event) {
         if (!(event instanceof Event)) {
             throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
         }
-        event.target = this;
-        const nodeId = _getNodeIdOrMinusOne(this);
+        let dispatchTarget = this;
+        if (_RETARGETS_ON_CAPTURE.has(event.type)) {
+            try {
+                const pid = (typeof event.pointerId === "number") ? event.pointerId : 1;
+                const captured = _boNs && _boNs.capturedTarget && _boNs.capturedTarget(pid);
+                if (captured) dispatchTarget = captured;
+            } catch (_e) { /* ignore */ }
+        }
+        event.target = dispatchTarget;
+        const nodeId = _getNodeIdOrMinusOne(dispatchTarget);
 
         // Build propagation path (target → root) if it's a DOM node.
         // Real Chrome's EventTarget.prototype.dispatchEvent handles the
         // tree-walk automatically if 'this' is a Node.
         const path = [];
-        if (nodeId !== -1 && this.parentNode !== undefined) {
-            let current = this;
+        if (nodeId !== -1 && dispatchTarget.parentNode !== undefined) {
+            let current = dispatchTarget;
             while (current) {
                 path.push(current);
                 current = current.parentNode;
@@ -479,8 +524,8 @@
         // origin because the pointer had never been seen.
         if (path.length && path[path.length - 1] === globalThis.document) {
             path.push(globalThis);
-        } else if (this === globalThis.document) {
-            path.push(this, globalThis);
+        } else if (dispatchTarget === globalThis.document) {
+            path.push(dispatchTarget, globalThis);
         }
 
         // Capture phase (root → target)
@@ -495,10 +540,10 @@
 
         // Target phase
         if (!event._stopped) {
-            event.currentTarget = this;
+            event.currentTarget = dispatchTarget;
             event.eventPhase = 2;
-            _fireListeners(this, event, false);
-            _fireListeners(this, event, true);
+            _fireListeners(dispatchTarget, event, false);
+            _fireListeners(dispatchTarget, event, true);
         }
 
         // Bubble phase (target → root)
@@ -513,6 +558,14 @@
 
         event.eventPhase = 0;
         event.currentTarget = null;
+
+        if (_RELEASES_CAPTURE.has(event.type)) {
+            try {
+                const pid = (typeof event.pointerId === "number") ? event.pointerId : 1;
+                if (_boNs && _boNs.releaseCapture) _boNs.releaseCapture(pid, dispatchTarget);
+            } catch (_e) { /* ignore */ }
+        }
+
         return !event.defaultPrevented;
     };
 

@@ -220,6 +220,19 @@ pub struct FetchResponse {
     pub status_text: String,
     pub headers: HashMap<String, String>,
     pub body: String,
+    /// Base64 of the exact response bytes.
+    ///
+    /// `body` is `String::from_utf8_lossy` of them — every byte sequence that
+    /// is not valid UTF-8 becomes U+FFFD, which a later `TextEncoder` turns
+    /// into `EF BF BD`. A binary response (a PNG, a protobuf, a WASM module)
+    /// read through `arrayBuffer()`/`blob()` therefore came back corrupted:
+    /// its real first bytes (`89 50 4E 47` for a PNG) arrived as replacement
+    /// characters. `body` stays lossy for `text()`/`json()`, which is what
+    /// those are for; anything reading raw bytes uses this field instead.
+    pub body_base64: String,
+    /// Byte length of the real response body, independent of what the lossy
+    /// UTF-16 `body` string's `.length` would report.
+    pub body_size: usize,
     pub url: String,
     pub ok: bool,
 }
@@ -267,6 +280,8 @@ pub async fn op_fetch(
                 status_text: "".to_string(),
                 headers: HashMap::new(),
                 body: String::new(),
+                body_base64: String::new(),
+                body_size: 0,
                 url: url.clone(),
                 ok: false,
             });
@@ -288,6 +303,8 @@ pub async fn op_fetch(
             status_text: "OK".to_string(),
             headers: HashMap::new(),
             body: String::new(),
+            body_base64: String::new(),
+            body_size: 0,
             url: url.clone(),
             ok: true,
         });
@@ -377,12 +394,19 @@ pub async fn op_fetch(
 
     let ok = resp.ok();
     let body_text = resp.text();
+    let body_base64 = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(&resp.body)
+    };
+    let body_size = resp.body.len();
 
     let final_resp = FetchResponse {
         status: resp.status,
         status_text: resp.status_text.clone(),
         headers: resp.headers.clone(),
         body: body_text,
+        body_base64,
+        body_size,
         url: resp.url.clone(),
         ok,
     };
@@ -747,6 +771,14 @@ pub fn op_net_xhr_sync(
                     let status = resp.status;
                     let resp_url = resp.url.clone();
                     let body_text = resp.text();
+                    // Same lossy/exact split as the async fetch path — a
+                    // sync XHR reading a binary body (the PoW-VM style
+                    // challenge does this) hit the identical corruption.
+                    let body_base64 = {
+                        use base64::Engine as _;
+                        base64::engine::general_purpose::STANDARD.encode(&resp.body)
+                    };
+                    let body_size = resp.body.len();
                     // Serialize headers as [[k,v],...] for JS.
                     let headers_arr: Vec<[String; 2]> = resp.headers
                         .into_iter()
@@ -757,6 +789,8 @@ pub fn op_net_xhr_sync(
                         "url": resp_url,
                         "headers": headers_arr,
                         "body": body_text,
+                        "bodyBase64": body_base64,
+                        "bodySize": body_size,
                     }).to_string()
                 }
                 Ok(Err(e)) => {

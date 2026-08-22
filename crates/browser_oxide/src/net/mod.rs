@@ -294,6 +294,29 @@ impl HttpClient {
         Ok(tcp_stream)
     }
 
+    /// TCP-connect + TLS-handshake, retrying once (fresh socket, fresh
+    /// handshake) on a bare connection reset. CDNs occasionally RST a
+    /// legitimate handshake — edge-node hiccup, fingerprint sampling — even
+    /// though the very next attempt from the same client succeeds; real
+    /// browsers retry transparently, so a lone reset shouldn't sink the
+    /// whole request.
+    async fn connect_tcp_tls(
+        &self,
+        connector: &SslConnector,
+        host: &str,
+        port: u16,
+    ) -> Result<tokio_boring2::SslStream<tokio::net::TcpStream>, NetError> {
+        let tcp_stream = self.connect_tcp(host, port).await?;
+        match tls::connect_tls(connector, &self.profile, host, tcp_stream).await {
+            Ok(stream) => Ok(stream),
+            Err(e) if is_connection_reset(&e) => {
+                let tcp_stream = self.connect_tcp(host, port).await?;
+                tls::connect_tls(connector, &self.profile, host, tcp_stream).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Create a new client with the given stealth profile.
     pub fn new(profile: &StealthProfile) -> Result<Self, NetError> {
         let connector = tls::chrome_connector(profile)?;
@@ -570,10 +593,7 @@ impl HttpClient {
     /// Connect TCP+TLS and perform HTTP/2 handshake, returning a sender.
     /// Also spawns the connection driver task.
     async fn connect_h2(&self, host: &str, port: u16) -> Result<SendRequest<Bytes>, NetError> {
-        let tcp_stream = self.connect_tcp(host, port).await?;
-
-        let tls_stream =
-            tls::connect_tls(&self.tls_connector, &self.profile, host, tcp_stream).await?;
+        let tls_stream = self.connect_tcp_tls(&self.tls_connector, host, port).await?;
 
         // Check ALPN
         let alpn = tls::negotiated_alpn(&tls_stream);
@@ -732,16 +752,7 @@ impl HttpClient {
         let response = match response {
             Some(r) => r,
             None => {
-                let tcp_stream = tcp::connect_via_proxy(
-                    host,
-                    port,
-                    std::time::Duration::from_secs(10),
-                    Some(&self.dns_cache),
-                    self.proxy.as_ref(),
-                )
-                .await?;
-                let mut tls_stream =
-                    tls::connect_tls(&self.tls_connector, &self.profile, host, tcp_stream).await?;
+                let mut tls_stream = self.connect_tcp_tls(&self.tls_connector, host, port).await?;
                 let path = if parsed.query().is_some() {
                     format!("{}?{}", parsed.path(), parsed.query().unwrap())
                 } else {
@@ -872,16 +883,7 @@ impl HttpClient {
             Some(r) => r,
             None => {
                 // HTTP/1.1 fallback
-                let tcp_stream = tcp::connect_via_proxy(
-                    host,
-                    port,
-                    std::time::Duration::from_secs(10),
-                    Some(&self.dns_cache),
-                    self.proxy.as_ref(),
-                )
-                .await?;
-                let mut tls_stream =
-                    tls::connect_tls(&self.tls_connector, &self.profile, host, tcp_stream).await?;
+                let mut tls_stream = self.connect_tcp_tls(&self.tls_connector, host, port).await?;
                 let path = if parsed.query().is_some() {
                     format!("{}?{}", parsed.path(), parsed.query().unwrap())
                 } else {
@@ -1111,9 +1113,8 @@ impl HttpClient {
         }
         drop(jar);
 
-        let tcp_stream = self.connect_tcp(host, port).await?;
         let connector = tls::chrome_connector(&self.profile)?;
-        let mut tls_stream = tls::connect_tls(&connector, &self.profile, host, tcp_stream).await?;
+        let mut tls_stream = self.connect_tcp_tls(&connector, host, port).await?;
 
         let raw = h1_client::send_post(&mut tls_stream, host, &path, &hdrs, body).await?;
         self.build_response_from_raw(raw, url, "POST", &hdrs, body)
@@ -1231,17 +1232,8 @@ impl HttpClient {
         let response = match response {
             Some(r) => r,
             None => {
-                let tcp_stream = tcp::connect_via_proxy(
-                    host,
-                    port,
-                    std::time::Duration::from_secs(10),
-                    Some(&self.dns_cache),
-                    self.proxy.as_ref(),
-                )
-                .await?;
                 let connector = tls::chrome_connector(&self.profile)?;
-                let mut tls_stream =
-                    tls::connect_tls(&connector, &self.profile, host, tcp_stream).await?;
+                let mut tls_stream = self.connect_tcp_tls(&connector, host, port).await?;
                 let path = if parsed.query().is_some() {
                     format!("{}?{}", parsed.path(), parsed.query().unwrap())
                 } else {
@@ -1381,16 +1373,7 @@ impl HttpClient {
         let response = match response {
             Some(r) => r,
             None => {
-                let tcp_stream = tcp::connect_via_proxy(
-                    host,
-                    port,
-                    std::time::Duration::from_secs(10),
-                    Some(&self.dns_cache),
-                    self.proxy.as_ref(),
-                )
-                .await?;
-                let mut tls_stream =
-                    tls::connect_tls(&self.tls_connector, &self.profile, host, tcp_stream).await?;
+                let mut tls_stream = self.connect_tcp_tls(&self.tls_connector, host, port).await?;
                 let path = match parsed.query() {
                     Some(q) => format!("{}?{}", parsed.path(), q),
                     None => parsed.path().to_string(),
@@ -1570,6 +1553,12 @@ impl HttpClient {
             timings: TimingStats::default(),
         })
     }
+}
+
+/// A bare TCP-level reset seen while dialing — retried once by
+/// [`HttpClient::connect_tcp_tls`] rather than failing the request outright.
+fn is_connection_reset(e: &NetError) -> bool {
+    e.to_string().contains("Connection reset by peer")
 }
 
 /// Detect whether an error indicates a stale/closed pooled connection that can

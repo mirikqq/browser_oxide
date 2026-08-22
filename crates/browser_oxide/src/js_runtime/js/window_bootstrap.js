@@ -4141,6 +4141,54 @@
     }).getComputedStyle;
     _maskFunction(globalThis.getComputedStyle, 'getComputedStyle');
 
+    // Base64 → Uint8Array, self-contained so it does not depend on a global
+    // `atob` a page could have shadowed by the time a response arrives.
+    const _xhrB64ToBytes = (b64) => {
+        if (!b64) return new Uint8Array(0);
+        const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const clean = String(b64).replace(/[^A-Za-z0-9+/=]/g, "");
+        const len = clean.length;
+        const out = new Uint8Array(Math.floor(len * 3 / 4));
+        let o = 0;
+        for (let i = 0; i < len; i += 4) {
+            const a = chars.indexOf(clean[i]), b = chars.indexOf(clean[i + 1]);
+            const c = chars.indexOf(clean[i + 2]), d = chars.indexOf(clean[i + 3]);
+            out[o++] = (a << 2) | (b >> 4);
+            if (c !== -1 && c !== 64) out[o++] = ((b & 15) << 4) | (c >> 2);
+            if (d !== -1 && d !== 64) out[o++] = ((c & 3) << 6) | d;
+        }
+        return out.subarray(0, o);
+    };
+
+    /// The `.response` value for a finished XHR, from the raw response bytes.
+    ///
+    /// It used to be `xhr.response = xhr.responseText` unconditionally — every
+    /// `responseType` came back as the lossy UTF-8 text, so `responseType =
+    /// "arraybuffer"` handed a page a buffer built from a string that had
+    /// already lost every non-UTF-8 byte to U+FFFD, and `"blob"` wrapped that
+    /// same corrupted text. A binary payload (a PNG, a protobuf, a signed
+    /// token) read through XHR came back mangled the identical way a `fetch()`
+    /// arrayBuffer used to.
+    const _xhrResponseFor = (xhr, bytes, text, contentType) => {
+        switch (xhr.responseType) {
+            case "arraybuffer":
+                return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+            case "blob": {
+                const b = new Blob([]);
+                b._data = bytes;
+                b.size = bytes.byteLength;
+                b.type = contentType || "";
+                return b;
+            }
+            case "json":
+                try { return JSON.parse(text); } catch (_e) { return null; }
+            case "":
+            case "text":
+            default:
+                return text;
+        }
+    };
+
     // XMLHttpRequest stub (built on fetch)
     // XMLHttpRequest — must extend EventTarget and expose the full Chrome
     // shape. Some scripts monkey-patch `XMLHttpRequest.prototype.send`
@@ -4326,7 +4374,11 @@
                         }
                     }
                     xhr.responseText = result.body || '';
-                    xhr.response = xhr.responseText;
+                    {
+                        const bytes = _xhrB64ToBytes(result.bodyBase64 || '');
+                        const ct = xhr._respHeaders['content-type'] || '';
+                        xhr.response = _xhrResponseFor(xhr, bytes, xhr.responseText, ct);
+                    }
                     xhr.readyState = 2; fireEvent('readystatechange');
                     xhr.readyState = 3; fireEvent('readystatechange');
                     xhr.readyState = 4; fireEvent('readystatechange');
@@ -4368,7 +4420,12 @@
                     xhr.readyState = 3;
                     fireEvent('readystatechange');
                     xhr.responseText = await resp.text();
-                    xhr.response = xhr.responseText;
+                    {
+                        const buf = await resp.arrayBuffer();
+                        const bytes = new Uint8Array(buf);
+                        const ct = xhr._respHeaders['content-type'] || '';
+                        xhr.response = _xhrResponseFor(xhr, bytes, xhr.responseText, ct);
+                    }
                     xhr.readyState = 4;
                     fireEvent('readystatechange');
                     fireEvent('load');

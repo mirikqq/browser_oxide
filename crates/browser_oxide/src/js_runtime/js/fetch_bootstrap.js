@@ -1,6 +1,25 @@
 ((globalThis) => {
     const ops = Deno.core.ops;
 
+    // Base64 → Uint8Array. Self-contained: this runs early in the bootstrap
+    // chain, before a page script gets any chance to shadow a global `atob`.
+    const _b64ToBytes = (b64) => {
+        if (!b64) return new Uint8Array(0);
+        const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const clean = String(b64).replace(/[^A-Za-z0-9+/=]/g, "");
+        const len = clean.length;
+        const out = new Uint8Array(Math.floor(len * 3 / 4));
+        let o = 0;
+        for (let i = 0; i < len; i += 4) {
+            const a = chars.indexOf(clean[i]), b = chars.indexOf(clean[i + 1]);
+            const c = chars.indexOf(clean[i + 2]), d = chars.indexOf(clean[i + 3]);
+            out[o++] = (a << 2) | (b >> 4);
+            if (c !== -1 && c !== 64) out[o++] = ((b & 15) << 4) | (c >> 2);
+            if (d !== -1 && d !== 64) out[o++] = ((c & 3) << 6) | d;
+        }
+        return out.subarray(0, o);
+    };
+
     class Headers {
         #map;
         constructor(init = {}) {
@@ -231,6 +250,31 @@
             throw new TypeError("Failed to fetch");
         }
 
+        // data: URLs never touch the network — they carry their payload in
+        // the URL itself. Nothing intercepted them, so `fetch("data:...")`
+        // fell through to the real HTTP op, which parsed the URL, found no
+        // host to connect to, and errored. `fetch(canvas.toDataURL())` —
+        // the standard cross-browser idiom for turning a canvas into a
+        // Blob before `.arrayBuffer()`/upload — is exactly this shape, and
+        // an image built that way never made it out as a Response at all.
+        if (url && url.startsWith("data:")) {
+            const comma = url.indexOf(",");
+            if (comma < 0) throw new TypeError("Failed to fetch");
+            const meta = url.slice(5, comma);
+            const isBase64 = /;base64$/i.test(meta);
+            const mediaType = meta.replace(/;base64$/i, "") || "text/plain;charset=US-ASCII";
+            const payload = url.slice(comma + 1);
+            const bytes = isBase64 ? _b64ToBytes(payload) : new TextEncoder().encode(decodeURIComponent(payload));
+            const decoded = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+            return new Response(decoded, {
+                _rawBytes: bytes,
+                status: 200,
+                statusText: "OK",
+                headers: { "content-type": mediaType },
+                url,
+            });
+        }
+
         // blob: URLs short-circuit the HTTP client: look up the bytes
         // in the Rust BlobRegistry and synthesise a Response. Matches
         // Chrome's `fetch(URL.createObjectURL(blob))` shape — returns
@@ -380,14 +424,20 @@
 
             const entries = browser_oxide && browser_oxide.__perfResourceEntries;
             if (entries) {
-                entries.push({ url, type: "fetch", startTime, duration: performance.now() - startTime, size: result.body ? result.body.length : 0 });
+                entries.push({ url, type: "fetch", startTime, duration: performance.now() - startTime, size: result.body_size ?? (result.body ? result.body.length : 0) });
             }
 
             // Sync cookies from the net jar into document.cookie so subsequent JS
             // reads (including challenge polling loops) see Set-Cookie
             // values that arrived via this response.
             await _syncCookiesFromNet(url);
+            // `result.body` is lossy UTF-8 (see `FetchResponse::body_base64` on
+            // the Rust side) — fine for text()/json(), wrong for a binary
+            // payload read through arrayBuffer()/blob(). The exact bytes ride
+            // along as base64 and become `_rawBytes`, which is what those two
+            // methods actually read.
             return new Response(result.body, {
+                _rawBytes: _b64ToBytes(result.body_base64),
                 status: result.status,
                 statusText: result.status_text,
                 headers: result.headers,

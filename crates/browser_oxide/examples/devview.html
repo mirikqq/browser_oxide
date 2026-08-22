@@ -711,16 +711,36 @@
               v: Math.max(0, Math.min(1, (ev.clientY - sr.top) / Math.max(1, sr.height))),
             };
           }
+          // `u`/`v` are normalized against the FRAME's own box, not the clicked
+          // element's — same discipline as the canvas branch above, and for the
+          // same reason. `sel` is a `:nth-of-type` path computed against *this*
+          // snapshot of the mirror's DOM; the engine re-resolves it against its
+          // own, independently-mutating live DOM. hCaptcha's own widgets mutate
+          // constantly (an error banner appears, a class toggles, a canvas
+          // revision bumps something upstream of the target) — any sibling-count
+          // change anywhere in the ancestor chain between snapshot and click
+          // shifts every `:nth-of-type(n)` after it, and the query lands on
+          // whichever *other* element now sits in that slot. A click aimed at
+          // Verify landed on a grid tile instead — same button, same visible
+          // position, wrong element three levels down a stale position path.
+          // `sel` still rides along as a hint for the engine's own
+          // `elementFromPoint` fallback, but position is what actually locates
+          // the target now.
           if (box) {
             const body = box.querySelector('.bo-frame-body');
             if (!body || !body.contains(el)) return null;
+            const br = body.getBoundingClientRect();
             return { index: frame, sel: selectorWithin(body, el),
-              u: Math.max(0, Math.min(1, ox / Math.max(1, r.width))),
-              v: Math.max(0, Math.min(1, oy / Math.max(1, r.height))) };
+              u: Math.max(0, Math.min(1, (ev.clientX - br.left) / Math.max(1, br.width))),
+              v: Math.max(0, Math.min(1, (ev.clientY - br.top) / Math.max(1, br.height))) };
           }
-          return { index: null, sel: selectorFor(el),
-            u: Math.max(0, Math.min(1, ox / Math.max(1, r.width))),
-            v: Math.max(0, Math.min(1, oy / Math.max(1, r.height))) };
+          {
+            const vw = Math.max(1, (ev.view && ev.view.innerWidth) || 1);
+            const vh = Math.max(1, (ev.view && ev.view.innerHeight) || 1);
+            return { index: null, sel: selectorFor(el),
+              u: Math.max(0, Math.min(1, ev.clientX / vw)),
+              v: Math.max(0, Math.min(1, ev.clientY / vh)) };
+          }
         };
         let lastPointer = null;
         const sendPointer = (phase, ev) => {
