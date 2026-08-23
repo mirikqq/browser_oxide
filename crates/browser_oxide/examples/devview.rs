@@ -122,6 +122,7 @@ const SNAPSHOT_JS: &str = r#"
   return JSON.stringify({
     url: location.href,
     title: document.title,
+    viewport: [innerWidth, innerHeight],
     html: __boSerialize(),
     actionables: acts,
     frames: frames,
@@ -1066,7 +1067,17 @@ const POINTER_JS: &str = r#"(function(){
     x = u * vw;
     y = v * vh;
     try { el = document.elementFromPoint(x, y); } catch (e) { el = null; }
-    if (!el) { try { el = document.querySelector(`__SEL__`); } catch (e2) { el = null; } }
+    // `<body>`/`<html>` itself is never really the target — real content
+    // covers that whole area, so landing there means `u`/`v` (fractions of
+    // the *mirror's* own rendered width) missed this page's actual layout —
+    // the mirror panel and this page's real viewport can differ sharply in
+    // both size and aspect ratio, and CSS that reflows differently at each
+    // width puts the same fraction over different content. The selector,
+    // computed at click time against the mirror's own DOM shape, still names
+    // the right element even when the coordinate doesn't.
+    if (!el || el === document.body || el === document.documentElement) {
+      try { var bySel = document.querySelector(`__SEL__`); if (bySel) el = bySel; } catch (e2) {}
+    }
     if (!el) return 'нет элемента';
   }
   // Event coordinates are CSS viewport pixels. Clamp after converting the
@@ -1081,7 +1092,13 @@ const POINTER_JS: &str = r#"(function(){
       : ((ns && ns.input && typeof ns.input.mark === 'function') ? ns.input.mark : null);
   var st = ns ? (ns.__drag || (ns.__drag = {})) : {};
   function underPointer() {
-    try { return document.elementFromPoint(x, y) || el; } catch (e) { return el; }
+    // Same body/html distrust as the initial resolution above — this re-runs
+    // the live hit-test on every phase (down/move/up), so a coordinate that
+    // missed once misses identically each time without this check.
+    try {
+      var hit = document.elementFromPoint(x, y);
+      return (hit && hit !== document.body && hit !== document.documentElement) ? hit : el;
+    } catch (e) { return el; }
   }
   function fire(type, Ctor, receiver) {
     var isMove = type === 'pointermove' || type === 'mousemove';
@@ -1126,9 +1143,17 @@ const POINTER_JS: &str = r#"(function(){
     var target = underPointer();
     var down = st.down;
     fire('pointerup', P, target); fire('mouseup', globalThis.MouseEvent, target);
-    // A canvas is one DOM element for every tile. Compare geometry as well as
-    // target identity so a completed canvas drag cannot turn into a click.
-    if (down && !down.dragged && down.target === target) {
+    // A canvas is one DOM element for every tile, so exact-target equality
+    // still catches a completed drag from one tile onto another. But a real
+    // click's up doesn't always hit-test to the literal same element as its
+    // down — a button's inner label span, an icon glyph, a hair of sub-pixel
+    // jitter — and the browser fires `click` there too, provided the two are
+    // on the same ancestor chain. Requiring strict `===` silently ate exactly
+    // that case: down on a `<button>`, up one DOM level in on its label.
+    var related = down && (down.target === target
+      || (down.target.contains && down.target.contains(target))
+      || (target.contains && target.contains(down.target)));
+    if (down && !down.dragged && related) {
       fire('click', globalThis.MouseEvent, target);
     }
     st.down = null;

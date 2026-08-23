@@ -24,7 +24,15 @@
   .cline { padding:1px 8px; border-bottom:1px solid #202228; white-space:pre-wrap; word-break:break-all; }
   .cline.error { color:var(--bad); } .cline.warn { color:var(--warn); }
   .cline.info { color:var(--acc); } .cline .ts { color:var(--dim); margin-right:6px; }
-  #mirror { border:0; width:100%; height:100%; background:#fff; }
+  /* Default before the first snapshot's real viewport size is known; `fitMirror`
+     overrides both with inline styles (exact profile pixels, scaled down to fit
+     the stage) the moment it is. `position:absolute` takes it out of flow —
+     `transform` doesn't shrink an element's own layout footprint, only its
+     paint, so an in-flow iframe set to the profile's full (often 1000px+)
+     height fed that size straight into #left's grid track and grew #stage to
+     match, shoving the console out of view. Same fix `#overlay` already uses. */
+  #mirror { position:absolute; top:0; left:0; border:0; width:100%; height:100%;
+            background:#fff; transform-origin:0 0; }
   /* The engine has no cursor; this overlay draws where its behaviour generator
      believes the pointer is, so the synthesised path is visible while it happens. */
   #overlay { position:absolute; inset:0; pointer-events:none; }
@@ -389,10 +397,48 @@
     </div>`;
   }
 
+  // ---- mirror sizing -------------------------------------------------------------
+  // The mirror used to just fill the stage at 100%/100%, independent of the
+  // engine's actual viewport (a desktop profile is commonly 1900-2500px wide,
+  // the stage panel a fraction of that). `srcdoc` content reflows to whatever
+  // width its iframe renders at, so responsive CSS — anything with a media
+  // query or a breakpoint — laid out differently in the narrow mirror than it
+  // did on the engine's real, wide viewport. A click's `u`/`v` fraction (of
+  // the mirror's own width) then landed over different content when scaled
+  // back up against the real page: the button that looked centered in the
+  // mirror wasn't at that same fraction across the real 2000+px layout.
+  // Rendering the iframe at the profile's *actual* CSS pixel size and scaling
+  // the whole thing down visually with a transform makes the two identical —
+  // same breakpoints, same layout — so a fraction means the same thing in
+  // both places. `drawCursor` below already assumed this and computed its own
+  // scale from `clientWidth` vs `contentWindow.innerWidth`; it was the mirror
+  // that hadn't been sized to make that ratio meaningful.
+  let lastKnownViewport = null, lastFitKey = null;
+  function fitMirror(viewport) {
+    if (viewport && viewport[0] && viewport[1]) lastKnownViewport = viewport;
+    if (!lastKnownViewport) return;
+    const [vw, vh] = lastKnownViewport;
+    const f = $('mirror'), st = $('stage');
+    const stageW = st.clientWidth, stageH = st.clientHeight;
+    if (!stageW || !stageH) return;
+    const key = vw + 'x' + vh + '@' + stageW + 'x' + stageH;
+    if (key === lastFitKey) return;
+    lastFitKey = key;
+    const scale = Math.min(stageW / vw, stageH / vh);
+    f.style.width = vw + 'px';
+    f.style.height = vh + 'px';
+    f.style.transform = `scale(${scale})`;
+  }
+  window.addEventListener('resize', () => fitMirror(null));
+
   // ---- cursor overlay ----------------------------------------------------------
   function drawCursor(samples, lastPos) {
     const f = $('mirror'), st = $('stage');
-    const scaleX = f.clientWidth / (f.contentWindow?.innerWidth || f.clientWidth || 1);
+    // `clientWidth` is the untransformed layout box — `transform: scale()`
+    // (see `fitMirror`) doesn't move it, only the rendered pixels. The overlay
+    // draws over what's actually on screen, so it needs the rendered size.
+    const renderedWidth = f.getBoundingClientRect().width;
+    const scaleX = renderedWidth / (f.contentWindow?.innerWidth || renderedWidth || 1);
     for (const s of samples) trail.push([s.x, s.y]);
     if (trail.length > 220) trail = trail.slice(-220);
     const pts = trail.map(([x, y]) => `${Math.round(x * scaleX)},${Math.round(y * scaleX)}`).join(' ');
@@ -437,8 +483,18 @@
   // that relationship even when the mirror has lost the runtime-applied class.
   function repairCanvasPromptLayers(root) {
     root.querySelectorAll('[data-bo-canvas="1"]').forEach(canvas => {
+      // Headings belonging to the *same widget* only — Epic's own page has
+      // headings scattered everywhere (a section title, a dialog caption),
+      // and one can coincidentally overlap the canvas's on-screen rect with
+      // nothing to do with it. Searching the whole document meant the
+      // ancestor walk below found no shared container closer than <body>,
+      // then "promptLayer" became whichever top-level section happened to
+      // hold that unrelated heading — once bumping the entire login dialog's
+      // z-index a point above the captcha it was supposed to stay under.
+      const scope = canvas.closest('.bo-frame') || canvas.parentElement;
+      if (!scope) return;
       const cr = canvas.getBoundingClientRect();
-      root.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(heading => {
+      scope.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(heading => {
         if (!heading.textContent.trim()) return;
         const hr = heading.getBoundingClientRect();
         if (hr.right <= cr.left || hr.left >= cr.right || hr.bottom <= cr.top || hr.top >= cr.bottom) return;
@@ -589,6 +645,8 @@
     lastFrames = s.frames || [];
     $('counts').textContent = s.counts
       ? `${s.counts.elements} эл · ${s.counts.inputs} input · ${s.counts.buttons} button` : '';
+
+    fitMirror(s.viewport);
 
     // Bitmaps are always swapped in place — during a gesture, when a redraw is
     // held back, and on an ordinary tick where nothing structural changed.

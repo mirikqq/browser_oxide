@@ -1275,18 +1275,20 @@ fn get_inline_style_value(dom: &crate::dom::Dom, id: NodeId, property: &str) -> 
 /// Returns the value from the highest-specificity matching rule.
 #[allow(clippy::explicit_counter_loop, reason = "CSS source-order counter")]
 fn get_stylesheet_value(state: &mut DomState, id: NodeId, property: &str) -> Option<String> {
-    // Safe only while nothing has mutated since the cache was filled — layout
-    // marks itself dirty on every DOM/style-affecting mutation, so that flag
-    // doubles as this cache's invalidation signal. A mutation we can't
-    // attribute to one entry, so a dirty read just drops the whole cache.
-    let clean = !state.layout_engine.is_dirty();
-    let cache_key = (id, property.to_string());
-    if clean {
-        if let Some(cached) = state.computed_style_cache.get(&cache_key) {
-            return cached.clone();
-        }
-    } else {
+    // Safe only while nothing has mutated since the cache was filled. The
+    // epoch only ever increases, so a mismatch here reliably means *some*
+    // mutation happened since — including one that set-then-cleared layout's
+    // `dirty` bit entirely between two of our own reads, via an unrelated
+    // layout query's `compute()`. A mutation we can't attribute to one
+    // entry, so any mismatch just drops the whole cache.
+    let current_epoch = state.layout_engine.dirty_epoch();
+    if state.computed_style_cache_epoch != current_epoch {
         state.computed_style_cache.clear();
+        state.computed_style_cache_epoch = current_epoch;
+    }
+    let cache_key = (id, property.to_string());
+    if let Some(cached) = state.computed_style_cache.get(&cache_key) {
+        return cached.clone();
     }
 
     let dom_el = DomElement::new(&state.dom, id)?;
@@ -1322,9 +1324,7 @@ fn get_stylesheet_value(state: &mut DomState, id: NodeId, property: &str) -> Opt
 
     // Winner is the last entry (highest specificity, latest source order)
     let result = matches.last().map(|(_, _, val)| val.clone());
-    if clean {
-        state.computed_style_cache.insert(cache_key, result.clone());
-    }
+    state.computed_style_cache.insert(cache_key, result.clone());
     result
 }
 

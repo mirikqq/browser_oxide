@@ -22,10 +22,18 @@ pub struct DomState {
     /// each selector re-walked including any `:has()` subtree scan) is not
     /// cheap, and pages routinely read many properties off the same element —
     /// so an uncached lookup redoes the full rule scan per property, per call.
-    /// Valid only while `layout_engine.is_dirty()` is false; cleared whenever
-    /// a lookup observes it dirty, since a mutation invalidates entries we
-    /// have no per-element way to single out.
+    /// Entries are valid only as long as `computed_style_cache_epoch` still
+    /// matches `layout_engine.dirty_epoch()`; a mismatch means some mutation
+    /// happened since the cache was filled and the whole map is dropped
+    /// (there's no per-element way to single out which entries it touched).
     pub computed_style_cache: HashMap<(NodeId, String), Option<String>>,
+    /// `layout_engine.dirty_epoch()` as of the last time `computed_style_cache`
+    /// was validated. Deliberately *not* a bool "is it dirty right now": that
+    /// flag gets cleared by any unrelated layout query's `compute()`, so a
+    /// mutation could set-then-clear it entirely between two cache reads and
+    /// never be noticed. The epoch only ever increases, so no mutation can be
+    /// missed this way.
+    pub computed_style_cache_epoch: u64,
     /// `iframe.contentWindow.postMessage` payloads awaiting delivery into the child
     /// realm, as `(iframe node id, JSON)`. Realms are separate V8 isolates, so the
     /// hop has to go through Rust: `Page::pump_iframe_messages` drains this.
@@ -96,6 +104,7 @@ impl DomState {
             stylesheets: Vec::new(),
             cached_rules: Vec::new(),
             computed_style_cache: HashMap::new(),
+            computed_style_cache_epoch: 0,
             messages_to_children: Vec::new(),
             messages_to_parent: Vec::new(),
             invalidated_frames: Vec::new(),

@@ -184,6 +184,15 @@ pub struct LayoutEngine {
     dom_to_taffy: HashMap<u32, taffy::NodeId>,
     viewport: Viewport,
     dirty: bool,
+    /// Bumped on every mutation that sets `dirty`, and never reset by
+    /// `compute()`. `dirty` alone can't back an external cache: `compute()`
+    /// clears it independently of who asked (any layout query does), so a
+    /// cache that only checks "is it dirty right now" can miss a mutation
+    /// that happened and got cleared entirely between two of its own reads.
+    /// A strictly-increasing counter can't be missed that way — a cache
+    /// remains valid only while this value hasn't moved since it last
+    /// checked.
+    dirty_epoch: u64,
     root_taffy: Option<taffy::NodeId>,
     /// Author rules to cascade onto each element. Empty until the document's
     /// stylesheets are parsed; without them every box falls back to UA defaults,
@@ -217,6 +226,7 @@ impl LayoutEngine {
             css_display: HashMap::new(),
             viewport,
             dirty: true,
+            dirty_epoch: 0,
             root_taffy: None,
             rules: Vec::new(),
         }
@@ -233,27 +243,34 @@ impl LayoutEngine {
 
     pub fn set_viewport(&mut self, viewport: Viewport) {
         self.viewport = viewport;
-        self.dirty = true;
+        self.set_dirty();
     }
 
     /// Install the document's author rules. Marks layout dirty: geometry computed
     /// before the stylesheets arrived is wrong by definition.
     pub fn set_style_rules(&mut self, rules: Vec<StyleRule>) {
         self.rules = rules;
-        self.dirty = true;
+        self.set_dirty();
     }
 
     /// Mark layout as dirty (needs recomputation).
     pub fn mark_dirty(&mut self) {
-        self.dirty = true;
+        self.set_dirty();
     }
 
-    /// Whether a mutation has happened since the layout tree was last built.
-    /// Callers outside this module use it to know when a value they derived
-    /// from the DOM (e.g. a cached `getComputedStyle` result) is safe to
-    /// reuse rather than recompute.
-    pub fn is_dirty(&self) -> bool {
-        self.dirty
+    fn set_dirty(&mut self) {
+        self.dirty = true;
+        self.dirty_epoch += 1;
+    }
+
+    /// Monotonic counter bumped on every mutation, and never reset by
+    /// `compute()` (unlike `dirty`). Callers outside this module use it to
+    /// know when a value they derived from the DOM (e.g. a cached
+    /// `getComputedStyle` result) is still valid: it's safe to reuse for as
+    /// long as this value hasn't changed since they last checked it, and
+    /// must be treated as invalid the moment it has.
+    pub fn dirty_epoch(&self) -> u64 {
+        self.dirty_epoch
     }
 
     /// Compute layout for the entire DOM tree.
