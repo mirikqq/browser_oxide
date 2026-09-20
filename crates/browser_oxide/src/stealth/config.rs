@@ -70,16 +70,47 @@ impl ConfigFormat {
 }
 
 impl StealthProfile {
+    /// Point `gpu_profile` at the catalog entry this profile's
+    /// `webgl_renderer` names, when the two disagree and the catalog has a
+    /// match.
+    ///
+    /// `gpu_profile` — not `webgl_renderer` — is what reaches JS:
+    /// `canvas_bootstrap.js` reads `webgl_unmasked_vendor` /
+    /// `webgl_unmasked_renderer`, both sourced from `gpu_profile`. A
+    /// hand-written profile that names its GPU in `webgl_renderer` and
+    /// leaves `gpu_profile` to its serde default therefore shipped
+    /// `nvidia_rtx_3060_windows()`'s extension list, getParameter values
+    /// and shader precision — NVIDIA-on-Windows WebGL under, say, a macOS
+    /// user agent. The bundled `profiles/chrome_148_macos.yaml` had
+    /// exactly that shape.
+    ///
+    /// Leaves `gpu_profile` untouched when the renderer is not a catalog
+    /// entry, so Firefox profiles (`webgl_renderer: "Mozilla"` — the real
+    /// base RENDERER string, deliberately different from the unmasked one)
+    /// and GPUs with no capture yet keep whatever they were given.
+    fn resolve_gpu_profile(&mut self) {
+        if self.webgl_renderer.is_empty()
+            || self.gpu_profile.unmasked_renderer == self.webgl_renderer
+        {
+            return;
+        }
+        if let Some(gpu) = crate::stealth::gpu::by_unmasked_renderer(&self.webgl_renderer) {
+            self.gpu_profile = gpu;
+        }
+    }
+
     /// Parse a profile from a YAML string and validate it.
     pub fn from_yaml_str(s: &str) -> Result<Self, ConfigError> {
-        let profile: StealthProfile = serde_yaml_ng::from_str(s).map_err(ConfigError::Yaml)?;
+        let mut profile: StealthProfile = serde_yaml_ng::from_str(s).map_err(ConfigError::Yaml)?;
+        profile.resolve_gpu_profile();
         profile.validate().map_err(ConfigError::Invalid)?;
         Ok(profile)
     }
 
     /// Parse a profile from a JSON string and validate it.
     pub fn from_json_str(s: &str) -> Result<Self, ConfigError> {
-        let profile: StealthProfile = serde_json::from_str(s).map_err(ConfigError::Json)?;
+        let mut profile: StealthProfile = serde_json::from_str(s).map_err(ConfigError::Json)?;
+        profile.resolve_gpu_profile();
         profile.validate().map_err(ConfigError::Invalid)?;
         Ok(profile)
     }
@@ -154,9 +185,9 @@ mod tests {
         let profile = StealthProfile::load_from_file(&path)
             .unwrap_or_else(|e| panic!("load {:?}: {e}", path));
         assert_eq!(profile.browser_name, "Chrome");
-        assert_eq!(profile.browser_version, "147.0.7727.117");
+        assert_eq!(profile.browser_version, "153.0.8010.48");
         assert_eq!(profile.os_name, "macOS");
-        assert!(profile.user_agent.contains("Chrome/147.0.0.0"));
+        assert!(profile.user_agent.contains("Chrome/153.0.0.0"));
     }
 
     #[test]
@@ -164,16 +195,16 @@ mod tests {
         // We do not set `deny_unknown_fields`, so extra keys are tolerated —
         // assert that current behavior, so a future change is a conscious one.
         let yaml = r#"
-user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
 browser_name: Chrome
-browser_version: "147.0.7727.117"
+browser_version: "153.0.8010.48"
 os_name: macOS
 os_version: "15.2"
 platform: MacIntel
 vendor: "Google Inc."
 vendor_sub: ""
 product_sub: "20030107"
-app_version: "5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+app_version: "5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
 screen_width: 2560
 screen_height: 1440
 screen_avail_width: 2560
@@ -189,7 +220,7 @@ webgl_renderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M2 Pro, Unspecified V
 language: "en-US"
 languages: ["en-US", "en"]
 timezone: "America/New_York"
-tls_impersonate: "chrome_147"
+tls_impersonate: "chrome_153"
 connection_effective_type: "4g"
 connection_rtt: 50
 connection_downlink: 10.0
@@ -202,12 +233,107 @@ prefers_color_scheme: "light"
 pointer_type: "fine"
 hover_capability: "hover"
 inner_width: 2560
-inner_height: 1330
+inner_height: 1304
 outer_width: 2560
-outer_height: 1440
+outer_height: 1415
 "#;
         let p = StealthProfile::from_yaml_str(yaml).expect("loads");
-        assert!(p.user_agent.contains("147.0.0.0"));
+        assert!(p.user_agent.contains("153.0.0.0"));
         assert_eq!(p.os_name, "macOS");
+    }
+
+    /// A profile that names its GPU but omits `gpu_profile` must not ship
+    /// the `nvidia_rtx_3060_windows()` serde default — `gpu_profile` is the
+    /// field JS actually reads for UNMASKED_VENDOR/RENDERER, so the default
+    /// meant "macOS user agent, NVIDIA-on-Windows WebGL".
+    #[test]
+    fn omitted_gpu_profile_resolves_from_webgl_renderer() {
+        let yaml = r#"
+user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+browser_name: "Chrome"
+browser_version: "153.0.8010.48"
+os_name: "macOS"
+os_version: "15.2"
+platform: "MacIntel"
+vendor: "Google Inc."
+vendor_sub: ""
+product_sub: "20030107"
+app_version: "5.0 (Macintosh)"
+screen_width: 1512
+screen_height: 982
+screen_avail_width: 1512
+screen_avail_height: 949
+screen_avail_top: 33
+screen_color_depth: 30
+device_pixel_ratio: 2.0
+cpu_cores: 8
+device_memory: 8
+max_touch_points: 0
+webgl_vendor: "Google Inc. (Apple)"
+webgl_renderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)"
+language: "en-US"
+languages: ["en-US", "en"]
+timezone: "America/Los_Angeles"
+cpu_architecture: "arm"
+cpu_bitness: "64"
+platform_version: "15.2.0"
+tls_impersonate: "chrome_153"
+connection_effective_type: "4g"
+connection_rtt: 50
+connection_downlink: 10.0
+pdf_viewer_enabled: true
+plugins_count: 5
+mime_types_count: 2
+canvas_seed: 42
+audio_seed: 43
+audio_sample_rate: 48000
+prefers_color_scheme: "light"
+pointer_type: "fine"
+hover_capability: "hover"
+color_gamut: "p3"
+inner_width: 1512
+inner_height: 838
+outer_width: 1512
+outer_height: 949
+"#;
+        let p = StealthProfile::from_yaml_str(yaml).expect("loads");
+        assert_eq!(
+            p.gpu_profile.unmasked_renderer, p.webgl_renderer,
+            "gpu_profile must follow the renderer the profile names"
+        );
+        assert_eq!(p.gpu_profile.unmasked_vendor, "Google Inc. (Apple)");
+        assert!(
+            !p.gpu_profile.unmasked_renderer.contains("NVIDIA"),
+            "must not fall back to the NVIDIA-on-Windows default"
+        );
+    }
+
+    /// An Apple Silicon chip with no dedicated capture still resolves to the
+    /// shared ANGLE Metal stack under its own name — BrowserForge samples
+    /// M1/M2/M4 far more often than the M3 the catalog was captured on.
+    #[test]
+    fn unknown_apple_chip_resolves_to_metal_stack() {
+        let yaml = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/profiles/chrome_148_macos.yaml"
+        ))
+        .expect("bundled profile readable");
+        let yaml = yaml.replace("Apple M3", "Apple M4 Pro");
+        let p = StealthProfile::from_yaml_str(&yaml).expect("loads");
+        assert!(p.gpu_profile.unmasked_renderer.contains("Apple M4 Pro"));
+        assert!(!p.gpu_profile.extensions.is_empty());
+    }
+
+    /// The bundled example profile itself — the one the docs tell people to
+    /// copy — must come out internally consistent.
+    #[test]
+    fn bundled_macos_profile_has_consistent_gpu() {
+        let p = StealthProfile::load_from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/profiles/chrome_148_macos.yaml"
+        ))
+        .expect("bundled profile loads");
+        assert_eq!(p.gpu_profile.unmasked_renderer, p.webgl_renderer);
+        assert_eq!(p.gpu_profile.unmasked_vendor, p.webgl_vendor);
     }
 }

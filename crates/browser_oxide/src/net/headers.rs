@@ -219,6 +219,168 @@ pub fn chrome_headers_reload(
     hdrs
 }
 
+/// Build headers for a subresource fetch — a `<script>`, `<img>`, a
+/// stylesheet, a font. Not a navigation and not a `fetch()` call.
+///
+/// The script and module paths used to build on `nav_headers`, so every
+/// subresource carried `upgrade-insecure-requests: 1`, `sec-fetch-user: ?1`
+/// and the navigation `priority`, while `sec-fetch-site` was either left at
+/// `none` or hardcoded `same-origin` regardless of the target. A cross-site
+/// script — which is what a captcha vendor serves — therefore went out
+/// claiming to be a user-typed same-origin navigation. Every field below is
+/// from a Chrome 148 capture.
+///
+/// `cors` selects the request mode: classic `<script>`/`<img>`/stylesheet
+/// loads are `no-cors` and credentialed; module scripts and fonts are `cors`
+/// and are not. Only the credentialed ones carry `sec-fetch-storage-access`.
+pub fn nav_headers_subresource(
+    profile: &StealthProfile,
+    target_url: &str,
+    referrer_url: &str,
+    dest: &str,
+    cors: bool,
+) -> Vec<(String, String)> {
+    let accept = match dest {
+        "image" => "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "style" => "text/css,*/*;q=0.1",
+        _ => "*/*",
+    };
+
+    let referrer = url::Url::parse(referrer_url).ok();
+    let target = url::Url::parse(target_url).ok();
+    let site = match (&target, &referrer) {
+        (Some(t), Some(r)) if t.origin() == r.origin() => "same-origin",
+        (Some(t), Some(r)) if same_site(t, r) => "same-site",
+        _ => "cross-site",
+    };
+
+    let is_chrome = profile.browser_name != "Firefox" && profile.browser_name != "Safari";
+    let is_mobile = matches!(
+        profile.device_class,
+        DeviceClass::MobileAndroid | DeviceClass::MobileIOS
+    );
+
+    let mut headers: Vec<(String, String)> = Vec::with_capacity(14);
+    if is_chrome {
+        headers.push((
+            "sec-ch-ua-platform".to_string(),
+            format!("\"{}\"", profile.os_name),
+        ));
+    }
+    headers.push(("user-agent".to_string(), profile.user_agent.clone()));
+    if is_chrome {
+        headers.push(("sec-ch-ua".to_string(), build_sec_ch_ua(profile)));
+        headers.push((
+            "sec-ch-ua-mobile".to_string(),
+            if is_mobile { "?1" } else { "?0" }.to_string(),
+        ));
+    }
+    headers.push(("accept".to_string(), accept.to_string()));
+
+    // A CORS-mode subresource announces its origin; a no-cors one never does.
+    // The classic-script path used to send `Origin` on both.
+    if cors {
+        if let Some(r) = referrer.as_ref() {
+            headers.push(("origin".to_string(), r.origin().ascii_serialization()));
+        }
+    }
+
+    headers.push(("sec-fetch-site".to_string(), site.to_string()));
+    headers.push((
+        "sec-fetch-mode".to_string(),
+        if cors { "cors" } else { "no-cors" }.to_string(),
+    ));
+    headers.push(("sec-fetch-dest".to_string(), dest.to_string()));
+    if is_chrome && site == "cross-site" && !cors {
+        headers.push(("sec-fetch-storage-access".to_string(), "active".to_string()));
+    }
+    if let Some(referer) = referrer.as_ref().and_then(|r| referer_for(r, target_url)) {
+        headers.push(("referer".to_string(), referer));
+    }
+    headers.push((
+        "accept-encoding".to_string(),
+        "gzip, deflate, br, zstd".to_string(),
+    ));
+    headers.push((
+        "accept-language".to_string(),
+        build_accept_language(&profile.languages),
+    ));
+    // ponytail: one priority for every subresource kind. Chrome varies it by
+    // kind and position in the document; the h2 frames that carry it were not
+    // measurable over the local h1 capture. Split per dest if a probe ever
+    // reads it.
+    headers.push(("priority".to_string(), "u=1, i".to_string()));
+    headers
+}
+
+/// Build headers for a markup-driven iframe navigation.
+///
+/// A subframe document request is not the address-bar navigation
+/// `nav_headers` builds, and the differences are all things a server can read
+/// directly:
+///   - `sec-fetch-user` is ABSENT — markup carries no user activation
+///   - `sec-fetch-dest: iframe` (not `document`)
+///   - `sec-fetch-site` is measured against the embedding page (not `none`)
+///   - the parent's `Referer` rides along, per `strict-origin-when-cross-origin`
+///   - `sec-fetch-storage-access: active` on cross-site frames (Chrome 133+)
+///
+/// Sending the top-level nav shape instead makes every framed widget look like
+/// a URL somebody typed into the address bar — which for an hCaptcha challenge
+/// frame is a shape no real session ever produces.
+///
+/// Header positions verified against Chrome 148: the two added headers sit
+/// between `sec-fetch-dest` and `accept-encoding`, storage-access first.
+pub fn nav_headers_iframe(
+    profile: &StealthProfile,
+    target_url: &str,
+    parent_url: &str,
+) -> Vec<(String, String)> {
+    let parent = url::Url::parse(parent_url).ok();
+    let target = url::Url::parse(target_url).ok();
+
+    let site = match (&target, &parent) {
+        (Some(t), Some(p)) if t.origin() == p.origin() => "same-origin",
+        (Some(t), Some(p)) if same_site(t, p) => "same-site",
+        (Some(_), Some(_)) => "cross-site",
+        // No parent URL to measure against: a frame with an unknown embedder
+        // is still not a top-level nav, and `cross-site` is the conservative
+        // reading (it never claims a closer relationship than we can prove).
+        _ => "cross-site",
+    };
+
+    let mut headers: Vec<(String, String)> = nav_headers_for_url(profile, target_url, false)
+        .into_iter()
+        .filter(|(k, _)| k != "sec-fetch-user")
+        .collect();
+
+    for (k, v) in headers.iter_mut() {
+        match k.as_str() {
+            "sec-fetch-site" => site.clone_into(v),
+            "sec-fetch-dest" => "iframe".clone_into(v),
+            _ => {}
+        }
+    }
+
+    let mut extra: Vec<(String, String)> = Vec::with_capacity(2);
+    // Storage Access Headers are a Chromium feature; Firefox and Safari
+    // profiles must not grow one.
+    if site == "cross-site" && profile.browser_name != "Firefox" && profile.browser_name != "Safari"
+    {
+        extra.push(("sec-fetch-storage-access".to_string(), "active".to_string()));
+    }
+    if let Some(referer) = parent.as_ref().and_then(|p| referer_for(p, target_url)) {
+        extra.push(("referer".to_string(), referer));
+    }
+
+    let at = headers
+        .iter()
+        .position(|(k, _)| k == "sec-fetch-dest")
+        .map(|i| i + 1)
+        .unwrap_or(headers.len());
+    headers.splice(at..at, extra);
+    headers
+}
+
 /// Build headers that match a `window.fetch()` request from JS, NOT a
 /// document navigation. Chrome's fetch API and its nav requests send
 /// completely different header sets; a "fetch" request that arrives
@@ -302,20 +464,100 @@ pub fn chrome_headers_fetch(
     ));
     headers.push(("priority".to_string(), "u=1, i".to_string()));
 
-    // Origin + Referer — always set for same-site + cross-site fetches
+    // Origin + Referer. Chrome's default policy is
+    // strict-origin-when-cross-origin: the full referring URL (minus fragment)
+    // when the target is same-origin, the bare origin when it is not, and no
+    // Referer at all on an https→http downgrade. We used to send the bare
+    // origin unconditionally, so every same-origin request under-reported its
+    // own referrer — visible by comparing one header against the page URL.
     if let Some(o) = origin {
-        headers.push(("origin".to_string(), o.to_string()));
-        headers.push((
-            "referer".to_string(),
-            format!("{}/", o.trim_end_matches('/')),
-        ));
+        match url::Url::parse(o) {
+            Ok(ou) => {
+                headers.push(("origin".to_string(), ou.origin().ascii_serialization()));
+                if let Some(referer) = referer_for(&ou, target_url) {
+                    headers.push(("referer".to_string(), referer));
+                }
+            }
+            Err(_) => {
+                headers.push(("origin".to_string(), o.to_string()));
+                headers.push((
+                    "referer".to_string(),
+                    format!("{}/", o.trim_end_matches('/')),
+                ));
+            }
+        }
     }
 
+    order_like_chrome_fetch(&mut headers);
     headers
+}
+
+/// Sort assembled fetch/XHR headers into the order Chrome puts them on the
+/// wire.
+///
+/// Measured against Chrome 151 across three request shapes (GET, POST without
+/// an explicit content-type, POST with content-type plus an author header) —
+/// the sequence is stable and does not resemble the order the headers are
+/// naturally produced in. Ours appended `origin`, `referer` and `content-type`
+/// after `priority`, which puts three headers in positions no Chrome request
+/// has. Header order is about the cheapest signal an edge layer can read: it
+/// needs no JavaScript and no fingerprint, just the frame as received.
+///
+/// Author-supplied headers are unranked and keep their relative order, landing
+/// where Chrome puts them — right after `content-type`.
+pub fn order_like_chrome_fetch(headers: &mut [(String, String)]) {
+    fn rank(name: &str) -> u8 {
+        match name {
+            "content-length" => 0,
+            "sec-ch-ua-platform" => 1,
+            "user-agent" => 2,
+            "sec-ch-ua" => 3,
+            "content-type" => 4,
+            // 5 = author headers
+            "sec-ch-ua-mobile" => 6,
+            "accept" => 7,
+            "origin" => 8,
+            "sec-fetch-site" => 9,
+            "sec-fetch-mode" => 10,
+            "sec-fetch-dest" => 11,
+            "referer" => 12,
+            "accept-encoding" => 13,
+            "accept-language" => 14,
+            "cookie" => 15,
+            "priority" => 16,
+            _ => 5,
+        }
+    }
+    headers.sort_by_key(|(name, _)| rank(&name.to_ascii_lowercase()));
 }
 
 /// Heuristic same-site comparison: registered domain (eTLD+1) would be the
 /// correct implementation; as a proxy, compare the last two labels.
+/// `Referer` value for Chrome's default `strict-origin-when-cross-origin`
+/// policy: the full referring URL minus its fragment when the target is
+/// same-origin, the bare origin otherwise, and no header at all on an
+/// https→http downgrade.
+///
+/// Note the same-origin test is by *origin*, not site — a same-site but
+/// cross-origin request (`localhost:8731` → `localhost:8732`) still gets
+/// only the origin, confirmed against Chrome.
+pub fn referer_for(referrer: &url::Url, target_url: &str) -> Option<String> {
+    let origin = referrer.origin().ascii_serialization();
+    let Ok(target) = url::Url::parse(target_url) else {
+        return Some(format!("{}/", origin.trim_end_matches('/')));
+    };
+    if referrer.scheme() == "https" && target.scheme() == "http" {
+        return None;
+    }
+    if target.origin() == referrer.origin() {
+        let mut r = referrer.clone();
+        r.set_fragment(None);
+        Some(r.to_string())
+    } else {
+        Some(format!("{}/", origin.trim_end_matches('/')))
+    }
+}
+
 fn same_site(a: &url::Url, b: &url::Url) -> bool {
     fn tail2(u: &url::Url) -> Option<String> {
         let host = u.host_str()?;
@@ -530,46 +772,28 @@ fn chrome_platform_version(os_name: &str, os_version: &str) -> String {
     }
 }
 
-/// Build the `Sec-CH-UA-Full-Version-List` header value.
-///
-/// **Chrome 147 live capture**: real Chrome 147 only sends this header AFTER an
-/// `Accept-CH` advertisement. When sent, the format is:
-/// ```text
-/// "Google Chrome";v="147.0.7727.117", "Not.A/Brand";v="8.0.0.0", "Chromium";v="147.0.7727.117"
-/// ```
-/// Order: `Google Chrome`, `Not.A/Brand` middle, `Chromium`. The "Not"
-/// brand format and version rotates per Chrome major release — Chrome 147
-/// uses `Not.A/Brand` v="8" (was `Not-A.Brand` v="24" in Chrome 130-146).
-/// Brand strings here MUST match `build_sec_ch_ua` exactly.
 fn build_sec_ch_ua_full_version_list(profile: &StealthProfile) -> String {
-    let v = &profile.browser_version;
-    format!("\"Google Chrome\";v=\"{v}\", \"Not.A/Brand\";v=\"8.0.0.0\", \"Chromium\";v=\"{v}\"")
+    profile
+        .ua_brands()
+        .iter()
+        .map(|(brand, v)| {
+            if brand.starts_with("Not") {
+                format!("\"{brand}\";v=\"{v}.0.0.0\"")
+            } else {
+                format!("\"{brand}\";v=\"{}\"", profile.browser_version)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
-/// Build the sec-ch-ua header value from the browser version.
-///
-/// **Chrome 146 live capture**:
-/// ```text
-/// "Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"
-/// ```
-/// Same brand triple as the full-version-list variant — only the
-/// version numbers drop the `.0.0.0` suffix. `Not-A.Brand` in the
-/// middle, not the end.
 fn build_sec_ch_ua(profile: &StealthProfile) -> String {
-    let major_version = profile.browser_version.split('.').next().unwrap_or("147");
-
-    // Real Chrome 147 sec-ch-ua:
-    //   "Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"
-    // Brand order is [Google Chrome, Not.A/Brand, Chromium] (NOT
-    // alphabetical and NOT what the W3C spec implies). The "Not."-style
-    // dummy brand changes per Chrome version — we hardcode the v=8 / dot-slash
-    // form that matches Chrome 147+. Earlier Chrome (130 era) used
-    // "Not-A.Brand";v="24" with brands ordered [Chromium, Not-A.Brand, Google Chrome]
-    // — that's what we used to emit, but it diverges from modern Chrome.
-    format!(
-        "\"Google Chrome\";v=\"{v}\", \"Not.A/Brand\";v=\"8\", \"Chromium\";v=\"{v}\"",
-        v = major_version
-    )
+    profile
+        .ua_brands()
+        .iter()
+        .map(|(brand, v)| format!("\"{brand}\";v=\"{v}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ============================================================================
@@ -1214,21 +1438,27 @@ mod tests {
 
     #[test]
     fn sec_ch_ua_full_version_list_has_chrome_version() {
-        // Chrome 147+ live capture format:
-        //   "Google Chrome";v="<ver>", "Not.A/Brand";v="8.0.0.0", "Chromium";v="<ver>"
-        // The "Not" brand name rotates across major releases (was `Not-A.Brand`
-        // v="24" in Chrome 130-146; changed to `Not.A/Brand` v="8" in Chrome 147+).
-        let profile = crate::stealth::chrome_148_linux();
-        let value = build_sec_ch_ua_full_version_list(&profile);
-        assert!(value.contains("Google Chrome"));
-        assert!(value.contains(&profile.browser_version));
-        assert!(value.contains("Not.A/Brand"));
-        // Brand order: Google Chrome first, Not.A/Brand middle, Chromium last.
-        let google_idx = value.find("Google Chrome").unwrap();
-        let not_idx = value.find("Not.A/Brand").unwrap();
-        let chromium_idx = value.find("Chromium").unwrap();
-        assert!(google_idx < not_idx);
-        assert!(not_idx < chromium_idx);
+        let mut profile = crate::stealth::chrome_148_linux();
+        profile.browser_version = "153.0.8010.48".into();
+        assert_eq!(
+            build_sec_ch_ua(&profile),
+            // Byte-identical to a live Chrome 153.0.8010.48 capture.
+            r#""Google Chrome";v="153", "Not_A Brand";v="8", "Chromium";v="153""#
+        );
+        assert_eq!(
+            build_sec_ch_ua_full_version_list(&profile),
+            r#""Google Chrome";v="153.0.8010.48", "Not_A Brand";v="8.0.0.0", "Chromium";v="153.0.8010.48""#
+        );
+        profile.browser_version = "147.0.7727.117".into();
+        assert_eq!(
+            build_sec_ch_ua(&profile),
+            r#""Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147""#
+        );
+        profile.browser_version = "146.0.7680.0".into();
+        assert_eq!(
+            build_sec_ch_ua(&profile),
+            r#""Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146""#
+        );
     }
 
     #[test]

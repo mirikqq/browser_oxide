@@ -1,0 +1,190 @@
+diff --git a/src/include/openssl/ssl.h b/src/include/openssl/ssl.h
+index 0000201..5c91dad 100644
+--- a/src/include/openssl/ssl.h
++++ b/src/include/openssl/ssl.h
+@@ -4578,6 +4578,17 @@ OPENSSL_EXPORT void SSL_CTX_set_retain_only_sha256_of_client_certs(SSL_CTX *ctx,
+ // GREASE. See RFC 8701.
+ OPENSSL_EXPORT void SSL_CTX_set_grease_enabled(SSL_CTX *ctx, int enabled);
+ 
++OPENSSL_EXPORT void SSL_CTX_set_grease_sigalgs_enabled(SSL_CTX *ctx,
++                                                       int enabled);
++
++OPENSSL_EXPORT int SSL_CTX_set_advertised_extra_sigalgs(SSL_CTX *ctx,
++                                                        const uint16_t *sigalgs,
++                                                        size_t num_sigalgs);
++
++OPENSSL_EXPORT int SSL_CTX_set1_requested_trust_anchors(SSL_CTX *ctx,
++                                                        const uint8_t *ids,
++                                                        size_t ids_len);
++
+ // SSL_CTX_set_permute_extensions configures whether sockets on |ctx| should
+ // permute extensions. For now, this is only implemented for the ClientHello.
+ OPENSSL_EXPORT void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled);
+diff --git a/src/include/openssl/tls1.h b/src/include/openssl/tls1.h
+index 955126a..20dd45e 100644
+--- a/src/include/openssl/tls1.h
++++ b/src/include/openssl/tls1.h
+@@ -249,6 +249,8 @@ extern "C" {
+ #define TLSEXT_TYPE_application_settings 17513
+ #define TLSEXT_TYPE_application_settings_new 17613
+ 
++#define TLSEXT_TYPE_trust_anchors 0xca34
++
+ // ExtensionType values from draft-ietf-tls-esni-13. This is not an IANA defined
+ // extension number.
+ #define TLSEXT_TYPE_encrypted_client_hello 0xfe0d
+diff --git a/src/ssl/extensions.cc b/src/ssl/extensions.cc
+index 6456249..e8aba61 100644
+--- a/src/ssl/extensions.cc
++++ b/src/ssl/extensions.cc
+@@ -1086,8 +1086,20 @@ static bool ext_sigalgs_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
+   CBB contents, sigalgs_cbb;
+   if (!CBB_add_u16(out_compressible, TLSEXT_TYPE_signature_algorithms) ||
+       !CBB_add_u16_length_prefixed(out_compressible, &contents) ||
+-      !CBB_add_u16_length_prefixed(&contents, &sigalgs_cbb) ||
+-      !tls12_add_verify_sigalgs(hs, &sigalgs_cbb) ||
++      !CBB_add_u16_length_prefixed(&contents, &sigalgs_cbb)) {
++    return false;
++  }
++  if (hs->ssl->ctx->grease_sigalgs_enabled &&
++      !CBB_add_u16(&sigalgs_cbb,
++                   ssl_get_grease_value(hs, ssl_grease_signature_algorithm))) {
++    return false;
++  }
++  for (uint16_t sigalg : hs->ssl->ctx->advertised_extra_sigalgs) {
++    if (!CBB_add_u16(&sigalgs_cbb, sigalg)) {
++      return false;
++    }
++  }
++  if (!tls12_add_verify_sigalgs(hs, &sigalgs_cbb) ||
+       !CBB_flush(out_compressible)) {
+     return false;
+   }
+@@ -3248,6 +3260,31 @@ static bool record_size_limit_add_serverhello(SSL_HANDSHAKE* hs, CBB* out) {
+     return true;
+ }
+ 
++static bool ext_trust_anchors_add_clienthello(const SSL_HANDSHAKE *hs,
++                                              CBB *out, CBB *out_compressible,
++                                              ssl_client_hello_type_t type) {
++  const SSL_CTX *ctx = hs->ssl->ctx.get();
++  if (!ctx->has_requested_trust_anchors) {
++    return true;
++  }
++  CBB contents, list;
++  if (!CBB_add_u16(out_compressible, TLSEXT_TYPE_trust_anchors) ||
++      !CBB_add_u16_length_prefixed(out_compressible, &contents) ||
++      !CBB_add_u16_length_prefixed(&contents, &list) ||
++      !CBB_add_bytes(&list, ctx->requested_trust_anchors.data(),
++                     ctx->requested_trust_anchors.size()) ||
++      !CBB_flush(out_compressible)) {
++    return false;
++  }
++  return true;
++}
++
++static bool ext_trust_anchors_parse_serverhello(SSL_HANDSHAKE *hs,
++                                                uint8_t *out_alert,
++                                                CBS *contents) {
++  return true;
++}
++
+ // kExtensions contains all the supported extensions.
+ static const struct tls_extension kExtensions[] = {
+   {
+@@ -3436,6 +3473,13 @@ static const struct tls_extension kExtensions[] = {
+     record_size_limit_parse_clienthello,
+     record_size_limit_add_serverhello,
+   },
++  {
++    TLSEXT_TYPE_trust_anchors,
++    ext_trust_anchors_add_clienthello,
++    ext_trust_anchors_parse_serverhello,
++    ignore_parse_clienthello,
++    dont_add_serverhello,
++  },
+ };
+ 
+ #define kNumExtensions (sizeof(kExtensions) / sizeof(struct tls_extension))
+diff --git a/src/ssl/internal.h b/src/ssl/internal.h
+index 15298c2..74d6a49 100644
+--- a/src/ssl/internal.h
++++ b/src/ssl/internal.h
+@@ -1669,7 +1669,8 @@ enum ssl_grease_index_t {
+   ssl_grease_version,
+   ssl_grease_ticket_extension,
+   ssl_grease_ech_config_id,
+-  ssl_grease_last_index = ssl_grease_ech_config_id,
++  ssl_grease_signature_algorithm,
++  ssl_grease_last_index = ssl_grease_signature_algorithm,
+ };
+ 
+ enum tls12_server_hs_state_t {
+@@ -3818,6 +3819,11 @@ struct ssl_ctx_st {
+   // extension_permutation is the permutation of extensions to send.
+   bssl::Array<uint8_t> extension_permutation;
+ 
++  bool grease_sigalgs_enabled = false;
++  bssl::Array<uint16_t> advertised_extra_sigalgs;
++  bool has_requested_trust_anchors = false;
++  bssl::Array<uint8_t> requested_trust_anchors;
++
+  private:
+   ~ssl_ctx_st();
+   friend OPENSSL_EXPORT void SSL_CTX_free(SSL_CTX *);
+diff --git a/src/ssl/ssl_lib.cc b/src/ssl/ssl_lib.cc
+index 3242769..e0b8d18 100644
+--- a/src/ssl/ssl_lib.cc
++++ b/src/ssl/ssl_lib.cc
+@@ -2981,6 +2981,33 @@ void SSL_CTX_set_grease_enabled(SSL_CTX *ctx, int enabled) {
+   ctx->grease_enabled = !!enabled;
+ }
+ 
++void SSL_CTX_set_grease_sigalgs_enabled(SSL_CTX *ctx, int enabled) {
++  ctx->grease_sigalgs_enabled = !!enabled;
++}
++
++int SSL_CTX_set_advertised_extra_sigalgs(SSL_CTX *ctx, const uint16_t *sigalgs,
++                                         size_t num_sigalgs) {
++  return ctx->advertised_extra_sigalgs.CopyFrom(
++      MakeConstSpan(sigalgs, num_sigalgs));
++}
++
++int SSL_CTX_set1_requested_trust_anchors(SSL_CTX *ctx, const uint8_t *ids,
++                                         size_t ids_len) {
++  CBS cbs, id;
++  CBS_init(&cbs, ids, ids_len);
++  while (CBS_len(&cbs) > 0) {
++    if (!CBS_get_u8_length_prefixed(&cbs, &id) || CBS_len(&id) == 0) {
++      OPENSSL_PUT_ERROR(SSL, SSL_R_DECODE_ERROR);
++      return 0;
++    }
++  }
++  if (!ctx->requested_trust_anchors.CopyFrom(MakeConstSpan(ids, ids_len))) {
++    return 0;
++  }
++  ctx->has_requested_trust_anchors = true;
++  return 1;
++}
++
+ void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled) {
+   ctx->permute_extensions = !!enabled;
+ }
+diff --git a/src/ssl/tls13_both.cc b/src/ssl/tls13_both.cc
+index 5ab5a1c..1982a44 100644
+--- a/src/ssl/tls13_both.cc
++++ b/src/ssl/tls13_both.cc
+@@ -234,8 +234,12 @@ bool tls13_process_certificate(SSL_HANDSHAKE *hs, const SSLMessage &msg,
+     SSLExtension sct(
+         TLSEXT_TYPE_certificate_timestamp,
+         !ssl->server && hs->config->signed_cert_timestamps_enabled);
++    SSLExtension trust_anchors(
++        TLSEXT_TYPE_trust_anchors,
++        !ssl->server && ssl->ctx->has_requested_trust_anchors);
+     uint8_t alert = SSL_AD_DECODE_ERROR;
+-    if (!ssl_parse_extensions(&extensions, &alert, {&status_request, &sct},
++    if (!ssl_parse_extensions(&extensions, &alert,
++                              {&status_request, &sct, &trust_anchors},
+                               /*ignore_unknown=*/false)) {
+       ssl_send_alert(ssl, SSL3_AL_FATAL, alert);
+       return false;

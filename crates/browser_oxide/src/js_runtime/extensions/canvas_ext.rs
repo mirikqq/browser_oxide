@@ -458,6 +458,21 @@ pub fn op_canvas_to_data_url(state: &mut OpState, #[smi] id: i32) -> String {
         .unwrap_or_default()
 }
 
+/// Whether `family` is a genuinely available font on the claimed
+/// profile OS — backs `FontFace.load()`'s `local()` presence check (see
+/// `canvas::text::family_available`). Not tied to a canvas id: the JS
+/// side already knows the profile's `os_name` (same `_p("os_name", ...)`
+/// used to build `document.fonts`) and passes it straight through.
+#[op2(fast)]
+pub fn op_font_family_available(
+    #[string] family: &str,
+    #[smi] weight: i32,
+    italic: bool,
+    #[string] os_name: &str,
+) -> bool {
+    crate::canvas::text::family_available(family, weight.clamp(1, 1000) as u16, italic, os_name)
+}
+
 #[op2(fast)]
 pub fn op_canvas_measure_text(state: &mut OpState, #[smi] id: i32, #[string] text: &str) -> f64 {
     let state = state.borrow::<CanvasState>();
@@ -827,6 +842,7 @@ deno_core::extension!(
         op_canvas_to_data_url,
         op_canvas_measure_text,
         op_canvas_measure_text_full,
+        op_font_family_available,
         op_canvas_get_image_data,
         op_canvas_put_image_data,
         op_canvas_draw_image,

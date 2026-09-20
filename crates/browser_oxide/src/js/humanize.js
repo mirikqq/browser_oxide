@@ -49,23 +49,24 @@
     // our synthesized input events trusted via this closure-held function
     // instead of the old `Object.defineProperty(ev,'isTrusted',{value:true})`
     // — which created a detectable OWN data property AND was overridable.
-    const _markTrusted = (typeof globalThis.__bo_mark_trusted === 'function')
-        ? globalThis.__bo_mark_trusted
+    const _boNsTop = (function(){try{var s=Object.getOwnPropertySymbols(globalThis, 1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})();
+    const _markTrusted = (_boNsTop && typeof _boNsTop.markTrusted === 'function')
+        ? _boNsTop.markTrusted
         : null;
-    try { delete globalThis.__bo_mark_trusted; } catch (_) {}
+    try { if (_boNsTop) delete _boNsTop.markTrusted; } catch (_) {}
 
     // Same discipline for the behaviour-generator bridge: capture, then revoke.
     // Without it `Deno.core.ops` is already gone by the time this script runs and
     // every path degenerates to linear interpolation.
-    const _bo = globalThis.__bo_input_api || null;
-    try { delete globalThis.__bo_input_api; } catch (_) {}
+    const _bo = (_boNsTop && _boNsTop.inputApi) || null;
+    try { if (_boNsTop) delete _boNsTop.inputApi; } catch (_) {}
 
     // v0.1.0-parity Fix 6 — seeded random for two-level per-session
     // determinism. Symbol-keyed slot is installed by stealth_bootstrap.js
     // and survives cleanup_bootstrap's `internals` string purge. Without
     // a backing op (e.g. test paths that don't run a full runtime) we
     // fall back to the V8 default so the page still renders.
-    const _rand = ((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return {};})().rand)
+    const _rand = ((function(){try{var s=Object.getOwnPropertySymbols(globalThis, 1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return {};})().rand)
         || Math.random;
 
     // Use the engine-internal background-timer helper so our synthetic
@@ -83,7 +84,7 @@
     // avoid.
     const _sched = (function () {
         try {
-            const syms = Object.getOwnPropertySymbols(globalThis);
+            const syms = Object.getOwnPropertySymbols(globalThis, 1);
             for (let i = 0; i < syms.length; i++) {
                 const v = globalThis[syms[i]];
                 if (v && v.__bo && v.host && typeof v.host.__bgSetTimeout === 'function') {
@@ -102,7 +103,7 @@
     // the sensor-payload POST.
     // Internal namespace, keyed by a symbol so it stays out of
     // `Object.getOwnPropertyNames(window)` — see dom_bootstrap.js.
-    const _boNs = (function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})() || {};
+    const _boNs = _boNsTop || {};
     if (!_boNs.input) {
         try {
             Object.defineProperty(_boNs, 'input', {
@@ -363,8 +364,9 @@
     function _fireMove(x, y, prev) {
         if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
         const [vw, vh] = _viewport();
-        const cx = Math.max(0, Math.min(Math.max(0, vw - 1), Math.round(x)));
-        const cy = Math.max(0, Math.min(Math.max(0, vh - 1), Math.round(y)));
+        const cx = Math.max(0, Math.min(Math.max(0, vw - 1), x));
+        const cy = Math.max(0, Math.min(Math.max(0, vh - 1), y));
+        // movementX/Y and screenX/Y stay integral — Chrome reports those as longs.
         const mx = prev && Number.isFinite(prev[0]) ? Math.round(cx - prev[0]) : 0;
         const my = prev && Number.isFinite(prev[1]) ? Math.round(cy - prev[1]) : 0;
         const mouseEv = new MouseEvent('mousemove', {
@@ -399,6 +401,46 @@
     }
 
     // Fire a `wheel` + `scroll` pair simulating a scroll-down step.
+    function _pointerStep(x, y, phase) {
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return 'некорректные координаты';
+        const [vw, vh] = _viewport();
+        const cx = Math.max(0, Math.min(Math.max(0, vw - 1), x));
+        const cy = Math.max(0, Math.min(Math.max(0, vh - 1), y));
+        const prev = (_boNs.input && Array.isArray(_boNs.input._lastPos))
+            ? _boNs.input._lastPos : null;
+        if (phase === 'move') {
+            _fireMove(cx, cy, prev);
+        } else {
+            const down = phase === 'down';
+            const mx = prev && Number.isFinite(prev[0]) ? Math.round(cx - prev[0]) : 0;
+            const my = prev && Number.isFinite(prev[1]) ? Math.round(cy - prev[1]) : 0;
+            const base = {
+                bubbles: true, cancelable: true, view: window,
+                clientX: cx, clientY: cy,
+                screenX: _screenXOf(cx), screenY: _screenYOf(cy),
+                movementX: mx, movementY: my,
+                button: 0, buttons: down ? 1 : 0,
+            };
+            const target = _hitTarget(cx, cy);
+            try {
+                const PE = (typeof PointerEvent === 'function') ? PointerEvent : null;
+                if (PE) {
+                    _dispatch(target, new PE(down ? 'pointerdown' : 'pointerup', Object.assign({
+                        pointerType: 'mouse', pointerId: 1, isPrimary: true,
+                        pressure: down ? 0.5 : 0, width: 1, height: 1,
+                    }, base)));
+                }
+            } catch (_) {}
+            _dispatch(target, new MouseEvent(down ? 'mousedown' : 'mouseup', base));
+            if (!down) {
+                try { _dispatch(target, new MouseEvent('click', base)); } catch (_) {}
+            }
+            _akRecMouse(cx, cy, down ? 'down' : 'click', 0);
+        }
+        try { _boNs.input._lastPos = [cx, cy]; } catch (_) {}
+        return 'шаг ' + phase;
+    }
+
     function _fireScrollStep(deltaY) {
         try {
             const wheel = new WheelEvent('wheel', {
@@ -653,15 +695,40 @@
             ? _boNs.input._lastPos.slice()
             : [(window.innerWidth || 1280) * 0.5, (window.innerHeight || 800) * 0.45];
         const traj = _trajectory(from[0], from[1], x, y, targetW);
+        if (!traj.length) return;
+        // The generator decides the path; the display decides the cadence. Real
+        // pointer input is sampled by the compositor at refresh rate, so a
+        // browser emits mousemove every ~16.7 ms while the pointer moves — a
+        // captured human session shows dt median 17 ms with 15 distinct values.
+        // Emitting the generator's own waypoints gave 20–106 ms gaps, a spacing
+        // no display produces. Resample along the same path instead.
+        const STEP = 1000 / 60;
+        const total = traj[traj.length - 1].t_ms || 0;
+        const clock = () => (typeof performance === 'object' && performance
+            && typeof performance.now === 'function') ? performance.now() : Date.now();
+        const t0 = clock();
         let prev = from.slice();
-        let prevT = 0;
-        for (const p of traj) {
-            await _sleep((p.t_ms || 0) - prevT);
-            prevT = p.t_ms || 0;
-            try {
-                if (_fireMove(p.x, p.y, prev)) prev = [Math.round(p.x), Math.round(p.y)];
-            } catch (_) {}
+        let seg = 0;
+        let deadline = STEP;
+        // Deadline-driven, not `sleep(STEP)` per step: a timer that overshoots by
+        // a few ms would otherwise stretch every gap. Sampling by real elapsed
+        // time keeps the average on the display grid and lets the overshoot show
+        // up as the small dt spread a real session has.
+        for (;;) {
+            const t = clock() - t0;
+            if (t >= total) break;
+            while (seg < traj.length - 2 && (traj[seg + 1].t_ms || 0) <= t) seg++;
+            const a = traj[seg];
+            const b = traj[seg + 1] || a;
+            const span = (b.t_ms || 0) - (a.t_ms || 0);
+            const u = span > 0 ? Math.max(0, Math.min(1, (t - (a.t_ms || 0)) / span)) : 0;
+            const px = a.x + (b.x - a.x) * u;
+            const py = a.y + (b.y - a.y) * u;
+            try { if (_fireMove(px, py, prev)) prev = [px, py]; } catch (_) {}
+            deadline += STEP;
+            await _sleep(Math.max(0, deadline - (clock() - t0)));
         }
+        try { _fireMove(x, y, prev); } catch (_) {}
         try { _boNs.input._lastPos = [x, y]; } catch (_) {}
     }
 
@@ -805,6 +872,7 @@
         _akEvents.typeElement = _humanType;
         _akEvents.typeSelector = (sel, text) => _humanType(document.querySelector(sel), text);
         _akEvents.moveTo = (x, y) => _travelTo(x, y, 30);
+        _akEvents.pointerStep = _pointerStep;
         // The trusted-event minter, for drivers that build their own event
         // sequences. A drag cannot be expressed through `clickElement`, and an
         // untrusted `pointerdown` is worth little to a widget that checks

@@ -73,6 +73,14 @@ pub struct StealthProfile {
     pub language: String,
     pub languages: Vec<String>,
     pub timezone: String,
+    /// Coordinates of the exit address, when the egress lookup resolved them.
+    /// Not sampled — a made-up position that disagrees with the timezone and
+    /// the peer address is worse than none, so these stay `None` unless
+    /// `egress::apply_egress` filled them from the address itself.
+    #[serde(default)]
+    pub latitude: Option<f64>,
+    #[serde(default)]
+    pub longitude: Option<f64>,
 
     // === Client Hints high-entropy values ===
     //
@@ -220,6 +228,34 @@ fn default_audio_sample_rate() -> u32 {
 }
 
 impl StealthProfile {
+    pub fn ua_brands(&self) -> [(String, String); 3] {
+        const CHARS: [char; 11] = [' ', '(', ':', '-', '.', '/', ')', ';', '=', '?', '_'];
+        const VERSIONS: [&str; 3] = ["8", "99", "24"];
+        const ORDERS: [[usize; 3]; 6] = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        let major = self.browser_version.split('.').next().unwrap_or_default();
+        let seed: usize = major.parse().unwrap_or_default();
+        let order = ORDERS[seed % ORDERS.len()];
+        let mut brands: [(String, String); 3] = Default::default();
+        brands[order[0]] = (
+            format!(
+                "Not{}A{}Brand",
+                CHARS[seed % CHARS.len()],
+                CHARS[(seed + 1) % CHARS.len()]
+            ),
+            VERSIONS[seed % VERSIONS.len()].to_string(),
+        );
+        brands[order[1]] = ("Chromium".to_string(), major.to_string());
+        brands[order[2]] = ("Google Chrome".to_string(), major.to_string());
+        brands
+    }
+
     /// Validate that all fields are internally consistent.
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
@@ -393,6 +429,21 @@ impl StealthProfile {
                 self.ua_model
             ));
         }
+        // The declared TLS identity must be the one the wire stack will
+        // actually emit. `net::tls` picks the stack from browser_name +
+        // device_class; `tls_impersonate` was a free-text field nothing
+        // read, so a profile could claim `firefox_135` and hand a Chrome
+        // ClientHello to the server — the JA4-vs-UA contradiction the
+        // Firefox branch exists to prevent, reintroduced by a typo.
+        let expected_tls = crate::net::tls::expected_impersonate(self);
+        if self.tls_impersonate != expected_tls {
+            errors.push(format!(
+                "tls_impersonate '{}' does not match the stack this profile emits \
+                 ('{}' for browser_name={} device_class={:?})",
+                self.tls_impersonate, expected_tls, self.browser_name, self.device_class
+            ));
+        }
+
         // AudioContext.sampleRate must be one of the values a real audio
         // output device reports. Modern Macs / iOS = 48000; most Windows
         // / Linux desktops + Android phones = 44100; pro audio = 96000;
@@ -410,5 +461,60 @@ impl StealthProfile {
         } else {
             Err(errors)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::stealth::presets;
+
+    /// Every shipped preset must declare the TLS identity its own
+    /// browser_name/device_class combination actually puts on the wire.
+    #[test]
+    fn presets_declare_the_tls_stack_they_emit() {
+        let presets: Vec<(&str, super::StealthProfile)> = vec![
+            ("chrome_148_windows", presets::chrome_148_windows()),
+            ("chrome_148_macos", presets::chrome_148_macos()),
+            ("chrome_148_linux", presets::chrome_148_linux()),
+            ("chrome_148_ru", presets::chrome_148_ru()),
+            ("chrome_148_cn", presets::chrome_148_cn()),
+            ("firefox_135_macos", presets::firefox_135_macos()),
+            ("firefox_135_windows", presets::firefox_135_windows()),
+            ("firefox_135_linux", presets::firefox_135_linux()),
+            ("pixel_9_pro_chrome_148", presets::pixel_9_pro_chrome_148()),
+            (
+                "iphone_15_pro_safari_18",
+                presets::iphone_15_pro_safari_18(),
+            ),
+        ];
+        for (name, p) in presets {
+            assert_eq!(
+                p.tls_impersonate,
+                crate::net::tls::expected_impersonate(&p),
+                "{name} declares a TLS identity it does not emit"
+            );
+        }
+    }
+
+    /// The rule has to actually fire — a Firefox profile carrying Chrome's
+    /// TLS name is the JA4-vs-UA contradiction it exists to catch.
+    #[test]
+    fn mismatched_tls_impersonate_is_rejected() {
+        let mut p = presets::firefox_135_macos();
+        p.tls_impersonate = "chrome_147".into();
+        let errors = p.validate().expect_err("must not validate");
+        assert!(
+            errors.iter().any(|e| e.contains("tls_impersonate")),
+            "expected a tls_impersonate error, got {errors:?}"
+        );
+    }
+
+    /// ...and the same the other way round: a Chrome desktop profile must
+    /// not claim the NSS-class Firefox stack.
+    #[test]
+    fn chrome_profile_claiming_firefox_tls_is_rejected() {
+        let mut p = presets::chrome_148_macos();
+        p.tls_impersonate = "firefox_135".into();
+        assert!(p.validate().is_err());
     }
 }

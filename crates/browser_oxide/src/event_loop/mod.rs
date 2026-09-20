@@ -272,7 +272,7 @@ impl BrowserEventLoop {
     /// (no timers, no unresolved promises, no pending async ops).
     ///
     /// **Nav short-circuit (gap: challenge-vendor 5-second retry window):** if JS
-    /// sets `(((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).__pendingNavigation` (via `location.href = ...`,
+    /// sets `(((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).__pendingNavigation` (via `location.href = ...`,
     /// `location.reload()`, form.submit, meta-refresh, etc.), the JS
     /// bootstrap calls `op_set_pending_nav` which flips an atomic flag
     /// shared with this loop. We detect it on the next tick boundary,
@@ -461,7 +461,7 @@ impl BrowserEventLoop {
     pub fn reset_nav_pending(&mut self) {
         self.runtime.reset_nav_pending();
         let _ = self.runtime.execute_script(
-            "(((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo && ((((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__pendingNavigation = null);",
+            "(((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo && ((((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__pendingNavigation = null);",
             None,
         );
     }

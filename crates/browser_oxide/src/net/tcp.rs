@@ -1,7 +1,11 @@
-//! Happy Eyeballs (RFC 6555) TCP connection over tokio.
+//! Happy Eyeballs (RFC 8305) TCP connection over tokio.
 //!
-//! Resolves DNS to both IPv4 and IPv6 addresses, tries IPv6 first,
-//! and falls back to IPv4 after 250ms if IPv6 hasn't connected yet.
+//! Resolves DNS to both families and starts IPv6 first; IPv4 joins the
+//! race after the Connection Attempt Delay and both stay in flight until
+//! one connects. On a host that advertises IPv6 but cannot route it —
+//! common, and the case this exists for — the v6 attempt either fails
+//! fast (and v4 starts immediately) or is aborted once v4 wins, instead
+//! of being left to the OS connect timeout.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -162,6 +166,37 @@ pub async fn connect_default(host: &str, port: u16) -> Result<TcpStream, NetErro
 }
 
 /// Happy Eyeballs: try IPv6 first, start IPv4 after a delay.
+/// Map a spawned attempt's `JoinHandle` result down to the connect result.
+fn flatten_attempt(
+    joined: Result<Result<TcpStream, NetError>, tokio::task::JoinError>,
+) -> Result<TcpStream, NetError> {
+    match joined {
+        Ok(res) => res,
+        Err(e) => Err(NetError::Tcp(format!("connect task failed: {e}"))),
+    }
+}
+
+/// Race IPv6 against IPv4 per RFC 8305: start IPv6, and after the
+/// Connection Attempt Delay start IPv4 **alongside it** — first to connect
+/// wins, the loser is aborted.
+///
+/// The previous shape nested two `select!`s and, when the delay fired,
+/// dropped the in-flight IPv6 future and started a *fresh* one racing
+/// IPv4. That is wrong in three ways, and all three bite hardest on
+/// exactly the network this is meant to survive — one that advertises
+/// IPv6 but cannot route it:
+///
+/// 1. The 250 ms of progress already made was thrown away, so a v6
+///    connection that would have completed at ~260 ms restarted from zero.
+/// 2. A v6 attempt that failed *fast* (`ENETUNREACH`, the usual answer
+///    when there is no v6 route at all) still waited out the full delay
+///    before v4 was tried, instead of moving on immediately.
+/// 3. Both families could end up attempted twice, doubling the socket
+///    count on every request of a page load.
+///
+/// Aborting the loser matters as much as racing them: a black-holed IPv6
+/// connect gets no RST and sits until the OS gives up, which on macOS is
+/// ~75 s per address.
 async fn happy_eyeballs(ipv6: &[SocketAddr], ipv4: &[SocketAddr]) -> Result<TcpStream, NetError> {
     // If only one family is available, just try that
     if ipv6.is_empty() {
@@ -171,29 +206,47 @@ async fn happy_eyeballs(ipv6: &[SocketAddr], ipv4: &[SocketAddr]) -> Result<TcpS
         return try_addrs(ipv6).await;
     }
 
-    // Try IPv6 first with a timeout, then race with IPv4
+    let v6_addrs = ipv6.to_vec();
+    let v4_addrs = ipv4.to_vec();
+
+    // IPv6 goes first and keeps running for the whole race — it is never
+    // restarted, only ever aborted once the other family has won.
+    let mut v6_task = tokio::spawn(async move { try_addrs(&v6_addrs).await });
+
+    // Give IPv6 its head start, but stop waiting the moment it fails:
+    // there is no reason to hold IPv4 back for a family that has already
+    // answered "unreachable".
+    let v6_failed_early = tokio::select! {
+        joined = &mut v6_task => match flatten_attempt(joined) {
+            Ok(stream) => return Ok(stream),
+            Err(_) => true,
+        },
+        _ = tokio::time::sleep(HAPPY_EYEBALLS_DELAY) => false,
+    };
+
+    let mut v4_task = tokio::spawn(async move { try_addrs(&v4_addrs).await });
+
+    if v6_failed_early {
+        return flatten_attempt(v4_task.await);
+    }
+
+    // Both families in flight. First success wins; if the first to finish
+    // failed, the other one is still our chance, so wait it out.
     tokio::select! {
-        result = try_addrs(ipv6) => {
-            match result {
-                Ok(stream) => Ok(stream),
-                // IPv6 failed entirely, try IPv4
-                Err(_) => try_addrs(ipv4).await,
+        joined = &mut v6_task => match flatten_attempt(joined) {
+            Ok(stream) => {
+                v4_task.abort();
+                Ok(stream)
             }
-        }
-        _ = tokio::time::sleep(HAPPY_EYEBALLS_DELAY) => {
-            // IPv6 is taking too long, race both
-            tokio::select! {
-                result = try_addrs(ipv6) => {
-                    match result {
-                        Ok(stream) => Ok(stream),
-                        Err(_) => try_addrs(ipv4).await,
-                    }
-                }
-                result = try_addrs(ipv4) => {
-                    result
-                }
+            Err(_) => flatten_attempt(v4_task.await),
+        },
+        joined = &mut v4_task => match flatten_attempt(joined) {
+            Ok(stream) => {
+                v6_task.abort();
+                Ok(stream)
             }
-        }
+            Err(_) => flatten_attempt(v6_task.await),
+        },
     }
 }
 

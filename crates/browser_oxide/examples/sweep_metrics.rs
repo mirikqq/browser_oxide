@@ -258,11 +258,11 @@ async fn main() {
             // Aggregate
             let pass_count = results
                 .iter()
-                .filter(|r| r.tag == "L3-RENDERED" && r.len >= 15000)
+                .filter(|r| r.tag == "L3-RENDERED" && r.len >= browser_oxide::classify::THIN_SHELL_MAX_BYTES)
                 .count();
             let thin_shell = results
                 .iter()
-                .filter(|r| r.tag == "L3-RENDERED" && r.len >= 1000 && r.len < 15000)
+                .filter(|r| r.tag == "L3-RENDERED" && r.len >= 1000 && r.len < browser_oxide::classify::THIN_SHELL_MAX_BYTES)
                 .count();
             let chl = results
                 .iter()
@@ -284,7 +284,7 @@ async fn main() {
                 .iter()
                 .zip(results.iter())
                 .filter(|(s, r)| {
-                    !s.diagnostic && r.tag == "L3-RENDERED" && r.len >= 15000
+                    !s.diagnostic && r.tag == "L3-RENDERED" && r.len >= browser_oxide::classify::THIN_SHELL_MAX_BYTES
                 })
                 .count();
             let production_pass_pct = if production_n > 0 {
@@ -309,7 +309,7 @@ async fn main() {
             for r in &results {
                 let entry = by_category.entry(r.cat.clone()).or_default();
                 entry.n += 1;
-                if r.tag == "L3-RENDERED" && r.len >= 15000 {
+                if r.tag == "L3-RENDERED" && r.len >= browser_oxide::classify::THIN_SHELL_MAX_BYTES {
                     entry.pass += 1;
                 }
             }

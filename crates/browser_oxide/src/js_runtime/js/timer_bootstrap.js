@@ -82,7 +82,7 @@
             try {
                 const ns = (function () {
                     try {
-                        const syms = Object.getOwnPropertySymbols(globalThis);
+                        const syms = Object.getOwnPropertySymbols(globalThis, 1);
                         for (let i = 0; i < syms.length; i++) {
                             const v = globalThis[syms[i]];
                             if (v && v.__bo) return v;
@@ -216,7 +216,7 @@
     try {
         const _ns = (function () {
             try {
-                const syms = Object.getOwnPropertySymbols(globalThis);
+                const syms = Object.getOwnPropertySymbols(globalThis, 1);
                 for (let i = 0; i < syms.length; i++) {
                     const v = globalThis[syms[i]];
                     if (v && v.__bo) return v;

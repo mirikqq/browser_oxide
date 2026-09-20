@@ -165,10 +165,29 @@ pub fn apple_m3_max_macos() -> GpuProfile {
     apple_m3_family_profile("Apple M3 Max")
 }
 
-/// Shared GpuProfile constructor for the M3 chip family (base / Pro / Max).
-/// All three share the ANGLE Metal Renderer stack — same extension list,
-/// same getParameter values, same shader precision. Only the
-/// `unmasked_renderer` string differs per chip.
+/// Chrome 147+ on macOS with any other Apple Silicon chip that runs the
+/// same modern ANGLE Metal Renderer stack (M1 / M2 / M4 families).
+///
+/// The differentiator is the `unmasked_renderer` string only — exactly the
+/// same reasoning this file already applies to `apple_m3_pro_macos()` and
+/// `apple_m3_max_macos()`, which are themselves name-variants of the base
+/// M3 capture: the extension list, getParameter values and shader
+/// precision come from the driver, and every Apple Silicon Mac on a
+/// current Chrome runs the same ANGLE Metal backend.
+///
+/// NOTE: unlike `apple_m3_macos()` these names were not each captured on
+/// their own machine. `apple_m2_pro_macos()` is deliberately NOT routed
+/// here — it is an older, genuinely different capture (WebGL 1.0 surface,
+/// Chrome 131) and keeps its own entry.
+pub fn apple_silicon_macos(chip_name: &str) -> GpuProfile {
+    apple_m3_family_profile(chip_name)
+}
+
+/// Shared GpuProfile constructor for the modern ANGLE Metal stack, used by
+/// the M3 family (base / Pro / Max) and by [`apple_silicon_macos`] for the
+/// other Apple Silicon chip names. All share the ANGLE Metal Renderer
+/// stack — same extension list, same getParameter values, same shader
+/// precision. Only the `unmasked_renderer` string differs per chip.
 fn apple_m3_family_profile(chip_name: &str) -> GpuProfile {
     GpuProfile {
         vendor: "WebKit".into(),
@@ -254,12 +273,12 @@ fn apple_m3_webgl1_surface() -> WebGL1Surface {
             "EXT_float_blend".into(),
             "EXT_frag_depth".into(),
             "EXT_polygon_offset_clamp".into(),
-            "EXT_sRGB".into(),
             "EXT_shader_texture_lod".into(),
             "EXT_texture_compression_bptc".into(),
             "EXT_texture_compression_rgtc".into(),
             "EXT_texture_filter_anisotropic".into(),
             "EXT_texture_mirror_clamp_to_edge".into(),
+            "EXT_sRGB".into(),
             "KHR_parallel_shader_compile".into(),
             "OES_element_index_uint".into(),
             "OES_fbo_render_mipmap".into(),
@@ -480,9 +499,96 @@ fn standard_shader_precision() -> Vec<(u32, u32, [i32; 3])> {
     out
 }
 
+/// Find the catalog entry whose `unmasked_renderer` equals `renderer`.
+///
+/// Exists because `StealthProfile.gpu_profile` — not `webgl_renderer` — is
+/// what actually reaches JS (`canvas_bootstrap.js` reads
+/// `webgl_unmasked_vendor`/`webgl_unmasked_renderer`, both sourced from
+/// `gpu_profile`). A profile loaded from YAML/JSON that names a renderer
+/// but omits `gpu_profile` would otherwise silently fall back to the
+/// `nvidia_rtx_3060_windows()` serde default and report NVIDIA-on-Windows
+/// extensions and getParameter values under, say, a macOS user agent.
+/// [`StealthProfile::load_from_file`] uses this to resolve the entry the
+/// profile actually meant.
+///
+/// Apple Silicon names not in the fixed list resolve through
+/// [`apple_silicon_macos`], which is the same ANGLE Metal stack under a
+/// different chip string.
+pub fn by_unmasked_renderer(renderer: &str) -> Option<GpuProfile> {
+    for build in [
+        nvidia_rtx_3060_windows as fn() -> GpuProfile,
+        apple_m3_macos,
+        apple_m3_pro_macos,
+        apple_m3_max_macos,
+        apple_m2_pro_macos,
+        intel_uhd_630_linux,
+    ] {
+        let candidate = build();
+        if candidate.unmasked_renderer == renderer {
+            return Some(candidate);
+        }
+    }
+    // "ANGLE (Apple, ANGLE Metal Renderer: <chip>, Unspecified Version)"
+    let chip = renderer
+        .strip_prefix("ANGLE (Apple, ANGLE Metal Renderer: ")?
+        .strip_suffix(", Unspecified Version)")?;
+    (!chip.is_empty() && chip.starts_with("Apple ")).then(|| apple_silicon_macos(chip))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn by_unmasked_renderer_matches_catalog_entries() {
+        for build in [
+            nvidia_rtx_3060_windows as fn() -> GpuProfile,
+            apple_m3_macos,
+            apple_m3_pro_macos,
+            apple_m3_max_macos,
+            apple_m2_pro_macos,
+            intel_uhd_630_linux,
+        ] {
+            let want = build();
+            let got = by_unmasked_renderer(&want.unmasked_renderer)
+                .unwrap_or_else(|| panic!("no catalog hit for {}", want.unmasked_renderer));
+            assert_eq!(got.unmasked_renderer, want.unmasked_renderer);
+            assert_eq!(got.extensions, want.extensions);
+        }
+    }
+
+    #[test]
+    fn by_unmasked_renderer_covers_other_apple_silicon() {
+        // Chips BrowserForge samples that have no dedicated capture still
+        // resolve — to the shared ANGLE Metal stack, with their own name.
+        for chip in [
+            "Apple M1",
+            "Apple M1 Pro",
+            "Apple M2",
+            "Apple M4",
+            "Apple M4 Pro",
+        ] {
+            let renderer =
+                format!("ANGLE (Apple, ANGLE Metal Renderer: {chip}, Unspecified Version)");
+            let gpu =
+                by_unmasked_renderer(&renderer).unwrap_or_else(|| panic!("{chip} should resolve"));
+            assert_eq!(gpu.unmasked_renderer, renderer);
+            assert_eq!(gpu.unmasked_vendor, "Google Inc. (Apple)");
+            assert!(!gpu.extensions.is_empty());
+        }
+    }
+
+    #[test]
+    fn by_unmasked_renderer_rejects_unknown() {
+        assert!(by_unmasked_renderer("Some Unknown GPU").is_none());
+        assert!(by_unmasked_renderer("").is_none());
+        // Well-formed ANGLE string for a non-Apple vendor we have no entry
+        // for must NOT silently resolve to an Apple profile.
+        assert!(by_unmasked_renderer(
+            "ANGLE (AMD, AMD Radeon RX 7900 XTX Direct3D11 vs_5_0 ps_5_0, D3D11)"
+        )
+        .is_none());
+    }
 
     /// FIX-D2: apple_m3 must carry a distinct WebGL 1 surface whose extension
     /// set is the spec-correct delta of the WebGL 2 list — no WebGL-2-only

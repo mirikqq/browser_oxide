@@ -164,14 +164,15 @@ impl ModuleLoader for BrowserModuleLoader {
             let client = client.ok_or_else(|| {
                 ModuleLoaderError::generic("module loader: shared HTTP client unavailable")
             })?;
-            let mut hdrs = crate::net::headers::nav_headers_for_url(&profile, &referer, false);
-            hdrs.push(("referer".to_string(), referer));
-            hdrs.push(("accept".to_string(), "*/*".to_string()));
-            // ESM fetches: Chrome emits dest=script, mode=cors.
-            hdrs.push(("sec-fetch-dest".to_string(), "script".to_string()));
-            hdrs.push(("sec-fetch-mode".to_string(), "cors".to_string()));
+            // ESM fetches: dest=script, mode=cors. This used to build on
+            // `nav_headers_for_url`, which left `sec-fetch-site: none`,
+            // `sec-fetch-user: ?1` and `upgrade-insecure-requests: 1` on a
+            // request that is neither a navigation nor user-initiated.
+            let hdrs = crate::net::headers::nav_headers_subresource(
+                &profile, &url, &referer, "script", true,
+            );
             let resp = client
-                .get_follow_with_headers(&url, &hdrs, 5)
+                .get_follow_exact_headers(&url, &hdrs, 5)
                 .await
                 .map_err(|e| ModuleLoaderError::generic(format!("module fetch {url}: {e}")))?;
             if !resp.ok() {

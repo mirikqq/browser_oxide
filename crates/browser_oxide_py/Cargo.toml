@@ -29,3 +29,6 @@ browser_oxide = { path = "../browser_oxide" }
 # extension-module: resolve CPython symbols at runtime (no libpython link), so a
 # plain `cargo build` of the cdylib works and maturin produces a portable wheel.
 pyo3 = { version = "0.28", features = ["abi3-py38", "extension-module"] }
+
+[patch.crates-io]
+boring-sys2 = { path = "../../third_party/boring-sys2" }

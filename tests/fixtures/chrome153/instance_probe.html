@@ -1,0 +1,29 @@
+<!DOCTYPE html><meta charset=utf-8><title>loc probe</title><pre id=out></pre>
+<script>
+const d = (obj, key) => {
+  const x = Object.getOwnPropertyDescriptor(obj, key);
+  if (!x) return null;
+  const o = { e: +x.enumerable, c: +x.configurable };
+  if ('value' in x) { o.k = typeof x.value === 'function' ? 'fn' : typeof x.value; o.w = +x.writable; if (o.k === 'fn') o.l = x.value.length; }
+  else { o.k = 'acc'; o.g = +!!x.get; o.s = +!!x.set; }
+  return o;
+};
+const dump = (obj) => {
+  const out = {};
+  for (const k of Object.getOwnPropertyNames(obj)) out[k] = d(obj, k);
+  for (const s of Object.getOwnPropertySymbols(obj)) out['@@' + String(s)] = d(obj, s);
+  return out;
+};
+const res = {
+  location: dump(location),
+  locationProtoIsLocationPrototype: Object.getPrototypeOf(location) === Location.prototype,
+  document: dump(document),
+  event: dump(new Event('x')),
+  eventProtoIsTrusted: !!Object.getOwnPropertyDescriptor(Event.prototype, 'isTrusted'),
+  documentElementOwn: dump(document.documentElement),
+  templateOwn: dump(document.createElement('template')),
+  htmlHtmlProto: Object.getOwnPropertyNames(HTMLHtmlElement.prototype),
+  templateProto: Object.getOwnPropertyNames(HTMLTemplateElement.prototype),
+};
+out.textContent = JSON.stringify(res);
+</script>

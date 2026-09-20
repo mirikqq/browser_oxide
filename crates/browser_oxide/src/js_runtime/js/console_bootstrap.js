@@ -81,11 +81,8 @@
     }
 
     globalThis.console = {
-        log(...args) {
+        debug(...args) {
             core.ops.op_console_log(args.map(_stringify).join(" "));
-        },
-        warn(...args) {
-            core.ops.op_console_warn(args.map(_stringify).join(" "));
         },
         error(...args) {
             core.ops.op_console_error(args.map(_stringify).join(" "));
@@ -93,11 +90,15 @@
         info(...args) {
             core.ops.op_console_log(args.map(_stringify).join(" "));
         },
-        debug(...args) {
+        log(...args) {
             core.ops.op_console_log(args.map(_stringify).join(" "));
+        },
+        warn(...args) {
+            core.ops.op_console_warn(args.map(_stringify).join(" "));
         },
         dir() {},
         dirxml() {},
+        table() {},
         trace() {},
         group() {},
         groupCollapsed() {},
@@ -105,16 +106,41 @@
         clear() {},
         count() {},
         countReset() {},
-        assert(cond, ...args) {
-            if (!cond) {
-                core.ops.op_console_error("Assertion failed: " + args.map(String).join(" "));
+        assert(...args) {
+            if (!args[0]) {
+                core.ops.op_console_error("Assertion failed: " + args.slice(1).map(String).join(" "));
             }
         },
-        table() {},
+        profile() {},
+        profileEnd() {},
         time() {},
         timeLog() {},
         timeEnd() {},
+        timeStamp() {},
+        context(_name) { return globalThis.console; },
+        createTask(...args) {
+            const name = args[0];
+            const task = {
+                run(fn, ...rest) {
+                    if (typeof fn !== "function") {
+                        throw new TypeError("Failed to execute 'run' on 'Task': parameter 1 is not of type 'Function'.");
+                    }
+                    return fn.apply(this, rest);
+                },
+            };
+            Object.defineProperty(task.run, "name", { value: "run", configurable: true });
+            Object.defineProperty(task, Symbol.toStringTag, { value: String(name), configurable: true });
+            return task;
+        },
+        get memory() {
+            const perf = globalThis.performance;
+            return perf ? perf.memory : undefined;
+        },
+        set memory(_v) {},
     };
+    Object.defineProperty(globalThis.console, Symbol.toStringTag, {
+        value: "console", configurable: true,
+    });
     // Native-masking of these methods is applied by stealth_bootstrap.js
     // (concatenated AFTER this file in the V8 snapshot, where
     // _maskAsNative is defined). Doing it here would no-op because

@@ -36,7 +36,7 @@ static FORCE_CANVAS_FLUSH: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Resolves the engine's symbol-keyed internal namespace (see `page.rs`).
-const NS_RESOLVE: &str = "(function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()";
+const NS_RESOLVE: &str = "(function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()";
 
 /// Properties compared engine-vs-Chrome. Both sides iterate the same list.
 const INSPECT_PROPS: &str = "['display','position','width','height','fontSize','fontFamily',\
@@ -102,7 +102,7 @@ const SNAPSHOT_JS: &str = r#"
         box: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)]
       };
     });
-  var _ns = (function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})();
+  var _ns = (function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})();
   var bo = (_ns && _ns.input) || null;
   var cursor = [];
   if (bo && bo.mouse && bo.mouse.length) { cursor = bo.mouse.splice(0, bo.mouse.length); }
@@ -230,15 +230,29 @@ async fn run() {
     // one address range carries the same canvas hash, screen and audio surface —
     // which clusters on its own, regardless of how correct each value is.
     // `BROWSER_OXIDE_PROFILE_SEED` pins it when a run has to be reproducible.
-    let profile = match std::env::var("BROWSER_OXIDE_PROFILE_SEED")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-    {
-        Some(seed) => {
-            let mut rng = browser_oxide::stealth::presets::seeded_rng(seed);
-            browser_oxide::stealth::presets::random_desktop_with_rng(&mut rng)
-        }
-        None => browser_oxide::stealth::presets::random_desktop(),
+    // `BROWSER_OXIDE_PROFILE_FILE` loads a profile from disk instead —
+    // the path for profiles produced by `tools/browserforge_profile.py`,
+    // which samples field *combinations* from observed traffic rather than
+    // from the hand-built presets. Loading runs `validate()` and resolves
+    // `gpu_profile` from the named renderer.
+    let profile = match std::env::var("BROWSER_OXIDE_PROFILE_FILE") {
+        Ok(path) => match browser_oxide::stealth::StealthProfile::load_from_file(&path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("не удалось загрузить профиль {path}: {e}");
+                std::process::exit(1);
+            }
+        },
+        Err(_) => match std::env::var("BROWSER_OXIDE_PROFILE_SEED")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            Some(seed) => {
+                let mut rng = browser_oxide::stealth::presets::seeded_rng(seed);
+                browser_oxide::stealth::presets::random_desktop_with_rng(&mut rng)
+            }
+            None => browser_oxide::stealth::presets::random_desktop(),
+        },
     };
     // The locale is not left to the dice: it is pulled to wherever the traffic
     // actually leaves. An exit IP in Stockholm presenting `Europe/Paris` and
@@ -247,15 +261,24 @@ async fn run() {
     // `BROWSER_OXIDE_NO_GEO=1` when testing on a fixed profile.
     let mut profile = profile;
     if std::env::var_os("BROWSER_OXIDE_NO_GEO").is_none() {
-        match browser_oxide::stealth::egress::detect_country(&profile).await {
-            Some(cc) => {
-                if browser_oxide::stealth::egress::apply_country(&mut profile, &cc) {
-                    eprintln!("[гео] выход из {cc} — локаль подогнана");
+        match browser_oxide::stealth::egress::detect_egress(&profile).await {
+            Some(egress) => {
+                let where_ = match (&egress.city, &egress.region) {
+                    (Some(c), Some(r)) if c != r => format!("{c}, {r}, {}", egress.country),
+                    (Some(c), _) => format!("{c}, {}", egress.country),
+                    _ => egress.country.clone(),
+                };
+                if browser_oxide::stealth::egress::apply_egress(&mut profile, &egress) {
+                    let coords = match (profile.latitude, profile.longitude) {
+                        (Some(la), Some(lo)) => format!(" · {la:.4},{lo:.4}"),
+                        _ => String::new(),
+                    };
+                    eprintln!("[гео] выход {where_} → {}{coords}", profile.timezone);
                 } else {
-                    eprintln!("[гео] выход из {cc} — нет записи, локаль оставлена случайной");
+                    eprintln!("[гео] выход {where_} — зону определить нечем, профиль как есть");
                 }
             }
-            None => eprintln!("[гео] определить страну выхода не удалось, локаль случайная"),
+            None => eprintln!("[гео] определить точку выхода не удалось, локаль случайная"),
         }
     }
     let profile = profile;
@@ -599,7 +622,7 @@ async fn run() {
                         let js = format!(
                             "(function(){{var e=document.querySelector(`{sel}`);\
                              if(!e)return 'нет элемента';\
-                             var ns=(function(){{try{{var s=Object.getOwnPropertySymbols(globalThis);\
+                             var ns=(function(){{try{{var s=Object.getOwnPropertySymbols(globalThis,1);\
                                  for(var i=0;i<s.length;i++){{var v=globalThis[s[i]];if(v&&v.__bo)return v;}}}}catch(e){{}}return null;}})();\
                              var mark=(typeof globalThis.__bo_mark_trusted==='function')\
                                  ?globalThis.__bo_mark_trusted\
@@ -806,9 +829,11 @@ fn push_snapshot(
                 let path_json = serde_json::to_string(&frame.frame_path).unwrap_or_default();
                 let parent_json = serde_json::to_string(&frame.parent_path).unwrap_or_default();
                 let rect_json = serde_json::to_string(&frame.css_rect).unwrap_or_default();
-                let html_json = changed
-                    .then(|| json_str(&frame.html))
-                    .unwrap_or_else(|| "null".into());
+                let html_json = if changed {
+                    json_str(&frame.html)
+                } else {
+                    "null".into()
+                };
                 tree.push(format!(
                     "{{\"framePath\":{path_json},\"parentPath\":{parent_json},\"slot\":{slot},\"generation\":{},\"cssRect\":{rect_json},\"html\":{html_json}}}",
                     frame.generation
@@ -1041,7 +1066,7 @@ const POINTER_JS: &str = r#"(function(){
   var vh = Math.max(1, Number(globalThis.innerHeight) || 1);
   var el, x, y;
   if (canvasId >= 0) {
-    el = [].find.call(document.querySelectorAll('canvas'), function(c){ return (c._canvasId|0) === canvasId; });
+    el = [].find.call(document.querySelectorAll('canvas'), function(c){ var ns=(function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})(); var id=(ns&&ns.idl)?(ns.idl.read(c,'_canvasId',0)|0):0; return id === canvasId; });
     if (!el) return 'нет элемента';
     // A canvas's own box, not the frame's: drawImage-space math needs offsets
     // relative to the surface itself.
@@ -1085,7 +1110,7 @@ const POINTER_JS: &str = r#"(function(){
   // rect may place a pointer outside the browser profile's viewport.
   x = Math.max(0, Math.min(vw - 1, x));
   y = Math.max(0, Math.min(vh - 1, y));
-  var ns = (function(){try{var s=Object.getOwnPropertySymbols(globalThis);
+  var ns = (function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);
       for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})();
   var mark = (typeof globalThis.__bo_mark_trusted === 'function')
       ? globalThis.__bo_mark_trusted
@@ -1106,8 +1131,12 @@ const POINTER_JS: &str = r#"(function(){
     var isPress = type === 'pointerdown' || type === 'mousedown';
     var prev = st.at || { x: x, y: y };
     var buttons = isRelease ? 0 : (isMove ? (st.down ? 1 : 0) : (isPress ? 1 : 0));
+    // Client coordinates keep sub-pixel precision: a real Chrome on a dpr-2
+    // display reports fractional clientX/clientY for pointer motion, and a
+    // gesture made entirely of whole numbers is a tell on its own.
+    // screenX/screenY and movementX/movementY stay integral, as Chrome has them.
     var init = { bubbles: true, cancelable: true, view: globalThis,
-                 clientX: Math.round(x), clientY: Math.round(y),
+                 clientX: x, clientY: y,
                  screenX: Math.round((Number(globalThis.screenX) || 0) + x),
                  screenY: Math.round((Number(globalThis.screenY) || 0) + y),
                  movementX: Math.round(x - prev.x), movementY: Math.round(y - prev.y),
@@ -1159,6 +1188,20 @@ const POINTER_JS: &str = r#"(function(){
     st.down = null;
   }
   st.at = { x: x, y: y };
+  // The viewer's cursor and the humanized one are a single cursor: park the
+  // position where humanize.js keeps it, so a synthesised action afterwards
+  // starts from where the hand actually left off instead of teleporting from a
+  // stale point, and record the step in the same telemetry buffer.
+  try {
+    if (ns && ns.input) {
+      ns.input._lastPos = [x, y];
+      if (Array.isArray(ns.input.mouse) && ns.input.mouse.length < 200) {
+        ns.input.mouse.push({ x: x | 0, y: y | 0, t: Date.now(),
+                              kind: phase === 'move' ? 0 : 1, button: 0 });
+      }
+      if (ns.input.counters) ns.input.counters.mouse++;
+    }
+  } catch (e) {}
   if (ns && ns.trace && ns.trace.record) {
     try { ns.trace.record('pointer transport', {
       kind:'input', phase:phase, uv:[u,v], client:[x,y],
@@ -1189,7 +1232,7 @@ const KEY_JS: &str = r#"(function(){
   var el = sel ? document.querySelector(sel) : (document.activeElement || document.body);
   if (!el) return 'нет цели';
   var key = `__KEY__`, code = `__CODE__`, phase = '__PHASE__';
-  var ns = (function(){try{var s=Object.getOwnPropertySymbols(globalThis);
+  var ns = (function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);
       for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})();
   var mark = (typeof globalThis.__bo_mark_trusted === 'function')
       ? globalThis.__bo_mark_trusted
@@ -1542,7 +1585,12 @@ fn action_to_js(raw: &str) -> String {
              e.dispatchEvent(new Event('input',{{bubbles:true}}));\
              return 'заполнено (humanize не загружен)';}})()"
         ),
-        "eval" => text,
+        // Not `text`: that copy is escaped for embedding in the backtick
+        // templates above, and this branch splices the script in directly.
+        // Doubling every backslash turned `/hcaptcha\.com/` into
+        // `/hcaptcha\\.com/` — a regex that matches a literal backslash and so
+        // never fires, silently corrupting any evaluated JS containing an escape.
+        "eval" => field(raw, "text"),
         other => format!("'неизвестное действие: {other}'"),
     }
 }

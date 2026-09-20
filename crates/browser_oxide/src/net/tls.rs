@@ -21,40 +21,68 @@ use crate::net::error::NetError;
 /// The Chrome major version whose **verified-real** ClientHello / H2
 /// fingerprint these constants reproduce, byte-exact.
 ///
-/// **Why this is 147 while every desktop preset's UA advertises Chrome
-/// 148 — and why that is NOT an incoherent skew:**
+/// Chrome's TLS ClientHello is version-stable across majors: it changes
+/// only on a deliberate TLS-stack change, the last being ML-DSA signature
+/// algorithms, signature-algorithm GREASE and Trust Anchor IDs, all present
+/// by Chrome 152. So this capture stays valid for
+/// neighbouring majors without a re-capture, and JA4 — TLS version +
+/// sorted cipher/extension counts + ALPN + sorted sigalgs — carries no
+/// Chrome version at all.
 ///
-/// 1. Chrome's TLS ClientHello is **version-stable across majors**. It
-///    only changes on a deliberate TLS-stack change; the last such change
-///    was the MLKEM768 post-quantum rollout at Chrome 131. There was no
-///    TLS-stack change between 147 and 148 (consecutive majors, ~1 month
-///    apart, May 2026), so the bytes real Chrome 148 puts on the wire are
-///    identical to this verified-real 147 capture: the byte-exact Chrome
-///    147 and 148 values are the same values.
-/// 2. **JA4 does not encode the Chrome version.** JA4 = TLS-version +
-///    sorted cipher/extension counts + ALPN + sorted sigalgs. None of
-///    those differ 147↔148. A "JA4-vs-UA cross-check" verifies
-///    the JA4 corresponds to *a Chrome* consistent with the UA *family*
-///    — it cannot, even in principle, detect a 147-vs-148 minor/major
-///    label difference.
-/// 3. UA=148 is a **deliberate, A/B-tested** decision: real Chrome
-///    stable IS 148 (chromiumdash; shipped early May 2026), and the
-///    147→148 UA bump *recovered* several previously-blocked sites in
-///    our measurement. Rolling the UA back to 147 would re-introduce
-///    those regressions and advertise an outdated browser (its own
-///    soft-deny signal). So the coherent state is UA=148 + these
-///    (wire-identical) 147-reference bytes.
-///
-/// This constant exists so the coherence is **machine-checked** (see the
-/// `tls_fingerprint_vectors_no_silent_drift` test) and the rationale is
-/// one `grep` away — the silent-drift hazard the plan flags is removed
-/// without changing a single wire byte or UA.
-pub const TLS_CHROME_MAJOR: u32 = 147;
+/// What this constant *is* for: pinning which capture the wire bytes came
+/// from, so a future TLS-stack change is a deliberate re-capture rather
+/// than silent drift (see `tls_fingerprint_vectors_no_silent_drift`).
+pub const TLS_CHROME_MAJOR: u32 = 153;
 
 /// The Chrome major every desktop Chrome preset's `user_agent`
-/// advertises. Intentionally != [`TLS_CHROME_MAJOR`]; see that
-/// constant's docs for why this is wire-coherent, not a skew.
-pub const UA_CHROME_MAJOR: u32 = 148;
+/// advertises.
+///
+/// Kept equal to [`TLS_CHROME_MAJOR`]. An earlier revision ran these
+/// deliberately apart (UA 148 over the wire-identical 147 capture, on the
+/// argument that JA4 cannot encode the minor difference); the presets
+/// have since settled on 147 and the constant had been left behind at
+/// 148, so the coherence assertion below was failing on every run — a
+/// permanently-red guard, which is worse than no guard: it stops being
+/// read, and the next real drift hides behind it.
+///
+/// Generated profiles do not use this constant. They carry their own UA
+/// from the fingerprint generator, and their TLS identity is checked
+/// per-profile instead — see [`expected_impersonate`] and the
+/// `tls_impersonate` rule in `StealthProfile::validate`.
+pub const UA_CHROME_MAJOR: u32 = 153;
+
+/// The TLS identity `chrome_connector`/`configure_connection` will actually
+/// emit for this profile.
+///
+/// The wire stack is chosen from `browser_name` + `device_class`, while
+/// the profile *also* carries a `tls_impersonate` string. Nothing read
+/// that string, so it could say anything — a profile could advertise
+/// `firefox_135` and put a Chrome ClientHello on the wire, which is
+/// precisely the JA4-vs-UA contradiction the Firefox branch exists to
+/// avoid. `StealthProfile::validate` now checks the declaration against
+/// this function, so the field is a machine-checked statement of intent
+/// rather than a comment.
+///
+/// This is also what makes TLS *generated* rather than hardcoded: a
+/// generated profile names its TLS identity as data, and the check keeps
+/// that name honest. Note the values are a small set of **captured, real**
+/// stacks — TLS parameters cannot be sampled freely the way canvas or
+/// audio noise can, because a cipher/extension list that no shipping
+/// browser emits is a far stronger signal than a common one. What *does*
+/// vary per connection is what real Chrome varies: the Fisher-Yates
+/// extension permutation and fresh GREASE (see
+/// `CHROME_EXTENSION_PERMUTATION`), so JA3 differs handshake to handshake
+/// while JA4 stays stable — exactly Chrome's own behaviour since 110.
+pub fn expected_impersonate(profile: &StealthProfile) -> &'static str {
+    if profile.browser_name == "Firefox" {
+        return "firefox_135";
+    }
+    match profile.device_class {
+        DeviceClass::MobileIOS => "safari_18_ios",
+        DeviceClass::MobileAndroid => "chrome_147_android",
+        DeviceClass::Desktop => "chrome_153",
+    }
+}
 
 /// Chrome 147 cipher suite list (order is critical for JA3 fingerprint).
 const CIPHER_LIST: &str = concat!(
@@ -291,8 +319,8 @@ const ALPN_PROTOS: &[u8] = b"\x02h2\x08http/1.1";
 
 use rand::prelude::SliceRandom;
 
-/// Chrome 147 extension permutation (indices into BoringSSL kExtensions table).
-/// 16 extensions matching a verified Chrome 147 macOS arm64 reference capture.
+/// Chrome 152 extension permutation (indices into BoringSSL kExtensions table).
+/// 17 extensions matching a verified Chrome 152 macOS arm64 reference capture.
 ///
 /// **Real Chrome shuffling behavior** (per Fastly TLS Fingerprinting blog
 /// + Chromestatus 5124606246518784 + BoringSSL `ssl_setup_extension_permutation`
@@ -320,9 +348,48 @@ const CHROME_EXTENSION_PERMUTATION: &[u8] = &[
     7,  // application_layer_protocol_negotiation (16)
     6,  // session_ticket (35)
     9,  // signature_algorithms (13)
+    26, // trust_anchors (0xca34)
 ];
 
-/// Generate a fresh Fisher-Yates shuffle over all 16 Chrome 147 extensions.
+const CHROME_DESKTOP_ADVERTISED_EXTRA_SIGALGS: &[u16] = &[0x0904, 0x0905, 0x0906];
+
+#[rustfmt::skip]
+const CHROME_DESKTOP_TRUST_ANCHOR_IDS: &[u8] = &[
+    0x04, 0xd6, 0x79, 0x09, 0x0e,
+    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x07,
+    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x09,
+    0x04, 0xd6, 0x79, 0x09, 0x09,
+    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x08,
+    0x04, 0xd6, 0x79, 0x09, 0x06,
+    0x05, 0x82, 0xdf, 0x13, 0x02, 0x14,
+    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x0d,
+    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x0c,
+    0x05, 0x82, 0xdf, 0x13, 0x02, 0x0e,
+    0x04, 0xd6, 0x79, 0x09, 0x01,
+    0x04, 0xd6, 0x79, 0x09, 0x0d,
+    0x04, 0xd6, 0x79, 0x09, 0x08,
+    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x0b,
+    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x0a,
+    0x04, 0xd6, 0x79, 0x09, 0x05,
+    0x04, 0xd6, 0x79, 0x09, 0x0b,
+    0x05, 0x82, 0xdf, 0x13, 0x02, 0x01,
+    0x04, 0xd6, 0x79, 0x09, 0x0c,
+    0x05, 0x82, 0xdf, 0x13, 0x02, 0x0f,
+    0x05, 0x82, 0xdf, 0x13, 0x02, 0x12,
+    0x04, 0xd6, 0x79, 0x09, 0x03,
+    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x13,
+    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x12,
+    0x04, 0xd6, 0x79, 0x09, 0x04,
+    0x04, 0xd6, 0x79, 0x09, 0x0f,
+    0x05, 0x82, 0xdf, 0x13, 0x02, 0x13,
+    0x05, 0x82, 0xdf, 0x13, 0x02, 0x06,
+    0x04, 0xd6, 0x79, 0x09, 0x0a,
+    0x04, 0xd6, 0x79, 0x09, 0x07,
+    0x05, 0x82, 0xdf, 0x13, 0x02, 0x0d,
+    0x04, 0xd6, 0x79, 0x09, 0x02,
+];
+
+/// Generate a fresh Fisher-Yates shuffle over all 17 Chrome 152 extensions.
 fn shuffled_chrome_extension_permutation() -> Vec<u8> {
     let mut rng = rand::rng();
     let mut permutation = CHROME_EXTENSION_PERMUTATION.to_vec();
@@ -509,6 +576,32 @@ pub fn chrome_connector(profile: &StealthProfile) -> Result<SslConnector, NetErr
         );
     }
 
+    if !is_safari_ios && !is_firefox && profile.device_class == DeviceClass::Desktop {
+        let ctx = connector.context().as_ptr();
+        // SAFETY: `ctx` is the live SSL_CTX of the connector built above and is
+        // not yet shared with any connection. Both setters read `len` elements
+        // from a `'static` slice and copy them into the SSL_CTX; nothing is
+        // retained or written through the pointers.
+        let ok = unsafe {
+            boring_sys2::SSL_CTX_set_grease_sigalgs_enabled(ctx, 1);
+            boring_sys2::SSL_CTX_set_advertised_extra_sigalgs(
+                ctx,
+                CHROME_DESKTOP_ADVERTISED_EXTRA_SIGALGS.as_ptr(),
+                CHROME_DESKTOP_ADVERTISED_EXTRA_SIGALGS.len(),
+            ) == 1
+                && boring_sys2::SSL_CTX_set1_requested_trust_anchors(
+                    ctx,
+                    CHROME_DESKTOP_TRUST_ANCHOR_IDS.as_ptr(),
+                    CHROME_DESKTOP_TRUST_ANCHOR_IDS.len(),
+                ) == 1
+        };
+        if !ok {
+            return Err(NetError::Tls(
+                "failed to configure Chrome desktop signature algorithms / trust anchors".into(),
+            ));
+        }
+    }
+
     Ok(connector)
 }
 
@@ -659,21 +752,23 @@ rsa_pss_rsae_sha512:rsa_pkcs1_sha512";
              must lead) — JA4 supported_groups would change"
         );
 
-        // --- JA4 input 4: extension count (16 — JA4 `c` digit) ---
+        // --- JA4 input 4: extension count (17 — JA4 `c` digit) ---
         assert_eq!(
             CHROME_EXTENSION_PERMUTATION.len(),
-            16,
+            17,
             "Chrome extension count drifted — JA4 extension-count digit \
              would change"
         );
 
-        // --- UA / TLS coherence (the deliberate, wire-equivalent split) ---
-        assert_eq!(TLS_CHROME_MAJOR, 147);
-        assert_eq!(UA_CHROME_MAJOR, 148);
-        // The split is intentional and wire-coherent: Chrome's
-        // ClientHello did not rev 147→148, JA4 cannot encode the Chrome
-        // version, and UA=148 is the A/B-tested current-Chrome value.
-        // (Rationale in TLS_CHROME_MAJOR docs.)
+        assert_eq!(
+            CHROME_DESKTOP_ADVERTISED_EXTRA_SIGALGS,
+            &[0x0904, 0x0905, 0x0906],
+            "Chrome ML-DSA sigalgs drifted — JA4 sigalg hash would change"
+        );
+        assert_eq!(CHROME_DESKTOP_TRUST_ANCHOR_IDS.len(), 204);
+
+        assert_eq!(TLS_CHROME_MAJOR, 153);
+        assert_eq!(UA_CHROME_MAJOR, 153);
 
         fn ua_chrome_major(ua: &str) -> Option<u32> {
             let i = ua.find("Chrome/")? + "Chrome/".len();
@@ -692,9 +787,9 @@ rsa_pss_rsae_sha512:rsa_pkcs1_sha512";
                 profile.user_agent
             );
             assert_eq!(
-                profile.tls_impersonate, "chrome_147",
+                profile.tls_impersonate, "chrome_153",
                 "desktop Chrome preset TLS profile must be the verified-real \
-                 chrome_147 reference (wire-equivalent to Chrome \
+                 chrome_153 reference (wire-equivalent to Chrome \
                  {UA_CHROME_MAJOR}); see TLS_CHROME_MAJOR docs"
             );
         }
@@ -815,13 +910,13 @@ rsa_pss_rsae_sha512:rsa_pkcs1_sha512";
 
     #[test]
     fn test_shuffle_is_full_fisher_yates() {
-        // Real Chrome shuffles all 16 extensions uniformly (no buckets).
+        // Real Chrome shuffles all 17 extensions uniformly (no buckets).
         // Verify the shuffle preserves the full set + is non-deterministic.
         let p1 = shuffled_chrome_extension_permutation();
         let p2 = shuffled_chrome_extension_permutation();
 
-        assert_eq!(p1.len(), 16);
-        assert_eq!(p2.len(), 16);
+        assert_eq!(p1.len(), 17);
+        assert_eq!(p2.len(), 17);
 
         let mut sorted = p1.clone();
         sorted.sort();

@@ -27,6 +27,7 @@ pub struct BrowserRuntimeOptions {
     pub base_url: Option<url::Url>,
     pub stealth_profile: Option<StealthProfile>,
     pub stylesheets: Vec<String>,
+    pub external_stylesheets: Vec<String>,
     /// Scripts evaluated AFTER all built-in bootstraps but BEFORE any
     /// parsed-HTML `<script>` tags. Mirrors Chromium's
     /// `Page.addScriptToEvaluateOnNewDocument` CDP command — the driver
@@ -183,12 +184,59 @@ pub fn create_runtime(dom: Dom, options: BrowserRuntimeOptions) -> JsRuntime {
 /// Create a runtime AND return its NavSignal so the event-loop driver
 /// can poll `nav.pending()` between ticks and break out of `run_until_idle`
 /// the moment JS triggers a navigation. See `nav_ext.rs`.
+/// The window-realm bootstrap sources, in order. Defined once here because the
+/// snapshot builder needs the identical list — when the two drifted apart, a
+/// snapshot-restored realm silently came up without `shared_apis`, `services`
+/// and `input`.
+macro_rules! window_bootstrap_js {
+    () => {
+        concat!(
+            include_str!("js/console_bootstrap.js"),
+            "\n",
+            include_str!("js/stealth_bootstrap.js"),
+            "\n",
+            include_str!("js/interfaces_bootstrap.js"),
+            "\n",
+            include_str!("js/shared_apis_bootstrap.js"),
+            "\n",
+            include_str!("js/instances_bootstrap.js"),
+            "\n",
+            include_str!("js/fetch_bootstrap.js"),
+            "\n",
+            include_str!("js/timer_bootstrap.js"),
+            "\n",
+            include_str!("js/dom_bootstrap.js"),
+            "\n",
+            include_str!("js/event_bootstrap.js"),
+            "\n",
+            include_str!("js/services_bootstrap.js"),
+            "\n",
+            include_str!("js/canvas_bootstrap.js"),
+            "\n",
+            include_str!("js/window_bootstrap.js"),
+            "\n",
+            include_str!("js/streams_bootstrap.js"),
+            "\n",
+            include_str!("js/structured_clone.js"),
+            // Must precede cleanup_bootstrap: it captures `Deno.core.ops` for the
+            // humanized-input init script, which itself runs after Deno is gone.
+            include_str!("js/input_bootstrap.js"),
+            "\n",
+            // Fills in the IDL members Chrome has that this engine does not
+            // implement; runs last so it only touches what is still missing.
+            include_str!("js/parity_bootstrap.js"),
+        )
+    };
+}
+pub(crate) use window_bootstrap_js;
+
 pub fn create_runtime_with_signals(
     dom: Dom,
     options: BrowserRuntimeOptions,
 ) -> (JsRuntime, NavSignal) {
     let mut state = DomState::new(dom);
     state.stylesheets = options.stylesheets;
+    state.external_stylesheets = options.external_stylesheets;
     if let Some(storage) = options.storage {
         state.storage = storage;
     }
@@ -342,36 +390,7 @@ pub fn create_runtime_with_signals(
 
     // Execute bootstrap JS only if NOT starting from snapshot
     if options.startup_snapshot.is_none() {
-        const BOOTSTRAP_JS: &str = concat!(
-            include_str!("js/console_bootstrap.js"),
-            "\n",
-            include_str!("js/stealth_bootstrap.js"),
-            "\n",
-            include_str!("js/interfaces_bootstrap.js"),
-            "\n",
-            include_str!("js/shared_apis_bootstrap.js"),
-            "\n",
-            include_str!("js/instances_bootstrap.js"),
-            "\n",
-            include_str!("js/fetch_bootstrap.js"),
-            "\n",
-            include_str!("js/timer_bootstrap.js"),
-            "\n",
-            include_str!("js/dom_bootstrap.js"),
-            "\n",
-            include_str!("js/event_bootstrap.js"),
-            "\n",
-            include_str!("js/canvas_bootstrap.js"),
-            "\n",
-            include_str!("js/window_bootstrap.js"),
-            "\n",
-            include_str!("js/streams_bootstrap.js"),
-            "\n",
-            include_str!("js/structured_clone.js"),
-            // Must precede cleanup_bootstrap: it captures `Deno.core.ops` for the
-            // humanized-input init script, which itself runs after Deno is gone.
-            include_str!("js/input_bootstrap.js"),
-        );
+        const BOOTSTRAP_JS: &str = window_bootstrap_js!();
 
         runtime
             .execute_script("<anonymous>", BOOTSTRAP_JS)
@@ -570,6 +589,10 @@ pub fn create_worker_runtime(
         .execute_script("<anonymous>", include_str!("js/event_bootstrap.js"))
         .expect("worker: event bootstrap failed");
 
+    runtime
+        .execute_script("<anonymous>", include_str!("js/services_bootstrap.js"))
+        .expect("worker: services bootstrap failed");
+
     // structuredClone is useful inside workers too — worker code that
     // uses `postMessage` with complex values relies on it, and the
     // impl is self-contained (it gracefully handles the absence of
@@ -590,10 +613,21 @@ pub fn create_worker_runtime(
         .execute_script("<anonymous>", include_str!("js/canvas_bootstrap.js"))
         .expect("worker: canvas bootstrap failed");
 
+    runtime
+        .execute_script("<anonymous>", include_str!("js/parity_bootstrap.js"))
+        .expect("worker: parity bootstrap failed");
+
     // Final cleanup in worker
     runtime
         .execute_script("<anonymous>", include_str!("js/cleanup_bootstrap.js"))
         .expect("worker: cleanup bootstrap failed");
+
+    // Second pass: the worker's global layout is built by cleanup, so the
+    // interfaces it creates (FileReaderSync, FileSystemSyncAccessHandle, …)
+    // only exist now. Members already filled in above are left alone.
+    runtime
+        .execute_script("<anonymous>", include_str!("js/parity_bootstrap.js"))
+        .expect("worker: parity bootstrap (post-cleanup) failed");
 
     runtime
 }

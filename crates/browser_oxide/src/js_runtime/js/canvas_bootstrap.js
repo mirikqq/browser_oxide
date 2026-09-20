@@ -1,4 +1,19 @@
 ((globalThis) => {
+    const _boNs = (() => {
+        try {
+            const syms = Object.getOwnPropertySymbols(globalThis, 1);
+            for (let i = 0; i < syms.length; i++) {
+                const v = globalThis[syms[i]];
+                if (v && v.__bo) return v;
+            }
+        } catch (_e) {}
+        return null;
+    })();
+    const _idl = (_boNs && _boNs.idl) || {
+        own: (obj) => obj,
+        read: () => undefined,
+        fields: () => {},
+    };
     // data: URL base64 payload → Uint8Array. `toBlob` used to wrap the whole
     // `"data:image/png;base64,...."` *string* in a `Blob`, which text-encodes
     // it — so the resulting Blob's bytes were the literal ASCII of the data
@@ -53,9 +68,9 @@
             "times new roman","trebuchet ms","verdana",
         ]),
         "macOS": new Set([
-            "arial","arial black","courier new","georgia","helvetica",
-            "helvetica neue","lucida grande","menlo","monaco","sf pro",
-            "times new roman","trebuchet ms","verdana",
+            "arial","arial black","comic sans ms","courier new","georgia",
+            "helvetica","helvetica neue","impact","lucida grande","menlo",
+            "monaco","times new roman","trebuchet ms","verdana",
         ]),
         "Linux": new Set([
             "arial","courier new","dejavu sans","dejavu sans mono","dejavu serif",
@@ -97,15 +112,6 @@
         const first = familyList.split(",")[0] || "";
         return first.replace(/["']/g, "").trim().toLowerCase();
     };
-    // 0.0 .. ~3.5 px deterministic delta. Sub-character-width so layout
-    // stays stable, large enough to clear 1e-3 fingerprint comparisons.
-    const _fontFamilyWidthDelta = (family) => {
-        if (!family) return 0;
-        if (_GENERIC_FAMILIES.has(family)) return 0; // generics are baselines
-        if (!_resolveInstalledFonts().has(family)) return 0; // not installed on this OS
-        const h = _fontProbeFnvHash(family);
-        return (h % 7000) / 2000; // 0.0 .. 3.5 px
-    };
 
     // Parse CSS color to [r, g, b, a]
     function _parseColor(str) {
@@ -125,17 +131,19 @@
 
     class ImageData {
         constructor(data, width, height) {
+            const _st = _idl.own(this);
             if (arguments.length === 2) {
                 // constructor(width, height)
                 height = width;
                 width = data;
                 data = new Uint8ClampedArray(width * height * 4);
             }
-            this.data = data;
-            this.width = width;
-            this.height = height;
+            _st.data = data;
+            _st.width = width;
+            _st.height = height;
         }
     }
+    _idl.fields(ImageData.prototype, ["data", "height", "width"]);
     globalThis.ImageData = ImageData;
     _maskFunction(ImageData, 'ImageData');
 
@@ -200,6 +208,7 @@
 
     let _resetCtxState;
     class CanvasRenderingContext2D {
+        #font;
         #id;
         #s = _defaultState();
         #stack = [];
@@ -221,19 +230,19 @@
 
         // Style
         set fillStyle(v) {
-            if (v && typeof v === "object" && v._type) {
+            if (v && typeof v === "object" && _idl.own(v)._type) {
                 // Gradient object
                 const stops = (v._stops || []).map(s => {
                     const c = _parseColor(s.color);
                     return [s.offset, c[0], c[1], c[2], c[3]];
                 });
                 let coords;
-                if (v._type === "linear") {
+                if (_idl.own(v)._type === "linear") {
                     coords = [v._x0, v._y0, v._x1, v._y1];
                 } else {
                     coords = [v._x0, v._y0, v._r0, v._x1, v._y1, v._r1];
                 }
-                ops.op_canvas_set_fill_gradient(this.#id, v._type, JSON.stringify({ coords, stops }));
+                ops.op_canvas_set_fill_gradient(this.#id, _idl.own(v)._type, JSON.stringify({ coords, stops }));
                 this.#s.fillStyle = v;
             } else {
                 ops.op_canvas_set_fill_style(this.#id, String(v));
@@ -267,7 +276,7 @@
         get globalCompositeOperation() { return this.#s.globalCompositeOperation; }
         set font(v) {
             this.#s.font = String(v);
-            this._font = this.#s.font;
+            this.#font = this.#s.font;
             ops.op_canvas_set_font(this.#id, this.#s.font);
         }
         get font() { return this.#s.font; }
@@ -373,17 +382,17 @@
             // Full 13-field TextMetrics shaped in Rust (T1.2 font stack).
             // actualBoundingBox* come from the real glyph run, not a
             // derived ratio — this is what fingerprint sites probe.
+            // Widths come from the engine's per-family metrics table, which
+            // carries the real Chrome advances for the claimed profile. A
+            // per-family delta used to be added here to keep font-detection
+            // probes from seeing one collapsed width for every family; it did
+            // not scale with font size, which no real font metric does, and it
+            // broke the macOS equalities (Arial/Helvetica, Courier New/Monaco).
             const m = ops.op_canvas_measure_text_full(this.#id, text);
-            // Per-family micro-delta so canvas-based font detection works.
-            // See `_fontFamilyWidthDelta` for rationale.
-            const fam = _primaryFontFamily(this._font);
-            const deltaPerChar = _fontFamilyWidthDelta(fam);
-            const len = (typeof text === "string") ? text.length : 0;
-            const widthDelta = deltaPerChar * Math.max(1, len) * 0.25;
             return {
-                width: m.width + widthDelta,
+                width: m.width,
                 actualBoundingBoxLeft: m.actual_bounding_box_left,
-                actualBoundingBoxRight: m.actual_bounding_box_right + widthDelta,
+                actualBoundingBoxRight: m.actual_bounding_box_right,
                 actualBoundingBoxAscent: m.actual_bounding_box_ascent,
                 actualBoundingBoxDescent: m.actual_bounding_box_descent,
                 fontBoundingBoxAscent: m.font_bounding_box_ascent,
@@ -462,11 +471,13 @@
             // Where the pixels live: a loaded <img> keeps a decoded-image id,
             // a canvas keeps its own surface id.
             let kind = -1, srcId = -1, natW = 0, natH = 0;
-            if (source._decodedImageId !== undefined && source._decodedImageId >= 0) {
-                kind = 0; srcId = source._decodedImageId;
+            const imgId = _boNs && _boNs.decodedImageId ? _boNs.decodedImageId(source) : -1;
+            const bmpId = _boNs && _boNs.bitmapCanvasId ? _boNs.bitmapCanvasId(source) : undefined;
+            if (imgId >= 0) {
+                kind = 0; srcId = imgId;
                 natW = source.naturalWidth || 0; natH = source.naturalHeight || 0;
-            } else if (source._canvasId !== undefined) {
-                kind = 1; srcId = source._canvasId;
+            } else if (_idl.own(source)._canvasId !== undefined || bmpId !== undefined) {
+                kind = 1; srcId = _idl.own(source)._canvasId !== undefined ? _idl.own(source)._canvasId : bmpId;
                 natW = source.width || 0; natH = source.height || 0;
             } else {
                 return;
@@ -511,8 +522,146 @@
         isPointInStroke() { return false; }
     }
 
-    // WebGL — routes through Canvas2D backend for real pixel output.
-    // Some scripts call readPixels() after clearColor()+clear() and expect real data.
+    const _glState = new WeakMap();
+    const _gl = (ctx) => {
+        let st = _glState.get(ctx);
+        if (!st) {
+            st = { canvasId: undefined, width: 300, height: 150, clearColor: [0, 0, 0, 0], isWebGL2: true, canvas: null };
+            _glState.set(ctx, st);
+        }
+        return st;
+    };
+    let _gpuCache = null, _gpuCache1 = null;
+    const _g = () => {
+        if (_gpuCache) return _gpuCache;
+        // Defaults — used when no stealth profile is active. Must match
+        // stealth::gpu::common_params_desktop() so probes that check for
+        // non-zero MAX_TEXTURE_SIZE etc. don't see `null` in headless mode.
+        // Defaults match captured Chrome 147 on macOS arm64
+        // (tests/fixtures/chrome147/captured_macos_arm64.json).
+        let vendor = "WebKit";
+        let renderer = "WebKit WebGL";
+        let version = "WebGL 2.0 (OpenGL ES 3.0 Chromium)";
+        let shadingLang = "WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)";
+        let unmaskedVendor = "Google Inc. (Apple)";
+        let unmaskedRenderer = "ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)";
+        let extensions = [];
+        let params = {
+            0x0D33: 16384,         // MAX_TEXTURE_SIZE
+            0x851C: 16384,         // MAX_CUBE_MAP_TEXTURE_SIZE
+            0x84E8: 16384,         // MAX_RENDERBUFFER_SIZE
+            0x8073: 2048,          // MAX_3D_TEXTURE_SIZE
+            0x8869: 16,            // MAX_VERTEX_ATTRIBS
+            0x8DFB: 1024,          // MAX_VERTEX_UNIFORM_VECTORS
+            0x8DFD: 15,            // MAX_VARYING_VECTORS
+            0x8DFC: 1024,          // MAX_FRAGMENT_UNIFORM_VECTORS
+            0x8872: 16,            // MAX_TEXTURE_IMAGE_UNITS
+            0x8B4D: 16,            // MAX_VERTEX_TEXTURE_IMAGE_UNITS
+            0x8B4C: 32,            // MAX_COMBINED_TEXTURE_IMAGE_UNITS
+            // ALIASED_POINT_SIZE_RANGE — captured Chrome 147 macOS: [1, 511] typical
+            0x846D: [1.0, 511.0],
+            0x846E: [1.0, 1.0],    // ALIASED_LINE_WIDTH_RANGE — Chrome ANGLE on every OS = [1,1]
+            0x0D3A: [16384, 16384],// MAX_VIEWPORT_DIMS — captured Chrome 147 macOS
+            0x0D56: 8,             // DEPTH_BITS
+            0x0D57: 8,             // STENCIL_BITS
+            0x80AA: 2,             // SAMPLE_BUFFERS
+            0x80A9: 4,             // SAMPLES
+        };
+        let shaderPrec = {};
+        try {
+            if (ops.op_has_stealth_profile()) {
+                const s = (k) => ops.op_get_profile_value(k);
+                unmaskedVendor = s("webgl_unmasked_vendor") || unmaskedVendor;
+                unmaskedRenderer = s("webgl_unmasked_renderer") || unmaskedRenderer;
+                version = s("webgl_version") || version;
+                shadingLang = s("webgl_shading_language_version") || shadingLang;
+                const extsJson = s("webgl_extensions");
+                if (extsJson) {
+                    try { extensions = JSON.parse(extsJson); } catch {}
+                }
+                const paramsJson = s("webgl_params");
+                if (paramsJson) {
+                    try {
+                        const arr = JSON.parse(paramsJson);
+                        // Array of [glenum, value] pairs → keyed object
+                        for (const [k, v] of arr) params[k] = v;
+                    } catch {}
+                }
+                const spJson = s("webgl_shader_precision");
+                if (spJson) {
+                    try {
+                        // Array of [shader_type, precision_type, [min, max, precision]]
+                        const arr = JSON.parse(spJson);
+                        for (const [st, pt, v] of arr) {
+                            shaderPrec[`${st}:${pt}`] = { rangeMin: v[0], rangeMax: v[1], precision: v[2] };
+                        }
+                    } catch {}
+                }
+            }
+        } catch {}
+        // Firefox WebGL coherence: Gecko reports "Mozilla" for VENDOR /
+        // RENDERER and the UNMASKED_*_WEBGL strings, and a VERSION without
+        // the "(OpenGL ES … Chromium)" suffix. Chrome's GL identity
+        // ("WebKit" / "Google Inc." / "ANGLE (…)") under a Firefox UA is a
+        // 100% tell, so override the whole GL identity for the FF profile.
+        try {
+            if (ops.op_has_stealth_profile() &&
+                /Firefox\//.test(ops.op_get_profile_value("user_agent") || "")) {
+                vendor = "Mozilla";
+                renderer = "Mozilla";
+                unmaskedVendor = "Mozilla";
+                unmaskedRenderer = "Mozilla";
+                version = "WebGL 2.0";
+                shadingLang = "WebGL GLSL ES 3.00";
+            }
+        } catch {}
+        _gpuCache = {
+            vendor, renderer, version, shadingLang,
+            unmaskedVendor, unmaskedRenderer,
+            extensions, params, shaderPrec,
+        };
+        return _gpuCache;
+    };
+    const _g1 = () => {
+        if (_gpuCache1) return _gpuCache1;
+        const base = _g();
+        // Start from the base surface, then downgrade the version strings to
+        // WebGL 1 whenever base describes a WebGL 2 surface (the apple_m3
+        // default + the no-profile fallback). Legacy profiles whose shared
+        // field already holds WebGL 1 data (e.g. nvidia) or masked Firefox
+        // keep their base strings. Extensions: an empty list defers to
+        // getSupportedExtensions()'s own WebGL-1 fallback.
+        let version = base.version;
+        let shadingLang = base.shadingLang;
+        let extensions = base.extensions;
+        const _ffWebGL = (function () {
+            try { return ops.op_has_stealth_profile() && /Firefox\//.test(ops.op_get_profile_value("user_agent") || ""); }
+            catch { return false; }
+        })();
+        if (/^WebGL 2/.test(version)) {
+            // Firefox WebGL 1 reports "WebGL 1.0" with no "(OpenGL ES … Chromium)" suffix.
+            version = _ffWebGL ? "WebGL 1.0" : "WebGL 1.0 (OpenGL ES 2.0 Chromium)";
+            shadingLang = _ffWebGL ? "WebGL GLSL ES 1.0" : "WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)";
+        }
+        try {
+            if (ops.op_has_stealth_profile()) {
+                const v = ops.op_get_profile_value("webgl1_version");
+                const sl = ops.op_get_profile_value("webgl1_shading_language_version");
+                const extJson = ops.op_get_profile_value("webgl1_extensions");
+                if (v) version = v;
+                if (sl) shadingLang = sl;
+                if (extJson) {
+                    try { const e = JSON.parse(extJson); if (e && e.length) extensions = e; } catch {}
+                }
+            }
+        } catch {}
+        _gpuCache1 = { ...base, version, shadingLang, extensions };
+        return _gpuCache1;
+    };
+    const _surfaceFor = (ctx) => {
+        const st = ctx ? _glState.get(ctx) : null;
+        return (st && st.isWebGL2 === false) ? _g1() : _g();
+    };
     class WebGLRenderingContext {
         // WebGL constants
         static COLOR_BUFFER_BIT = 0x4000;
@@ -565,43 +714,40 @@
         static HIGH_INT = 0x8DF5;
 
         constructor(canvasId, width, height) {
-            this._canvasId = canvasId;
-            this._width = width || 300;
-            this._height = height || 150;
-            this._clearColor = [0, 0, 0, 0];
-            this.canvas = null;
-            this.drawingBufferWidth = this._width;
-            this.drawingBufferHeight = this._height;
-            // Copy constants to instance
-            for (const k of Object.getOwnPropertyNames(WebGLRenderingContext)) {
-                if (typeof WebGLRenderingContext[k] === 'number') this[k] = WebGLRenderingContext[k];
-            }
+            _glState.set(this, {
+                canvasId,
+                width: width || 300,
+                height: height || 150,
+                clearColor: [0, 0, 0, 0],
+                isWebGL2: true,
+                canvas: null,
+            });
         }
 
         // --- Real operations via Canvas2D backend ---
         clearColor(r, g, b, a) {
-            this._clearColor = [Math.round(r*255), Math.round(g*255), Math.round(b*255), a];
+            _gl(this).clearColor = [Math.round(r*255), Math.round(g*255), Math.round(b*255), a];
         }
         clear(mask) {
-            if (mask & 0x4000 && this._canvasId !== undefined) { // COLOR_BUFFER_BIT
-                const [r, g, b, a] = this._clearColor;
+            if (mask & 0x4000 && _gl(this).canvasId !== undefined) { // COLOR_BUFFER_BIT
+                const [r, g, b, a] = _gl(this).clearColor;
                 const color = `rgba(${r},${g},${b},${a})`;
-                ops.op_canvas_set_fill_style(this._canvasId, color);
-                ops.op_canvas_fill_rect(this._canvasId, 0, 0, this._width, this._height);
+                ops.op_canvas_set_fill_style(_gl(this).canvasId, color);
+                ops.op_canvas_fill_rect(_gl(this).canvasId, 0, 0, _gl(this).width, _gl(this).height);
             }
         }
         readPixels(x, y, w, h, format, type, pixels) {
-            if (this._canvasId === undefined || !pixels) return;
+            if (_gl(this).canvasId === undefined || !pixels) return;
             // Canvas2D stores pixels top-down, WebGL is bottom-up — flip Y
-            const flippedY = this._height - y - h;
-            const data = ops.op_canvas_get_image_data(this._canvasId, x, Math.max(0, flippedY), w, h);
+            const flippedY = _gl(this).height - y - h;
+            const data = ops.op_canvas_get_image_data(_gl(this).canvasId, x, Math.max(0, flippedY), w, h);
             for (let i = 0; i < data.length && i < pixels.length; i++) {
                 pixels[i] = data[i];
             }
         }
         viewport(x, y, w, h) {
-            this._width = w || this._width;
-            this._height = h || this._height;
+            _gl(this).width = w || _gl(this).width;
+            _gl(this).height = h || _gl(this).height;
         }
 
         // --- Parameter queries (fingerprint-relevant values) ---
@@ -615,96 +761,6 @@
         // `getParameter.call(somethingElse)` threw
         // `TypeError: this._g is not a function`, which some scripts
         // detect. Real Chrome's native methods don't have that dependency.
-        static _g() {
-            if (WebGLRenderingContext._gpuCache) return WebGLRenderingContext._gpuCache;
-            // Defaults — used when no stealth profile is active. Must match
-            // stealth::gpu::common_params_desktop() so probes that check for
-            // non-zero MAX_TEXTURE_SIZE etc. don't see `null` in headless mode.
-            // Defaults match captured Chrome 147 on macOS arm64
-            // (tests/fixtures/chrome147/captured_macos_arm64.json).
-            let vendor = "WebKit";
-            let renderer = "WebKit WebGL";
-            let version = "WebGL 2.0 (OpenGL ES 3.0 Chromium)";
-            let shadingLang = "WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)";
-            let unmaskedVendor = "Google Inc. (Apple)";
-            let unmaskedRenderer = "ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)";
-            let extensions = [];
-            let params = {
-                0x0D33: 16384,         // MAX_TEXTURE_SIZE
-                0x851C: 16384,         // MAX_CUBE_MAP_TEXTURE_SIZE
-                0x84E8: 16384,         // MAX_RENDERBUFFER_SIZE
-                0x8073: 2048,          // MAX_3D_TEXTURE_SIZE
-                0x8869: 16,            // MAX_VERTEX_ATTRIBS
-                0x8DFB: 1024,          // MAX_VERTEX_UNIFORM_VECTORS
-                0x8DFD: 15,            // MAX_VARYING_VECTORS
-                0x8DFC: 1024,          // MAX_FRAGMENT_UNIFORM_VECTORS
-                0x8872: 16,            // MAX_TEXTURE_IMAGE_UNITS
-                0x8B4D: 16,            // MAX_VERTEX_TEXTURE_IMAGE_UNITS
-                0x8B4C: 32,            // MAX_COMBINED_TEXTURE_IMAGE_UNITS
-                // ALIASED_POINT_SIZE_RANGE — captured Chrome 147 macOS: [1, 511] typical
-                0x846D: [1.0, 511.0],
-                0x846E: [1.0, 1.0],    // ALIASED_LINE_WIDTH_RANGE — Chrome ANGLE on every OS = [1,1]
-                0x0D3A: [16384, 16384],// MAX_VIEWPORT_DIMS — captured Chrome 147 macOS
-                0x0D56: 8,             // DEPTH_BITS
-                0x0D57: 8,             // STENCIL_BITS
-                0x80AA: 2,             // SAMPLE_BUFFERS
-                0x80A9: 4,             // SAMPLES
-            };
-            let shaderPrec = {};
-            try {
-                if (ops.op_has_stealth_profile()) {
-                    const s = (k) => ops.op_get_profile_value(k);
-                    unmaskedVendor = s("webgl_unmasked_vendor") || unmaskedVendor;
-                    unmaskedRenderer = s("webgl_unmasked_renderer") || unmaskedRenderer;
-                    version = s("webgl_version") || version;
-                    shadingLang = s("webgl_shading_language_version") || shadingLang;
-                    const extsJson = s("webgl_extensions");
-                    if (extsJson) {
-                        try { extensions = JSON.parse(extsJson); } catch {}
-                    }
-                    const paramsJson = s("webgl_params");
-                    if (paramsJson) {
-                        try {
-                            const arr = JSON.parse(paramsJson);
-                            // Array of [glenum, value] pairs → keyed object
-                            for (const [k, v] of arr) params[k] = v;
-                        } catch {}
-                    }
-                    const spJson = s("webgl_shader_precision");
-                    if (spJson) {
-                        try {
-                            // Array of [shader_type, precision_type, [min, max, precision]]
-                            const arr = JSON.parse(spJson);
-                            for (const [st, pt, v] of arr) {
-                                shaderPrec[`${st}:${pt}`] = { rangeMin: v[0], rangeMax: v[1], precision: v[2] };
-                            }
-                        } catch {}
-                    }
-                }
-            } catch {}
-            // Firefox WebGL coherence: Gecko reports "Mozilla" for VENDOR /
-            // RENDERER and the UNMASKED_*_WEBGL strings, and a VERSION without
-            // the "(OpenGL ES … Chromium)" suffix. Chrome's GL identity
-            // ("WebKit" / "Google Inc." / "ANGLE (…)") under a Firefox UA is a
-            // 100% tell, so override the whole GL identity for the FF profile.
-            try {
-                if (ops.op_has_stealth_profile() &&
-                    /Firefox\//.test(ops.op_get_profile_value("user_agent") || "")) {
-                    vendor = "Mozilla";
-                    renderer = "Mozilla";
-                    unmaskedVendor = "Mozilla";
-                    unmaskedRenderer = "Mozilla";
-                    version = "WebGL 2.0";
-                    shadingLang = "WebGL GLSL ES 3.00";
-                }
-            } catch {}
-            WebGLRenderingContext._gpuCache = {
-                vendor, renderer, version, shadingLang,
-                unmaskedVendor, unmaskedRenderer,
-                extensions, params, shaderPrec,
-            };
-            return WebGLRenderingContext._gpuCache;
-        }
         // FIX-D2: the WebGL **1.0** surface. `_g()` above is the WebGL **2.0**
         // surface; a `getContext("webgl")` context must NOT report the WebGL 2
         // version string or expose WebGL-2-only extensions (e.g.
@@ -712,53 +768,12 @@
         // real Chrome. Derived from the active
         // profile's `webgl1_*` values; falls back to `_g()` when the profile has
         // no distinct WebGL 1 surface (legacy profiles) → no behaviour change.
-        static _g1() {
-            if (WebGLRenderingContext._gpuCache1) return WebGLRenderingContext._gpuCache1;
-            const base = WebGLRenderingContext._g();
-            // Start from the base surface, then downgrade the version strings to
-            // WebGL 1 whenever base describes a WebGL 2 surface (the apple_m3
-            // default + the no-profile fallback). Legacy profiles whose shared
-            // field already holds WebGL 1 data (e.g. nvidia) or masked Firefox
-            // keep their base strings. Extensions: an empty list defers to
-            // getSupportedExtensions()'s own WebGL-1 fallback.
-            let version = base.version;
-            let shadingLang = base.shadingLang;
-            let extensions = base.extensions;
-            const _ffWebGL = (function () {
-                try { return ops.op_has_stealth_profile() && /Firefox\//.test(ops.op_get_profile_value("user_agent") || ""); }
-                catch { return false; }
-            })();
-            if (/^WebGL 2/.test(version)) {
-                // Firefox WebGL 1 reports "WebGL 1.0" with no "(OpenGL ES … Chromium)" suffix.
-                version = _ffWebGL ? "WebGL 1.0" : "WebGL 1.0 (OpenGL ES 2.0 Chromium)";
-                shadingLang = _ffWebGL ? "WebGL GLSL ES 1.0" : "WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)";
-            }
-            try {
-                if (ops.op_has_stealth_profile()) {
-                    const v = ops.op_get_profile_value("webgl1_version");
-                    const sl = ops.op_get_profile_value("webgl1_shading_language_version");
-                    const extJson = ops.op_get_profile_value("webgl1_extensions");
-                    if (v) version = v;
-                    if (sl) shadingLang = sl;
-                    if (extJson) {
-                        try { const e = JSON.parse(extJson); if (e && e.length) extensions = e; } catch {}
-                    }
-                }
-            } catch {}
-            WebGLRenderingContext._gpuCache1 = { ...base, version, shadingLang, extensions };
-            return WebGLRenderingContext._gpuCache1;
-        }
         // Per-instance surface selector. `_isWebGL2 === false` only for a
         // context handed back by `getContext("webgl"/"experimental-webgl")`.
         // Anything else (incl. `getParameter.call(notACtx)`) → WebGL 2 surface,
         // preserving the pre-FIX-D2 default.
-        static _surfaceFor(ctx) {
-            return (ctx && ctx._isWebGL2 === false)
-                ? WebGLRenderingContext._g1()
-                : WebGLRenderingContext._g();
-        }
         getParameter(pname) {
-            const gpu = WebGLRenderingContext._surfaceFor(this);
+            const gpu = _surfaceFor(this);
             // String-valued parameters
             if (pname === 0x1F00) return gpu.vendor;                // VENDOR
             if (pname === 0x1F01) return gpu.renderer;              // RENDERER
@@ -767,26 +782,27 @@
             if (pname === 0x9245) return gpu.unmaskedVendor;        // UNMASKED_VENDOR_WEBGL
             if (pname === 0x9246) return gpu.unmaskedRenderer;      // UNMASKED_RENDERER_WEBGL
             // Runtime-dependent values (not from the catalog)
-            if (pname === 0x0BA2) return [0, 0, this._width, this._height]; // VIEWPORT
+            if (pname === 0x0BA2) return [0, 0, _gl(this).width, _gl(this).height]; // VIEWPORT
             // Catalog-sourced numeric/array parameters
             if (gpu.params[pname] !== undefined) return gpu.params[pname];
             return null;
         }
         getSupportedExtensions() {
-            const gpu = WebGLRenderingContext._surfaceFor(this);
+            const gpu = _surfaceFor(this);
             // Fallback if the catalog is empty (no profile active).
             // Captured from real Chrome 147 on macOS arm64. WebGL 1 contexts get
             // the WebGL-1 list (extensions promoted to core in WebGL 2 reappear;
             // WebGL-2-only ones absent); WebGL 2 contexts get the 36-ext list.
             if (!gpu.extensions.length) {
-                if (this && this._isWebGL2 === false) {
+                if (this && _glState.get(this) && _glState.get(this).isWebGL2 === false) {
                     return [
                         "ANGLE_instanced_arrays","EXT_blend_minmax","EXT_clip_control",
                         "EXT_color_buffer_half_float","EXT_depth_clamp","EXT_disjoint_timer_query",
-                        "EXT_float_blend","EXT_frag_depth","EXT_polygon_offset_clamp","EXT_sRGB",
+                        "EXT_float_blend","EXT_frag_depth","EXT_polygon_offset_clamp",
                         "EXT_shader_texture_lod","EXT_texture_compression_bptc",
                         "EXT_texture_compression_rgtc","EXT_texture_filter_anisotropic",
-                        "EXT_texture_mirror_clamp_to_edge","KHR_parallel_shader_compile",
+                        "EXT_texture_mirror_clamp_to_edge","EXT_sRGB",
+                        "KHR_parallel_shader_compile",
                         "OES_element_index_uint","OES_fbo_render_mipmap","OES_standard_derivatives",
                         "OES_texture_float","OES_texture_float_linear","OES_texture_half_float",
                         "OES_texture_half_float_linear","OES_vertex_array_object",
@@ -849,7 +865,7 @@
         }
         isContextLost() { return false; }
         getShaderPrecisionFormat(shaderType, precisionType) {
-            const gpu = WebGLRenderingContext._g();
+            const gpu = _g();
             const key = `${shaderType}:${precisionType}`;
             if (gpu.shaderPrec[key]) return gpu.shaderPrec[key];
             // Fallback for unknown combinations — float-style values (our old behavior)
@@ -928,7 +944,121 @@
     // carry `_isWebGL2 = true` (set in getContext) so the surface selector
     // returns the WebGL 2 surface. Static `_g/_g1/_surfaceFor/_gpuCache*` are
     // inherited and resolve to the same shared caches.
-    class WebGL2RenderingContext extends WebGLRenderingContext {}
+    class WebGL2RenderingContext {
+        constructor(canvasId, width, height) {
+            _glState.set(this, {
+                canvasId,
+                width: width || 300,
+                height: height || 150,
+                clearColor: [0, 0, 0, 0],
+                isWebGL2: true,
+                canvas: null,
+            });
+        }
+    }
+
+
+    {
+        const GL_TABLES = { __proto__: null, WebGLRenderingContext: 'canvas;drawingBufferWidth;drawingBufferHeight;drawingBufferColorSpace=;unpackColorSpace=;DEPTH_BUFFER_BIT:256;STENCIL_BUFFER_BIT:1024;COLOR_BUFFER_BIT:16384;POINTS:0;LINES:1;LINE_LOOP:2;LINE_STRIP:3;TRIANGLES:4;TRIANGLE_STRIP:5;TRIANGLE_FAN:6;ZERO:0;ONE:1;SRC_COLOR:768;ONE_MINUS_SRC_COLOR:769;SRC_ALPHA:770;ONE_MINUS_SRC_ALPHA:771;DST_ALPHA:772;ONE_MINUS_DST_ALPHA:773;DST_COLOR:774;ONE_MINUS_DST_COLOR:775;SRC_ALPHA_SATURATE:776;FUNC_ADD:32774;BLEND_EQUATION:32777;BLEND_EQUATION_RGB:32777;BLEND_EQUATION_ALPHA:34877;FUNC_SUBTRACT:32778;FUNC_REVERSE_SUBTRACT:32779;BLEND_DST_RGB:32968;BLEND_SRC_RGB:32969;BLEND_DST_ALPHA:32970;BLEND_SRC_ALPHA:32971;CONSTANT_COLOR:32769;ONE_MINUS_CONSTANT_COLOR:32770;CONSTANT_ALPHA:32771;ONE_MINUS_CONSTANT_ALPHA:32772;BLEND_COLOR:32773;ARRAY_BUFFER:34962;ELEMENT_ARRAY_BUFFER:34963;ARRAY_BUFFER_BINDING:34964;ELEMENT_ARRAY_BUFFER_BINDING:34965;STREAM_DRAW:35040;STATIC_DRAW:35044;DYNAMIC_DRAW:35048;BUFFER_SIZE:34660;BUFFER_USAGE:34661;CURRENT_VERTEX_ATTRIB:34342;FRONT:1028;BACK:1029;FRONT_AND_BACK:1032;TEXTURE_2D:3553;CULL_FACE:2884;BLEND:3042;DITHER:3024;STENCIL_TEST:2960;DEPTH_TEST:2929;SCISSOR_TEST:3089;POLYGON_OFFSET_FILL:32823;SAMPLE_ALPHA_TO_COVERAGE:32926;SAMPLE_COVERAGE:32928;NO_ERROR:0;INVALID_ENUM:1280;INVALID_VALUE:1281;INVALID_OPERATION:1282;OUT_OF_MEMORY:1285;CW:2304;CCW:2305;LINE_WIDTH:2849;ALIASED_POINT_SIZE_RANGE:33901;ALIASED_LINE_WIDTH_RANGE:33902;CULL_FACE_MODE:2885;FRONT_FACE:2886;DEPTH_RANGE:2928;DEPTH_WRITEMASK:2930;DEPTH_CLEAR_VALUE:2931;DEPTH_FUNC:2932;STENCIL_CLEAR_VALUE:2961;STENCIL_FUNC:2962;STENCIL_FAIL:2964;STENCIL_PASS_DEPTH_FAIL:2965;STENCIL_PASS_DEPTH_PASS:2966;STENCIL_REF:2967;STENCIL_VALUE_MASK:2963;STENCIL_WRITEMASK:2968;STENCIL_BACK_FUNC:34816;STENCIL_BACK_FAIL:34817;STENCIL_BACK_PASS_DEPTH_FAIL:34818;STENCIL_BACK_PASS_DEPTH_PASS:34819;STENCIL_BACK_REF:36003;STENCIL_BACK_VALUE_MASK:36004;STENCIL_BACK_WRITEMASK:36005;VIEWPORT:2978;SCISSOR_BOX:3088;COLOR_CLEAR_VALUE:3106;COLOR_WRITEMASK:3107;UNPACK_ALIGNMENT:3317;PACK_ALIGNMENT:3333;MAX_TEXTURE_SIZE:3379;MAX_VIEWPORT_DIMS:3386;SUBPIXEL_BITS:3408;RED_BITS:3410;GREEN_BITS:3411;BLUE_BITS:3412;ALPHA_BITS:3413;DEPTH_BITS:3414;STENCIL_BITS:3415;POLYGON_OFFSET_UNITS:10752;POLYGON_OFFSET_FACTOR:32824;TEXTURE_BINDING_2D:32873;SAMPLE_BUFFERS:32936;SAMPLES:32937;SAMPLE_COVERAGE_VALUE:32938;SAMPLE_COVERAGE_INVERT:32939;COMPRESSED_TEXTURE_FORMATS:34467;DONT_CARE:4352;FASTEST:4353;NICEST:4354;GENERATE_MIPMAP_HINT:33170;BYTE:5120;UNSIGNED_BYTE:5121;SHORT:5122;UNSIGNED_SHORT:5123;INT:5124;UNSIGNED_INT:5125;FLOAT:5126;DEPTH_COMPONENT:6402;ALPHA:6406;RGB:6407;RGBA:6408;LUMINANCE:6409;LUMINANCE_ALPHA:6410;UNSIGNED_SHORT_4_4_4_4:32819;UNSIGNED_SHORT_5_5_5_1:32820;UNSIGNED_SHORT_5_6_5:33635;FRAGMENT_SHADER:35632;VERTEX_SHADER:35633;MAX_VERTEX_ATTRIBS:34921;MAX_VERTEX_UNIFORM_VECTORS:36347;MAX_VARYING_VECTORS:36348;MAX_COMBINED_TEXTURE_IMAGE_UNITS:35661;MAX_VERTEX_TEXTURE_IMAGE_UNITS:35660;MAX_TEXTURE_IMAGE_UNITS:34930;MAX_FRAGMENT_UNIFORM_VECTORS:36349;SHADER_TYPE:35663;DELETE_STATUS:35712;LINK_STATUS:35714;VALIDATE_STATUS:35715;ATTACHED_SHADERS:35717;ACTIVE_UNIFORMS:35718;ACTIVE_ATTRIBUTES:35721;SHADING_LANGUAGE_VERSION:35724;CURRENT_PROGRAM:35725;NEVER:512;LESS:513;EQUAL:514;LEQUAL:515;GREATER:516;NOTEQUAL:517;GEQUAL:518;ALWAYS:519;KEEP:7680;REPLACE:7681;INCR:7682;DECR:7683;INVERT:5386;INCR_WRAP:34055;DECR_WRAP:34056;VENDOR:7936;RENDERER:7937;VERSION:7938;NEAREST:9728;LINEAR:9729;NEAREST_MIPMAP_NEAREST:9984;LINEAR_MIPMAP_NEAREST:9985;NEAREST_MIPMAP_LINEAR:9986;LINEAR_MIPMAP_LINEAR:9987;TEXTURE_MAG_FILTER:10240;TEXTURE_MIN_FILTER:10241;TEXTURE_WRAP_S:10242;TEXTURE_WRAP_T:10243;TEXTURE:5890;TEXTURE_CUBE_MAP:34067;TEXTURE_BINDING_CUBE_MAP:34068;TEXTURE_CUBE_MAP_POSITIVE_X:34069;TEXTURE_CUBE_MAP_NEGATIVE_X:34070;TEXTURE_CUBE_MAP_POSITIVE_Y:34071;TEXTURE_CUBE_MAP_NEGATIVE_Y:34072;TEXTURE_CUBE_MAP_POSITIVE_Z:34073;TEXTURE_CUBE_MAP_NEGATIVE_Z:34074;MAX_CUBE_MAP_TEXTURE_SIZE:34076;TEXTURE0:33984;TEXTURE1:33985;TEXTURE2:33986;TEXTURE3:33987;TEXTURE4:33988;TEXTURE5:33989;TEXTURE6:33990;TEXTURE7:33991;TEXTURE8:33992;TEXTURE9:33993;TEXTURE10:33994;TEXTURE11:33995;TEXTURE12:33996;TEXTURE13:33997;TEXTURE14:33998;TEXTURE15:33999;TEXTURE16:34000;TEXTURE17:34001;TEXTURE18:34002;TEXTURE19:34003;TEXTURE20:34004;TEXTURE21:34005;TEXTURE22:34006;TEXTURE23:34007;TEXTURE24:34008;TEXTURE25:34009;TEXTURE26:34010;TEXTURE27:34011;TEXTURE28:34012;TEXTURE29:34013;TEXTURE30:34014;TEXTURE31:34015;ACTIVE_TEXTURE:34016;REPEAT:10497;CLAMP_TO_EDGE:33071;MIRRORED_REPEAT:33648;FLOAT_VEC2:35664;FLOAT_VEC3:35665;FLOAT_VEC4:35666;INT_VEC2:35667;INT_VEC3:35668;INT_VEC4:35669;BOOL:35670;BOOL_VEC2:35671;BOOL_VEC3:35672;BOOL_VEC4:35673;FLOAT_MAT2:35674;FLOAT_MAT3:35675;FLOAT_MAT4:35676;SAMPLER_2D:35678;SAMPLER_CUBE:35680;VERTEX_ATTRIB_ARRAY_ENABLED:34338;VERTEX_ATTRIB_ARRAY_SIZE:34339;VERTEX_ATTRIB_ARRAY_STRIDE:34340;VERTEX_ATTRIB_ARRAY_TYPE:34341;VERTEX_ATTRIB_ARRAY_NORMALIZED:34922;VERTEX_ATTRIB_ARRAY_POINTER:34373;VERTEX_ATTRIB_ARRAY_BUFFER_BINDING:34975;IMPLEMENTATION_COLOR_READ_TYPE:35738;IMPLEMENTATION_COLOR_READ_FORMAT:35739;COMPILE_STATUS:35713;LOW_FLOAT:36336;MEDIUM_FLOAT:36337;HIGH_FLOAT:36338;LOW_INT:36339;MEDIUM_INT:36340;HIGH_INT:36341;FRAMEBUFFER:36160;RENDERBUFFER:36161;RGBA4:32854;RGB5_A1:32855;RGB565:36194;DEPTH_COMPONENT16:33189;STENCIL_INDEX8:36168;DEPTH_STENCIL:34041;RENDERBUFFER_WIDTH:36162;RENDERBUFFER_HEIGHT:36163;RENDERBUFFER_INTERNAL_FORMAT:36164;RENDERBUFFER_RED_SIZE:36176;RENDERBUFFER_GREEN_SIZE:36177;RENDERBUFFER_BLUE_SIZE:36178;RENDERBUFFER_ALPHA_SIZE:36179;RENDERBUFFER_DEPTH_SIZE:36180;RENDERBUFFER_STENCIL_SIZE:36181;FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE:36048;FRAMEBUFFER_ATTACHMENT_OBJECT_NAME:36049;FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL:36050;FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE:36051;COLOR_ATTACHMENT0:36064;DEPTH_ATTACHMENT:36096;STENCIL_ATTACHMENT:36128;DEPTH_STENCIL_ATTACHMENT:33306;NONE:0;FRAMEBUFFER_COMPLETE:36053;FRAMEBUFFER_INCOMPLETE_ATTACHMENT:36054;FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT:36055;FRAMEBUFFER_INCOMPLETE_DIMENSIONS:36057;FRAMEBUFFER_UNSUPPORTED:36061;FRAMEBUFFER_BINDING:36006;RENDERBUFFER_BINDING:36007;MAX_RENDERBUFFER_SIZE:34024;INVALID_FRAMEBUFFER_OPERATION:1286;UNPACK_FLIP_Y_WEBGL:37440;UNPACK_PREMULTIPLY_ALPHA_WEBGL:37441;CONTEXT_LOST_WEBGL:37442;UNPACK_COLORSPACE_CONVERSION_WEBGL:37443;BROWSER_DEFAULT_WEBGL:37444;activeTexture(1);attachShader(2);bindAttribLocation(3);bindRenderbuffer(2);blendColor(4);blendEquation(1);blendEquationSeparate(2);blendFunc(2);blendFuncSeparate(4);bufferData(3);bufferSubData(3);checkFramebufferStatus(1);compileShader(1);compressedTexImage2D(7);compressedTexSubImage2D(8);copyTexImage2D(8);copyTexSubImage2D(8);createBuffer(0);createFramebuffer(0);createProgram(0);createRenderbuffer(0);createShader(1);createTexture(0);cullFace(1);deleteBuffer(1);deleteFramebuffer(1);deleteProgram(1);deleteRenderbuffer(1);deleteShader(1);deleteTexture(1);depthFunc(1);depthMask(1);depthRange(2);detachShader(2);disable(1);enable(1);finish(0);flush(0);framebufferRenderbuffer(4);framebufferTexture2D(5);frontFace(1);generateMipmap(1);getActiveAttrib(2);getActiveUniform(2);getAttachedShaders(1);getAttribLocation(2);getBufferParameter(2);getContextAttributes(0);getError(0);getExtension(1);getFramebufferAttachmentParameter(3);getParameter(1);getProgramInfoLog(1);getProgramParameter(2);getRenderbufferParameter(2);getShaderInfoLog(1);getShaderParameter(2);getShaderPrecisionFormat(2);getShaderSource(1);getSupportedExtensions(0);getTexParameter(2);getUniform(2);getUniformLocation(2);getVertexAttrib(2);getVertexAttribOffset(2);hint(2);isBuffer(1);isContextLost(0);isEnabled(1);isFramebuffer(1);isProgram(1);isRenderbuffer(1);isShader(1);isTexture(1);lineWidth(1);linkProgram(1);pixelStorei(2);polygonOffset(2);readPixels(7);renderbufferStorage(4);sampleCoverage(2);shaderSource(2);stencilFunc(3);stencilFuncSeparate(4);stencilMask(1);stencilMaskSeparate(2);stencilOp(3);stencilOpSeparate(4);texImage2D(6);texParameterf(3);texParameteri(3);texSubImage2D(7);useProgram(1);validateProgram(1);bindBuffer(2);bindFramebuffer(2);bindTexture(2);clear(1);clearColor(4);clearDepth(1);clearStencil(1);colorMask(4);disableVertexAttribArray(1);drawArrays(3);drawElements(4);enableVertexAttribArray(1);scissor(4);uniform1f(2);uniform1fv(2);uniform1i(2);uniform1iv(2);uniform2f(3);uniform2fv(2);uniform2i(3);uniform2iv(2);uniform3f(4);uniform3fv(2);uniform3i(4);uniform3iv(2);uniform4f(5);uniform4fv(2);uniform4i(5);uniform4iv(2);uniformMatrix2fv(3);uniformMatrix3fv(3);uniformMatrix4fv(3);vertexAttrib1f(2);vertexAttrib1fv(2);vertexAttrib2f(3);vertexAttrib2fv(2);vertexAttrib3f(4);vertexAttrib3fv(2);vertexAttrib4f(5);vertexAttrib4fv(2);vertexAttribPointer(6);viewport(4);drawingBufferFormat;RGB8:32849;RGBA8:32856;drawingBufferStorage(3);constructor;makeXRCompatible(0)', WebGL2RenderingContext: 'canvas;drawingBufferWidth;drawingBufferHeight;drawingBufferColorSpace=;unpackColorSpace=;DEPTH_BUFFER_BIT:256;STENCIL_BUFFER_BIT:1024;COLOR_BUFFER_BIT:16384;POINTS:0;LINES:1;LINE_LOOP:2;LINE_STRIP:3;TRIANGLES:4;TRIANGLE_STRIP:5;TRIANGLE_FAN:6;ZERO:0;ONE:1;SRC_COLOR:768;ONE_MINUS_SRC_COLOR:769;SRC_ALPHA:770;ONE_MINUS_SRC_ALPHA:771;DST_ALPHA:772;ONE_MINUS_DST_ALPHA:773;DST_COLOR:774;ONE_MINUS_DST_COLOR:775;SRC_ALPHA_SATURATE:776;FUNC_ADD:32774;BLEND_EQUATION:32777;BLEND_EQUATION_RGB:32777;BLEND_EQUATION_ALPHA:34877;FUNC_SUBTRACT:32778;FUNC_REVERSE_SUBTRACT:32779;BLEND_DST_RGB:32968;BLEND_SRC_RGB:32969;BLEND_DST_ALPHA:32970;BLEND_SRC_ALPHA:32971;CONSTANT_COLOR:32769;ONE_MINUS_CONSTANT_COLOR:32770;CONSTANT_ALPHA:32771;ONE_MINUS_CONSTANT_ALPHA:32772;BLEND_COLOR:32773;ARRAY_BUFFER:34962;ELEMENT_ARRAY_BUFFER:34963;ARRAY_BUFFER_BINDING:34964;ELEMENT_ARRAY_BUFFER_BINDING:34965;STREAM_DRAW:35040;STATIC_DRAW:35044;DYNAMIC_DRAW:35048;BUFFER_SIZE:34660;BUFFER_USAGE:34661;CURRENT_VERTEX_ATTRIB:34342;FRONT:1028;BACK:1029;FRONT_AND_BACK:1032;TEXTURE_2D:3553;CULL_FACE:2884;BLEND:3042;DITHER:3024;STENCIL_TEST:2960;DEPTH_TEST:2929;SCISSOR_TEST:3089;POLYGON_OFFSET_FILL:32823;SAMPLE_ALPHA_TO_COVERAGE:32926;SAMPLE_COVERAGE:32928;NO_ERROR:0;INVALID_ENUM:1280;INVALID_VALUE:1281;INVALID_OPERATION:1282;OUT_OF_MEMORY:1285;CW:2304;CCW:2305;LINE_WIDTH:2849;ALIASED_POINT_SIZE_RANGE:33901;ALIASED_LINE_WIDTH_RANGE:33902;CULL_FACE_MODE:2885;FRONT_FACE:2886;DEPTH_RANGE:2928;DEPTH_WRITEMASK:2930;DEPTH_CLEAR_VALUE:2931;DEPTH_FUNC:2932;STENCIL_CLEAR_VALUE:2961;STENCIL_FUNC:2962;STENCIL_FAIL:2964;STENCIL_PASS_DEPTH_FAIL:2965;STENCIL_PASS_DEPTH_PASS:2966;STENCIL_REF:2967;STENCIL_VALUE_MASK:2963;STENCIL_WRITEMASK:2968;STENCIL_BACK_FUNC:34816;STENCIL_BACK_FAIL:34817;STENCIL_BACK_PASS_DEPTH_FAIL:34818;STENCIL_BACK_PASS_DEPTH_PASS:34819;STENCIL_BACK_REF:36003;STENCIL_BACK_VALUE_MASK:36004;STENCIL_BACK_WRITEMASK:36005;VIEWPORT:2978;SCISSOR_BOX:3088;COLOR_CLEAR_VALUE:3106;COLOR_WRITEMASK:3107;UNPACK_ALIGNMENT:3317;PACK_ALIGNMENT:3333;MAX_TEXTURE_SIZE:3379;MAX_VIEWPORT_DIMS:3386;SUBPIXEL_BITS:3408;RED_BITS:3410;GREEN_BITS:3411;BLUE_BITS:3412;ALPHA_BITS:3413;DEPTH_BITS:3414;STENCIL_BITS:3415;POLYGON_OFFSET_UNITS:10752;POLYGON_OFFSET_FACTOR:32824;TEXTURE_BINDING_2D:32873;SAMPLE_BUFFERS:32936;SAMPLES:32937;SAMPLE_COVERAGE_VALUE:32938;SAMPLE_COVERAGE_INVERT:32939;COMPRESSED_TEXTURE_FORMATS:34467;DONT_CARE:4352;FASTEST:4353;NICEST:4354;GENERATE_MIPMAP_HINT:33170;BYTE:5120;UNSIGNED_BYTE:5121;SHORT:5122;UNSIGNED_SHORT:5123;INT:5124;UNSIGNED_INT:5125;FLOAT:5126;DEPTH_COMPONENT:6402;ALPHA:6406;RGB:6407;RGBA:6408;LUMINANCE:6409;LUMINANCE_ALPHA:6410;UNSIGNED_SHORT_4_4_4_4:32819;UNSIGNED_SHORT_5_5_5_1:32820;UNSIGNED_SHORT_5_6_5:33635;FRAGMENT_SHADER:35632;VERTEX_SHADER:35633;MAX_VERTEX_ATTRIBS:34921;MAX_VERTEX_UNIFORM_VECTORS:36347;MAX_VARYING_VECTORS:36348;MAX_COMBINED_TEXTURE_IMAGE_UNITS:35661;MAX_VERTEX_TEXTURE_IMAGE_UNITS:35660;MAX_TEXTURE_IMAGE_UNITS:34930;MAX_FRAGMENT_UNIFORM_VECTORS:36349;SHADER_TYPE:35663;DELETE_STATUS:35712;LINK_STATUS:35714;VALIDATE_STATUS:35715;ATTACHED_SHADERS:35717;ACTIVE_UNIFORMS:35718;ACTIVE_ATTRIBUTES:35721;SHADING_LANGUAGE_VERSION:35724;CURRENT_PROGRAM:35725;NEVER:512;LESS:513;EQUAL:514;LEQUAL:515;GREATER:516;NOTEQUAL:517;GEQUAL:518;ALWAYS:519;KEEP:7680;REPLACE:7681;INCR:7682;DECR:7683;INVERT:5386;INCR_WRAP:34055;DECR_WRAP:34056;VENDOR:7936;RENDERER:7937;VERSION:7938;NEAREST:9728;LINEAR:9729;NEAREST_MIPMAP_NEAREST:9984;LINEAR_MIPMAP_NEAREST:9985;NEAREST_MIPMAP_LINEAR:9986;LINEAR_MIPMAP_LINEAR:9987;TEXTURE_MAG_FILTER:10240;TEXTURE_MIN_FILTER:10241;TEXTURE_WRAP_S:10242;TEXTURE_WRAP_T:10243;TEXTURE:5890;TEXTURE_CUBE_MAP:34067;TEXTURE_BINDING_CUBE_MAP:34068;TEXTURE_CUBE_MAP_POSITIVE_X:34069;TEXTURE_CUBE_MAP_NEGATIVE_X:34070;TEXTURE_CUBE_MAP_POSITIVE_Y:34071;TEXTURE_CUBE_MAP_NEGATIVE_Y:34072;TEXTURE_CUBE_MAP_POSITIVE_Z:34073;TEXTURE_CUBE_MAP_NEGATIVE_Z:34074;MAX_CUBE_MAP_TEXTURE_SIZE:34076;TEXTURE0:33984;TEXTURE1:33985;TEXTURE2:33986;TEXTURE3:33987;TEXTURE4:33988;TEXTURE5:33989;TEXTURE6:33990;TEXTURE7:33991;TEXTURE8:33992;TEXTURE9:33993;TEXTURE10:33994;TEXTURE11:33995;TEXTURE12:33996;TEXTURE13:33997;TEXTURE14:33998;TEXTURE15:33999;TEXTURE16:34000;TEXTURE17:34001;TEXTURE18:34002;TEXTURE19:34003;TEXTURE20:34004;TEXTURE21:34005;TEXTURE22:34006;TEXTURE23:34007;TEXTURE24:34008;TEXTURE25:34009;TEXTURE26:34010;TEXTURE27:34011;TEXTURE28:34012;TEXTURE29:34013;TEXTURE30:34014;TEXTURE31:34015;ACTIVE_TEXTURE:34016;REPEAT:10497;CLAMP_TO_EDGE:33071;MIRRORED_REPEAT:33648;FLOAT_VEC2:35664;FLOAT_VEC3:35665;FLOAT_VEC4:35666;INT_VEC2:35667;INT_VEC3:35668;INT_VEC4:35669;BOOL:35670;BOOL_VEC2:35671;BOOL_VEC3:35672;BOOL_VEC4:35673;FLOAT_MAT2:35674;FLOAT_MAT3:35675;FLOAT_MAT4:35676;SAMPLER_2D:35678;SAMPLER_CUBE:35680;VERTEX_ATTRIB_ARRAY_ENABLED:34338;VERTEX_ATTRIB_ARRAY_SIZE:34339;VERTEX_ATTRIB_ARRAY_STRIDE:34340;VERTEX_ATTRIB_ARRAY_TYPE:34341;VERTEX_ATTRIB_ARRAY_NORMALIZED:34922;VERTEX_ATTRIB_ARRAY_POINTER:34373;VERTEX_ATTRIB_ARRAY_BUFFER_BINDING:34975;IMPLEMENTATION_COLOR_READ_TYPE:35738;IMPLEMENTATION_COLOR_READ_FORMAT:35739;COMPILE_STATUS:35713;LOW_FLOAT:36336;MEDIUM_FLOAT:36337;HIGH_FLOAT:36338;LOW_INT:36339;MEDIUM_INT:36340;HIGH_INT:36341;FRAMEBUFFER:36160;RENDERBUFFER:36161;RGBA4:32854;RGB5_A1:32855;RGB565:36194;DEPTH_COMPONENT16:33189;STENCIL_INDEX8:36168;DEPTH_STENCIL:34041;RENDERBUFFER_WIDTH:36162;RENDERBUFFER_HEIGHT:36163;RENDERBUFFER_INTERNAL_FORMAT:36164;RENDERBUFFER_RED_SIZE:36176;RENDERBUFFER_GREEN_SIZE:36177;RENDERBUFFER_BLUE_SIZE:36178;RENDERBUFFER_ALPHA_SIZE:36179;RENDERBUFFER_DEPTH_SIZE:36180;RENDERBUFFER_STENCIL_SIZE:36181;FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE:36048;FRAMEBUFFER_ATTACHMENT_OBJECT_NAME:36049;FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL:36050;FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE:36051;COLOR_ATTACHMENT0:36064;DEPTH_ATTACHMENT:36096;STENCIL_ATTACHMENT:36128;DEPTH_STENCIL_ATTACHMENT:33306;NONE:0;FRAMEBUFFER_COMPLETE:36053;FRAMEBUFFER_INCOMPLETE_ATTACHMENT:36054;FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT:36055;FRAMEBUFFER_INCOMPLETE_DIMENSIONS:36057;FRAMEBUFFER_UNSUPPORTED:36061;FRAMEBUFFER_BINDING:36006;RENDERBUFFER_BINDING:36007;MAX_RENDERBUFFER_SIZE:34024;INVALID_FRAMEBUFFER_OPERATION:1286;UNPACK_FLIP_Y_WEBGL:37440;UNPACK_PREMULTIPLY_ALPHA_WEBGL:37441;CONTEXT_LOST_WEBGL:37442;UNPACK_COLORSPACE_CONVERSION_WEBGL:37443;BROWSER_DEFAULT_WEBGL:37444;READ_BUFFER:3074;UNPACK_ROW_LENGTH:3314;UNPACK_SKIP_ROWS:3315;UNPACK_SKIP_PIXELS:3316;PACK_ROW_LENGTH:3330;PACK_SKIP_ROWS:3331;PACK_SKIP_PIXELS:3332;COLOR:6144;DEPTH:6145;STENCIL:6146;RED:6403;RGB8:32849;RGBA8:32856;RGB10_A2:32857;TEXTURE_BINDING_3D:32874;UNPACK_SKIP_IMAGES:32877;UNPACK_IMAGE_HEIGHT:32878;TEXTURE_3D:32879;TEXTURE_WRAP_R:32882;MAX_3D_TEXTURE_SIZE:32883;UNSIGNED_INT_2_10_10_10_REV:33640;MAX_ELEMENTS_VERTICES:33000;MAX_ELEMENTS_INDICES:33001;TEXTURE_MIN_LOD:33082;TEXTURE_MAX_LOD:33083;TEXTURE_BASE_LEVEL:33084;TEXTURE_MAX_LEVEL:33085;MIN:32775;MAX:32776;DEPTH_COMPONENT24:33190;MAX_TEXTURE_LOD_BIAS:34045;TEXTURE_COMPARE_MODE:34892;TEXTURE_COMPARE_FUNC:34893;CURRENT_QUERY:34917;QUERY_RESULT:34918;QUERY_RESULT_AVAILABLE:34919;STREAM_READ:35041;STREAM_COPY:35042;STATIC_READ:35045;STATIC_COPY:35046;DYNAMIC_READ:35049;DYNAMIC_COPY:35050;MAX_DRAW_BUFFERS:34852;DRAW_BUFFER0:34853;DRAW_BUFFER1:34854;DRAW_BUFFER2:34855;DRAW_BUFFER3:34856;DRAW_BUFFER4:34857;DRAW_BUFFER5:34858;DRAW_BUFFER6:34859;DRAW_BUFFER7:34860;DRAW_BUFFER8:34861;DRAW_BUFFER9:34862;DRAW_BUFFER10:34863;DRAW_BUFFER11:34864;DRAW_BUFFER12:34865;DRAW_BUFFER13:34866;DRAW_BUFFER14:34867;DRAW_BUFFER15:34868;MAX_FRAGMENT_UNIFORM_COMPONENTS:35657;MAX_VERTEX_UNIFORM_COMPONENTS:35658;SAMPLER_3D:35679;SAMPLER_2D_SHADOW:35682;FRAGMENT_SHADER_DERIVATIVE_HINT:35723;PIXEL_PACK_BUFFER:35051;PIXEL_UNPACK_BUFFER:35052;PIXEL_PACK_BUFFER_BINDING:35053;PIXEL_UNPACK_BUFFER_BINDING:35055;FLOAT_MAT2x3:35685;FLOAT_MAT2x4:35686;FLOAT_MAT3x2:35687;FLOAT_MAT3x4:35688;FLOAT_MAT4x2:35689;FLOAT_MAT4x3:35690;SRGB:35904;SRGB8:35905;SRGB8_ALPHA8:35907;COMPARE_REF_TO_TEXTURE:34894;RGBA32F:34836;RGB32F:34837;RGBA16F:34842;RGB16F:34843;VERTEX_ATTRIB_ARRAY_INTEGER:35069;MAX_ARRAY_TEXTURE_LAYERS:35071;MIN_PROGRAM_TEXEL_OFFSET:35076;MAX_PROGRAM_TEXEL_OFFSET:35077;MAX_VARYING_COMPONENTS:35659;TEXTURE_2D_ARRAY:35866;TEXTURE_BINDING_2D_ARRAY:35869;R11F_G11F_B10F:35898;UNSIGNED_INT_10F_11F_11F_REV:35899;RGB9_E5:35901;UNSIGNED_INT_5_9_9_9_REV:35902;TRANSFORM_FEEDBACK_BUFFER_MODE:35967;MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS:35968;TRANSFORM_FEEDBACK_VARYINGS:35971;TRANSFORM_FEEDBACK_BUFFER_START:35972;TRANSFORM_FEEDBACK_BUFFER_SIZE:35973;TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN:35976;RASTERIZER_DISCARD:35977;MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS:35978;MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS:35979;INTERLEAVED_ATTRIBS:35980;SEPARATE_ATTRIBS:35981;TRANSFORM_FEEDBACK_BUFFER:35982;TRANSFORM_FEEDBACK_BUFFER_BINDING:35983;RGBA32UI:36208;RGB32UI:36209;RGBA16UI:36214;RGB16UI:36215;RGBA8UI:36220;RGB8UI:36221;RGBA32I:36226;RGB32I:36227;RGBA16I:36232;RGB16I:36233;RGBA8I:36238;RGB8I:36239;RED_INTEGER:36244;RGB_INTEGER:36248;RGBA_INTEGER:36249;SAMPLER_2D_ARRAY:36289;SAMPLER_2D_ARRAY_SHADOW:36292;SAMPLER_CUBE_SHADOW:36293;UNSIGNED_INT_VEC2:36294;UNSIGNED_INT_VEC3:36295;UNSIGNED_INT_VEC4:36296;INT_SAMPLER_2D:36298;INT_SAMPLER_3D:36299;INT_SAMPLER_CUBE:36300;INT_SAMPLER_2D_ARRAY:36303;UNSIGNED_INT_SAMPLER_2D:36306;UNSIGNED_INT_SAMPLER_3D:36307;UNSIGNED_INT_SAMPLER_CUBE:36308;UNSIGNED_INT_SAMPLER_2D_ARRAY:36311;DEPTH_COMPONENT32F:36012;DEPTH32F_STENCIL8:36013;FLOAT_32_UNSIGNED_INT_24_8_REV:36269;FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING:33296;FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE:33297;FRAMEBUFFER_ATTACHMENT_RED_SIZE:33298;FRAMEBUFFER_ATTACHMENT_GREEN_SIZE:33299;FRAMEBUFFER_ATTACHMENT_BLUE_SIZE:33300;FRAMEBUFFER_ATTACHMENT_ALPHA_SIZE:33301;FRAMEBUFFER_ATTACHMENT_DEPTH_SIZE:33302;FRAMEBUFFER_ATTACHMENT_STENCIL_SIZE:33303;FRAMEBUFFER_DEFAULT:33304;UNSIGNED_INT_24_8:34042;DEPTH24_STENCIL8:35056;UNSIGNED_NORMALIZED:35863;DRAW_FRAMEBUFFER_BINDING:36006;READ_FRAMEBUFFER:36008;DRAW_FRAMEBUFFER:36009;READ_FRAMEBUFFER_BINDING:36010;RENDERBUFFER_SAMPLES:36011;FRAMEBUFFER_ATTACHMENT_TEXTURE_LAYER:36052;MAX_COLOR_ATTACHMENTS:36063;COLOR_ATTACHMENT1:36065;COLOR_ATTACHMENT2:36066;COLOR_ATTACHMENT3:36067;COLOR_ATTACHMENT4:36068;COLOR_ATTACHMENT5:36069;COLOR_ATTACHMENT6:36070;COLOR_ATTACHMENT7:36071;COLOR_ATTACHMENT8:36072;COLOR_ATTACHMENT9:36073;COLOR_ATTACHMENT10:36074;COLOR_ATTACHMENT11:36075;COLOR_ATTACHMENT12:36076;COLOR_ATTACHMENT13:36077;COLOR_ATTACHMENT14:36078;COLOR_ATTACHMENT15:36079;FRAMEBUFFER_INCOMPLETE_MULTISAMPLE:36182;MAX_SAMPLES:36183;HALF_FLOAT:5131;RG:33319;RG_INTEGER:33320;R8:33321;RG8:33323;R16F:33325;R32F:33326;RG16F:33327;RG32F:33328;R8I:33329;R8UI:33330;R16I:33331;R16UI:33332;R32I:33333;R32UI:33334;RG8I:33335;RG8UI:33336;RG16I:33337;RG16UI:33338;RG32I:33339;RG32UI:33340;VERTEX_ARRAY_BINDING:34229;R8_SNORM:36756;RG8_SNORM:36757;RGB8_SNORM:36758;RGBA8_SNORM:36759;SIGNED_NORMALIZED:36764;COPY_READ_BUFFER:36662;COPY_WRITE_BUFFER:36663;COPY_READ_BUFFER_BINDING:36662;COPY_WRITE_BUFFER_BINDING:36663;UNIFORM_BUFFER:35345;UNIFORM_BUFFER_BINDING:35368;UNIFORM_BUFFER_START:35369;UNIFORM_BUFFER_SIZE:35370;MAX_VERTEX_UNIFORM_BLOCKS:35371;MAX_FRAGMENT_UNIFORM_BLOCKS:35373;MAX_COMBINED_UNIFORM_BLOCKS:35374;MAX_UNIFORM_BUFFER_BINDINGS:35375;MAX_UNIFORM_BLOCK_SIZE:35376;MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS:35377;MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS:35379;UNIFORM_BUFFER_OFFSET_ALIGNMENT:35380;ACTIVE_UNIFORM_BLOCKS:35382;UNIFORM_TYPE:35383;UNIFORM_SIZE:35384;UNIFORM_BLOCK_INDEX:35386;UNIFORM_OFFSET:35387;UNIFORM_ARRAY_STRIDE:35388;UNIFORM_MATRIX_STRIDE:35389;UNIFORM_IS_ROW_MAJOR:35390;UNIFORM_BLOCK_BINDING:35391;UNIFORM_BLOCK_DATA_SIZE:35392;UNIFORM_BLOCK_ACTIVE_UNIFORMS:35394;UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES:35395;UNIFORM_BLOCK_REFERENCED_BY_VERTEX_SHADER:35396;UNIFORM_BLOCK_REFERENCED_BY_FRAGMENT_SHADER:35398;INVALID_INDEX:4294967295;MAX_VERTEX_OUTPUT_COMPONENTS:37154;MAX_FRAGMENT_INPUT_COMPONENTS:37157;MAX_SERVER_WAIT_TIMEOUT:37137;OBJECT_TYPE:37138;SYNC_CONDITION:37139;SYNC_STATUS:37140;SYNC_FLAGS:37141;SYNC_FENCE:37142;SYNC_GPU_COMMANDS_COMPLETE:37143;UNSIGNALED:37144;SIGNALED:37145;ALREADY_SIGNALED:37146;TIMEOUT_EXPIRED:37147;CONDITION_SATISFIED:37148;WAIT_FAILED:37149;SYNC_FLUSH_COMMANDS_BIT:1;VERTEX_ATTRIB_ARRAY_DIVISOR:35070;ANY_SAMPLES_PASSED:35887;ANY_SAMPLES_PASSED_CONSERVATIVE:36202;SAMPLER_BINDING:35097;RGB10_A2UI:36975;INT_2_10_10_10_REV:36255;TRANSFORM_FEEDBACK:36386;TRANSFORM_FEEDBACK_PAUSED:36387;TRANSFORM_FEEDBACK_ACTIVE:36388;TRANSFORM_FEEDBACK_BINDING:36389;TEXTURE_IMMUTABLE_FORMAT:37167;MAX_ELEMENT_INDEX:36203;TEXTURE_IMMUTABLE_LEVELS:33503;TIMEOUT_IGNORED:-1;MAX_CLIENT_WAIT_TIMEOUT_WEBGL:37447;activeTexture(1);attachShader(2);beginQuery(2);beginTransformFeedback(1);bindAttribLocation(3);bindBufferBase(3);bindBufferRange(5);bindRenderbuffer(2);bindSampler(2);bindTransformFeedback(2);bindVertexArray(1);blendColor(4);blendEquation(1);blendEquationSeparate(2);blendFunc(2);blendFuncSeparate(4);blitFramebuffer(10);bufferData(3);bufferSubData(3);checkFramebufferStatus(1);clientWaitSync(3);compileShader(1);compressedTexImage2D(7);compressedTexImage3D(8);compressedTexSubImage2D(8);compressedTexSubImage3D(10);copyBufferSubData(5);copyTexImage2D(8);copyTexSubImage2D(8);copyTexSubImage3D(9);createBuffer(0);createFramebuffer(0);createProgram(0);createQuery(0);createRenderbuffer(0);createSampler(0);createShader(1);createTexture(0);createTransformFeedback(0);createVertexArray(0);cullFace(1);deleteBuffer(1);deleteFramebuffer(1);deleteProgram(1);deleteQuery(1);deleteRenderbuffer(1);deleteSampler(1);deleteShader(1);deleteSync(1);deleteTexture(1);deleteTransformFeedback(1);deleteVertexArray(1);depthFunc(1);depthMask(1);depthRange(2);detachShader(2);disable(1);drawArraysInstanced(4);drawElementsInstanced(5);drawRangeElements(6);enable(1);endQuery(1);endTransformFeedback(0);fenceSync(2);finish(0);flush(0);framebufferRenderbuffer(4);framebufferTexture2D(5);framebufferTextureLayer(5);frontFace(1);generateMipmap(1);getActiveAttrib(2);getActiveUniform(2);getActiveUniformBlockName(2);getActiveUniformBlockParameter(3);getActiveUniforms(3);getAttachedShaders(1);getAttribLocation(2);getBufferParameter(2);getBufferSubData(3);getContextAttributes(0);getError(0);getExtension(1);getFragDataLocation(2);getFramebufferAttachmentParameter(3);getIndexedParameter(2);getInternalformatParameter(3);getParameter(1);getProgramInfoLog(1);getProgramParameter(2);getQuery(2);getQueryParameter(2);getRenderbufferParameter(2);getSamplerParameter(2);getShaderInfoLog(1);getShaderParameter(2);getShaderPrecisionFormat(2);getShaderSource(1);getSupportedExtensions(0);getSyncParameter(2);getTexParameter(2);getTransformFeedbackVarying(2);getUniform(2);getUniformBlockIndex(2);getUniformIndices(2);getUniformLocation(2);getVertexAttrib(2);getVertexAttribOffset(2);hint(2);invalidateFramebuffer(2);invalidateSubFramebuffer(6);isBuffer(1);isContextLost(0);isEnabled(1);isFramebuffer(1);isProgram(1);isQuery(1);isRenderbuffer(1);isSampler(1);isShader(1);isSync(1);isTexture(1);isTransformFeedback(1);isVertexArray(1);lineWidth(1);linkProgram(1);pauseTransformFeedback(0);pixelStorei(2);polygonOffset(2);readBuffer(1);readPixels(7);renderbufferStorage(4);renderbufferStorageMultisample(5);resumeTransformFeedback(0);sampleCoverage(2);samplerParameterf(3);samplerParameteri(3);shaderSource(2);stencilFunc(3);stencilFuncSeparate(4);stencilMask(1);stencilMaskSeparate(2);stencilOp(3);stencilOpSeparate(4);texImage2D(6);texImage3D(10);texParameterf(3);texParameteri(3);texStorage2D(5);texStorage3D(6);texSubImage2D(7);texSubImage3D(11);transformFeedbackVaryings(3);uniform1ui(2);uniform2ui(3);uniform3ui(4);uniform4ui(5);uniformBlockBinding(3);useProgram(1);validateProgram(1);vertexAttribDivisor(2);vertexAttribI4i(5);vertexAttribI4ui(5);vertexAttribIPointer(5);waitSync(3);bindBuffer(2);bindFramebuffer(2);bindTexture(2);clear(1);clearBufferfi(4);clearBufferfv(3);clearBufferiv(3);clearBufferuiv(3);clearColor(4);clearDepth(1);clearStencil(1);colorMask(4);disableVertexAttribArray(1);drawArrays(3);drawBuffers(1);drawElements(4);enableVertexAttribArray(1);scissor(4);uniform1f(2);uniform1fv(2);uniform1i(2);uniform1iv(2);uniform1uiv(2);uniform2f(3);uniform2fv(2);uniform2i(3);uniform2iv(2);uniform2uiv(2);uniform3f(4);uniform3fv(2);uniform3i(4);uniform3iv(2);uniform3uiv(2);uniform4f(5);uniform4fv(2);uniform4i(5);uniform4iv(2);uniform4uiv(2);uniformMatrix2fv(3);uniformMatrix2x3fv(3);uniformMatrix2x4fv(3);uniformMatrix3fv(3);uniformMatrix3x2fv(3);uniformMatrix3x4fv(3);uniformMatrix4fv(3);uniformMatrix4x2fv(3);uniformMatrix4x3fv(3);vertexAttrib1f(2);vertexAttrib1fv(2);vertexAttrib2f(3);vertexAttrib2fv(2);vertexAttrib3f(4);vertexAttrib3fv(2);vertexAttrib4f(5);vertexAttrib4fv(2);vertexAttribI4iv(2);vertexAttribI4uiv(2);vertexAttribPointer(6);viewport(4);drawingBufferFormat;drawingBufferStorage(3);constructor;makeXRCompatible(0)' };
+        const _mask = typeof globalThis._maskFunction === "function" ? globalThis._maskFunction : (f) => f;
+        const _glObjects = {
+            __proto__: null,
+            createBuffer: "WebGLBuffer", createFramebuffer: "WebGLFramebuffer", createProgram: "WebGLProgram",
+            createRenderbuffer: "WebGLRenderbuffer", createShader: "WebGLShader", createTexture: "WebGLTexture",
+            createVertexArray: "WebGLVertexArrayObject", createQuery: "WebGLQuery", createSampler: "WebGLSampler",
+            createSync: "WebGLSync", createTransformFeedback: "WebGLTransformFeedback",
+        };
+        const _glMake = (name) => {
+            const C = globalThis[name];
+            return typeof C === "function" ? Object.create(C.prototype) : {};
+        };
+        const _glStub = (name, length) => {
+            const body = _glObjects[name]
+                ? () => _glMake(_glObjects[name])
+                : (name.startsWith("is") ? () => false : (name.startsWith("get") ? () => null : () => undefined));
+            const f = { [name](...args) { return body(args); } }[name];
+            Object.defineProperty(f, "length", { value: length, configurable: true });
+            _mask(f, name);
+            return { value: f, writable: true, enumerable: true, configurable: true };
+        };
+        const _glAccessor = (name) => {
+            const spaces = new WeakMap();
+            const get = {
+                canvas: () => function () { return _gl(this).canvas; },
+                drawingBufferWidth: () => function () { return _gl(this).width; },
+                drawingBufferHeight: () => function () { return _gl(this).height; },
+                drawingBufferFormat: () => function () { return 32856; },
+                drawingBufferColorSpace: () => function () { return spaces.get(this) || "srgb"; },
+                unpackColorSpace: () => function () { return spaces.get(this) || "srgb"; },
+            }[name];
+            if (!get) return null;
+            const g = Object.getOwnPropertyDescriptor({ get [name]() { return get().call(this); } }, name).get;
+            _mask(g, "get " + name);
+            const d = { get: g, set: undefined, enumerable: true, configurable: true };
+            if (name === "drawingBufferColorSpace" || name === "unpackColorSpace") {
+                const s = Object.getOwnPropertyDescriptor({
+                    set [name](v) { spaces.set(this, `${v}`); },
+                }, name).set;
+                _mask(s, "set " + name);
+                d.set = s;
+            }
+            return d;
+        };
+        const _buildGL = (C, fallback) => {
+            const proto = C.prototype;
+            const existing = { __proto__: null };
+            for (const k of Object.getOwnPropertyNames(proto)) {
+                if (k === "constructor") continue;
+                existing[k] = Object.getOwnPropertyDescriptor(proto, k);
+                delete proto[k];
+            }
+            for (const k of Object.getOwnPropertyNames(C)) {
+                if (k === "length" || k === "name" || k === "prototype") continue;
+                try { delete C[k]; } catch (_) {}
+            }
+            const ctor = Object.getOwnPropertyDescriptor(proto, "constructor");
+            delete proto.constructor;
+            const tag = Object.getOwnPropertyDescriptor(proto, Symbol.toStringTag);
+            if (tag) delete proto[Symbol.toStringTag];
+            for (const entry of GL_TABLES[C.name].split(";")) {
+                const colon = entry.indexOf(":");
+                const paren = entry.indexOf("(");
+                if (colon > 0) {
+                    const name = entry.slice(0, colon);
+                    const value = Number(entry.slice(colon + 1));
+                    const d = { value, writable: false, enumerable: true, configurable: false };
+                    Object.defineProperty(proto, name, d);
+                    Object.defineProperty(C, name, d);
+                    continue;
+                }
+                if (paren > 0) {
+                    const name = entry.slice(0, paren);
+                    const length = Number(entry.slice(paren + 1, -1));
+                    let d = existing[name] || (fallback ? fallback[name] : null);
+                    if (d && typeof d.value === "function") {
+                        Object.defineProperty(d.value, "length", { value: length, configurable: true });
+                        _mask(d.value, name);
+                        d = { value: d.value, writable: true, enumerable: true, configurable: true };
+                    } else {
+                        d = _glStub(name, length);
+                    }
+                    Object.defineProperty(proto, name, d);
+                    continue;
+                }
+                const name = entry.endsWith("=") ? entry.slice(0, -1) : entry;
+                if (name === "constructor") {
+                    if (ctor) Object.defineProperty(proto, "constructor", ctor);
+                    continue;
+                }
+                const d = _glAccessor(name);
+                if (d) Object.defineProperty(proto, name, d);
+            }
+            Object.defineProperty(proto, Symbol.toStringTag, { value: C.name, configurable: true });
+            return existing;
+        };
+        const _gl1Members = _buildGL(WebGLRenderingContext, null);
+        _buildGL(WebGL2RenderingContext, _gl1Members);
+    }
 
     // AudioContext + OfflineAudioContext
     // Simulates the pipeline commonly used for audio fingerprinting:
@@ -943,22 +1073,22 @@
         constructor(context, opts) {
             super();
             const o = opts || {};
-            this._context = context || null;
-            this._numberOfInputs = o.inputs === undefined ? 1 : o.inputs;
-            this._numberOfOutputs = o.outputs === undefined ? 1 : o.outputs;
-            this._channelCount = o.channelCount === undefined ? 2 : o.channelCount;
-            this._channelCountMode = o.channelCountMode || "max";
-            this._channelInterpretation = "speakers";
+            _idl.own(this)._context = context || null;
+            _idl.own(this)._numberOfInputs = o.inputs === undefined ? 1 : o.inputs;
+            _idl.own(this)._numberOfOutputs = o.outputs === undefined ? 1 : o.outputs;
+            _idl.own(this)._channelCount = o.channelCount === undefined ? 2 : o.channelCount;
+            _idl.own(this)._channelCountMode = o.channelCountMode || "max";
+            _idl.own(this)._channelInterpretation = "speakers";
         }
-        get context() { return this._context; }
-        get numberOfInputs() { return this._numberOfInputs; }
-        get numberOfOutputs() { return this._numberOfOutputs; }
-        get channelCount() { return this._channelCount; }
-        set channelCount(v) { this._channelCount = v | 0; }
-        get channelCountMode() { return this._channelCountMode; }
-        set channelCountMode(v) { this._channelCountMode = String(v); }
-        get channelInterpretation() { return this._channelInterpretation; }
-        set channelInterpretation(v) { this._channelInterpretation = String(v); }
+        get context() { return _idl.own(this)._context; }
+        get numberOfInputs() { return _idl.own(this)._numberOfInputs; }
+        get numberOfOutputs() { return _idl.own(this)._numberOfOutputs; }
+        get channelCount() { return _idl.own(this)._channelCount; }
+        set channelCount(v) { _idl.own(this)._channelCount = v | 0; }
+        get channelCountMode() { return _idl.own(this)._channelCountMode; }
+        set channelCountMode(v) { _idl.own(this)._channelCountMode = String(v); }
+        get channelInterpretation() { return _idl.own(this)._channelInterpretation; }
+        set channelInterpretation(v) { _idl.own(this)._channelInterpretation = String(v); }
         connect(dest) { return dest; }
         disconnect() {}
     }
@@ -970,19 +1100,21 @@
     }
 
     class OscillatorNode extends AudioScheduledSourceNode {
-        _type = "sine";
         constructor(context) {
             super(context, { inputs: 0, outputs: 1 });
-            this.frequency = {
+            const _st = _idl.own(this);
+            _st._type = "sine";
+            _st.frequency = {
                 _value: 440,
                 get value() { return this._value; },
-                set value(v) { this._value = v; if (context._setOscFreq) context._setOscFreq(v); }
+                set value(v) { this._value = v; _octxSet(context, "oscFreq", v); }
             };
-            this.detune = { value: 0 };
+            _st.detune = { value: 0 };
         }
-        get type() { return this._type; }
-        set type(v) { this._type = v; if (this._context._setOscType) this._context._setOscType(v); }
+        get type() { return _idl.own(this)._type; }
+        set type(v) { _idl.own(this)._type = v; _octxSet(_idl.own(this)._context, "oscType", v); }
     }
+    _idl.fields(OscillatorNode.prototype, ["detune", "frequency"]);
 
     // `new AudioBuffer({length, sampleRate})` is constructible in a browser and
     // was only a name here, so it threw "Illegal constructor". Fingerprinters
@@ -1043,13 +1175,16 @@
     }
 
     class AudioParam {
+        #context;
+        #setter;
+        #value;
         constructor(val, context, setter) {
-            this._value = val;
-            this._context = context;
-            this._setter = setter;
+            this.#value = val;
+            this.#context = context;
+            this.#setter = setter;
         }
-        get value() { return this._value; }
-        set value(v) { this._value = v; if (this._setter) this._setter(v); }
+        get value() { return this.#value; }
+        set value(v) { this.#value = v; if (this.#setter) this.#setter(v); }
         setValueAtTime() { return this; }
         linearRampToValueAtTime() { return this; }
         exponentialRampToValueAtTime() { return this; }
@@ -1062,18 +1197,21 @@
     class GainNode extends AudioNode {
         constructor(context) {
             super(context);
-            this.gain = new AudioParam(1, context);
+            const _st = _idl.own(this);
+            _st.gain = new AudioParam(1, context);
         }
     }
+    _idl.fields(GainNode.prototype, ["gain"]);
 
     class DynamicsCompressorNode extends AudioNode {
         constructor(context) {
             super(context, { channelCount: 2, channelCountMode: "clamped-max" });
-            this.threshold = new AudioParam(-24, context, v => { if (context._setCompThreshold) context._setCompThreshold(v); });
-            this.knee = new AudioParam(30, context, v => { if (context._setCompKnee) context._setCompKnee(v); });
-            this.ratio = new AudioParam(12, context, v => { if (context._setCompRatio) context._setCompRatio(v); });
-            this.attack = new AudioParam(0.003, context, v => { if (context._setCompAttack) context._setCompAttack(v); });
-            this.release = new AudioParam(0.25, context, v => { if (context._setCompRelease) context._setCompRelease(v); });
+            const _st = _idl.own(this);
+            _st.threshold = new AudioParam(-24, context, v => { _octxSet(context, "compThreshold", v); });
+            _st.knee = new AudioParam(30, context, v => { _octxSet(context, "compKnee", v); });
+            _st.ratio = new AudioParam(12, context, v => { _octxSet(context, "compRatio", v); });
+            _st.attack = new AudioParam(0.003, context, v => { _octxSet(context, "compAttack", v); });
+            _st.release = new AudioParam(0.25, context, v => { _octxSet(context, "compRelease", v); });
         }
         // Readonly float in dB, 0 until a render has happened — Chrome's shape.
         // It used to be missing entirely, and hCaptcha's audio probe reads
@@ -1081,19 +1219,22 @@
         // compat form) from its `complete` handler, so the whole handler threw
         // `Cannot read properties of undefined (reading 'value')`.
         get reduction() {
-            const c = this._context;
-            return (c && typeof c._compReduction === "number") ? c._compReduction : 0;
+            const c = this.context;
+            const st = c && _octxState(c);
+            return st && typeof st.compReduction === "number" ? st.compReduction : 0;
         }
     }
+    _idl.fields(DynamicsCompressorNode.prototype, ["attack", "knee", "ratio", "release", "threshold"]);
 
     class BiquadFilterNode extends AudioNode {
         constructor(context) {
             super(context);
+            const _st = _idl.own(this);
             this.type = "lowpass";
-            this.frequency = new AudioParam(350, context);
-            this.detune = new AudioParam(0, context);
-            this.Q = new AudioParam(1, context);
-            this.gain = new AudioParam(0);
+            _st.frequency = new AudioParam(350, context);
+            _st.detune = new AudioParam(0, context);
+            _st.Q = new AudioParam(1, context);
+            _st.gain = new AudioParam(0);
         }
         getFrequencyResponse(freqArr, magOut, phaseOut) {
             if (!(freqArr instanceof Float32Array)) return;
@@ -1102,7 +1243,7 @@
                 highshelf: 4, peaking: 5, notch: 6, allpass: 7,
             };
             const tid = _typeIds[this.type] ?? 0;
-            const sr = (this._sampleRate || 44100);
+            const sr = (this.context && this.context.sampleRate) || 44100;
             const inBytes = new Uint8Array(freqArr.buffer, freqArr.byteOffset, freqArr.byteLength);
             const out = ops.op_audio_biquad_response(
                 inBytes, tid,
@@ -1117,16 +1258,19 @@
             for (let i = 0; i < lenP; i++) phaseOut[i] = result[n + i];
         }
     }
+    _idl.fields(BiquadFilterNode.prototype, ["Q", "detune", "frequency", "gain"]);
 
     class AnalyserNode extends AudioNode {
+        #prevFreq;
+        #timeDomain;
         constructor(context) {
             super(context);
             this.fftSize = 2048;
             this.smoothingTimeConstant = 0.8;
             this.minDecibels = -100;
             this.maxDecibels = -30;
-            this._timeDomain = null;
-            this._prevFreq = null;
+            this.#timeDomain = null;
+            this.#prevFreq = null;
         }
         get frequencyBinCount() { return this.fftSize / 2; }
         getByteFrequencyData(arr) {
@@ -1140,13 +1284,13 @@
             }
         }
         getFloatFrequencyData(arr) {
-            if (!this._timeDomain || this._timeDomain.length < this.fftSize) {
+            if (!this.#timeDomain || this.#timeDomain.length < this.fftSize) {
                 for (let i = 0; i < arr.length; i++) arr[i] = this.minDecibels;
                 return;
             }
-            const tdBytes = new Uint8Array(this._timeDomain.buffer, 0, this.fftSize * 4);
-            const prevBytes = this._prevFreq
-                ? new Uint8Array(this._prevFreq.buffer)
+            const tdBytes = new Uint8Array(this.#timeDomain.buffer, 0, this.fftSize * 4);
+            const prevBytes = this.#prevFreq
+                ? new Uint8Array(this.#prevFreq.buffer)
                 : new Uint8Array(0);
             const out = ops.op_audio_analyser_freq_data(
                 tdBytes, this.fftSize,
@@ -1156,31 +1300,33 @@
             const result = new Float32Array(out.buffer, out.byteOffset, out.byteLength / 4);
             const len = Math.min(arr.length, result.length);
             for (let i = 0; i < len; i++) arr[i] = result[i];
-            this._prevFreq = result.slice();
+            this.#prevFreq = result.slice();
         }
         getByteTimeDomainData(arr) {
-            if (!this._timeDomain) {
+            if (!this.#timeDomain) {
                 for (let i = 0; i < arr.length; i++) arr[i] = 128;
                 return;
             }
-            const len = Math.min(arr.length, this._timeDomain.length);
+            const len = Math.min(arr.length, this.#timeDomain.length);
             for (let i = 0; i < len; i++) {
-                arr[i] = Math.max(0, Math.min(255, Math.round((this._timeDomain[i] + 1) * 127.5)));
+                arr[i] = Math.max(0, Math.min(255, Math.round((this.#timeDomain[i] + 1) * 127.5)));
             }
         }
         getFloatTimeDomainData(arr) {
-            if (!this._timeDomain) {
+            if (!this.#timeDomain) {
                 for (let i = 0; i < arr.length; i++) arr[i] = 0;
                 return;
             }
-            const len = Math.min(arr.length, this._timeDomain.length);
-            for (let i = 0; i < len; i++) arr[i] = this._timeDomain[i];
+            const len = Math.min(arr.length, this.#timeDomain.length);
+            for (let i = 0; i < len; i++) arr[i] = this.#timeDomain[i];
         }
     }
 
     class AudioDestinationNode extends AudioNode {
-        constructor() { super(); this.maxChannelCount = 2; }
+        constructor() {
+            super(); const _st = _idl.own(this); _st.maxChannelCount = 2; }
     }
+    _idl.fields(AudioDestinationNode.prototype, ["maxChannelCount"]);
 
     // AudioContext fingerprintable surface. Real Chrome reports a
     // stable per-device value across page loads. Previously this used
@@ -1242,13 +1388,14 @@
     class BaseAudioContext extends EventTarget {
         constructor() {
             super();
-            this.sampleRate = _audioSampleRate;
-            this.baseLatency = _audioBaseLatency;
-            this.outputLatency = _audioOutputLatency;
-            this.state = "running";
-            this.currentTime = 0;
-            this.destination = new AudioDestinationNode();
-            this.listener = {}; // AudioListener stub
+            const _st = _idl.own(this);
+            _st.sampleRate = _audioSampleRate;
+            _st.baseLatency = _audioBaseLatency;
+            _st.outputLatency = _audioOutputLatency;
+            _st.state = "running";
+            _st.currentTime = 0;
+            _st.destination = new AudioDestinationNode();
+            _st.listener = {}; // AudioListener stub
         }
         createOscillator() { return new OscillatorNode(this); }
         createDynamicsCompressor() { return new DynamicsCompressorNode(this); }
@@ -1270,6 +1417,9 @@
         decodeAudioData() { return Promise.resolve(); }
         resume() { return Promise.resolve(); }
     }
+    // baseLatency/outputLatency are AudioContext members in Chrome; the state
+    // is written here and parity_bootstrap.js installs the accessors there.
+    _idl.fields(BaseAudioContext.prototype, ["currentTime", "destination", "listener", "sampleRate", "state"]);
     globalThis.BaseAudioContext = BaseAudioContext;
 
     class AudioContext extends BaseAudioContext {
@@ -1280,35 +1430,35 @@
         suspend() { return Promise.resolve(); }
     }
 
+    const _octx = new WeakMap();
+    const _octxState = (ctx) => _octx.get(ctx);
+    const _octxSet = (ctx, key, v) => { const st = _octx.get(ctx); if (st) st[key] = v; };
     class OfflineAudioContext extends BaseAudioContext {
         constructor(channels, length, sampleRate) {
             super();
-            this._channels = channels || 1;
-            this._length = length || _audioSampleRate;
-            this.sampleRate = sampleRate || _audioSampleRate;
-            this._oscType = "triangle";
-            this._oscFreq = 10000;
-            this._compThreshold = -24;
-            this._compKnee = 30;
-            this._compRatio = 12;
-            this._compAttack = 0.003;
-            this._compRelease = 0.25;
+            _idl.own(this).sampleRate = sampleRate || _audioSampleRate;
+            _octx.set(this, {
+                channels: channels || 1,
+                length: length || _audioSampleRate,
+                oscType: "triangle",
+                oscFreq: 10000,
+                compThreshold: -24,
+                compKnee: 30,
+                compRatio: 12,
+                compAttack: 0.003,
+                compRelease: 0.25,
+                compReduction: 0,
+            });
         }
-        _setOscType(v) { this._oscType = v; }
-        _setOscFreq(v) { this._oscFreq = v; }
-        _setCompThreshold(v) { this._compThreshold = v; }
-        _setCompKnee(v) { this._compKnee = v; }
-        _setCompRatio(v) { this._compRatio = v; }
-        _setCompAttack(v) { this._compAttack = v; }
-        _setCompRelease(v) { this._compRelease = v; }
 
         startRendering() {
             const self = this;
             return new Promise((resolve) => {
+                const st = _octxState(self) || {};
                 const sr = self.sampleRate;
-                const len = self._length;
-                const freq = self._oscFreq;
-                const type = self._oscType;
+                const len = st.length;
+                const freq = st.oscFreq;
+                const type = st.oscType;
                 const waveTypeId = type === "sine" ? 0
                     : type === "square" ? 2
                     : type === "sawtooth" ? 3
@@ -1341,12 +1491,12 @@
                 try {
                     const bytes = ops.op_offline_audio_render(
                         seed, sr | 0, len | 0, freq, waveTypeId,
-                        self._compThreshold, self._compKnee, self._compRatio,
-                        self._compAttack, self._compRelease,
+                        st.compThreshold, st.compKnee, st.compRatio,
+                        st.compAttack, st.compRelease,
                     );
                     data = new Float32Array(bytes.buffer, bytes.byteOffset, len);
                     // One trailing f32: the compressor's metering gain in dB.
-                    self._compReduction = new Float32Array(
+                    st.compReduction = new Float32Array(
                         bytes.buffer, bytes.byteOffset, len + 1,
                     )[len];
                 } catch (e) {
@@ -1360,12 +1510,12 @@
                 let buf;
                 try {
                     buf = new AudioBuffer({
-                        length: len, sampleRate: sr, numberOfChannels: self._channels,
+                        length: len, sampleRate: sr, numberOfChannels: st.channels,
                     });
                     buf.copyToChannel(data, 0, 0);
                 } catch (_) {
                     buf = {
-                        numberOfChannels: self._channels,
+                        numberOfChannels: st.channels,
                         length: len,
                         sampleRate: sr,
                         duration: len / sr,
@@ -1458,10 +1608,11 @@
                 // with the WebGL 1 surface (_isWebGL2 = false).
                 const isV2 = (type === "webgl2");
                 const gl = isV2 ? new WebGL2RenderingContext() : new WebGLRenderingContext();
-                gl._isWebGL2 = isV2;
-                gl.canvas = this;
-                gl.drawingBufferWidth = this.width;
-                gl.drawingBufferHeight = this.height;
+                const st = _gl(gl);
+                st.isWebGL2 = isV2;
+                st.canvas = this;
+                st.width = this.width;
+                st.height = this.height;
                 return gl;
             }
             return null;
@@ -1646,10 +1797,10 @@
             }
         }
         function _lazyInitCanvas(self) {
-            if (!self._canvasId) {
+            if (!_idl.own(self)._canvasId) {
                 const w = parseInt(self.getAttribute && self.getAttribute("width")) || 300;
                 const h = parseInt(self.getAttribute && self.getAttribute("height")) || 150;
-                self._canvasId = ops.op_canvas_create(w, h, _getOsName(), _getCanvasSeed());
+                _idl.own(self)._canvasId = ops.op_canvas_create(w, h, _getOsName(), _getCanvasSeed());
             }
         }
 
@@ -1670,10 +1821,10 @@
                     // taken from this canvas: the page went on drawing into the
                     // old surface while everything else read a fresh empty one.
                     try {
-                        if (this._canvasId) {
+                        if (_idl.own(this)._canvasId) {
                             const w = prop === "width" ? n : this.width;
                             const h = prop === "height" ? n : this.height;
-                            ops.op_canvas_resize(this._canvasId, w | 0, h | 0);
+                            ops.op_canvas_resize(_idl.own(this)._canvasId, w | 0, h | 0);
                             // The engine drops its drawing state here, per spec;
                             // the context's readable mirror follows it.
                             const ctx = _ctx2d.get(this);
@@ -1687,10 +1838,16 @@
         }
 
         Object.defineProperty(_HTMLCanvasProto, "getContext", {
-            value: function getContext(type) {
+            // Method-shorthand, not `function getContext(...) {}` — a plain
+            // function expression has its own `.prototype` (constructible)
+            // and isn't implicitly strict, both of which fail the
+            // native-function shape checks fingerprint SDKs run against
+            // every DOM method (`Object.getOwnPropertyDescriptor(...).value`
+            // has `'prototype' in it`, `.caller`/`.arguments` don't throw).
+            value: { getContext(type) {
                 _requireCanvas(this, "getContext");
                 _lazyInitCanvas(this);
-                if (type === "2d") return _context2dFor(this, this._canvasId);
+                if (type === "2d") return _context2dFor(this, _idl.own(this)._canvasId);
                 if (
                     type === "webgl" ||
                     type === "webgl2" ||
@@ -1701,32 +1858,33 @@
                     // FIX-D2: distinct class + surface per requested version.
                     const isV2 = (type === "webgl2");
                     const gl = isV2
-                        ? new WebGL2RenderingContext(this._canvasId, w, h)
-                        : new WebGLRenderingContext(this._canvasId, w, h);
-                    gl._isWebGL2 = isV2;
-                    gl.canvas = this;
+                        ? new WebGL2RenderingContext(_idl.own(this)._canvasId, w, h)
+                        : new WebGLRenderingContext(_idl.own(this)._canvasId, w, h);
+                    const st = _gl(gl);
+                    st.isWebGL2 = isV2;
+                    st.canvas = this;
                     return gl;
                 }
                 return null;
-            },
+            } }.getContext,
             writable: true,
             configurable: true,
             enumerable: false,
         });
 
         Object.defineProperty(_HTMLCanvasProto, "toDataURL", {
-            value: function toDataURL(_type) {
+            value: { toDataURL(_type) {
                 _requireCanvas(this, "toDataURL");
                 // Auto-allocate a canvas if none yet — real Chrome
                 // serializes any HTMLCanvasElement, even one whose 2D
                 // context was never requested. The result is a fully
                 // transparent PNG of the element's width × height.
-                if (!this._canvasId) {
+                if (!_idl.own(this)._canvasId) {
                     try { this.getContext("2d"); } catch (_e) {}
                 }
-                if (!this._canvasId) return "data:,";
-                return ops.op_canvas_to_data_url(this._canvasId);
-            },
+                if (!_idl.own(this)._canvasId) return "data:,";
+                return ops.op_canvas_to_data_url(_idl.own(this)._canvasId);
+            } }.toDataURL,
             writable: true,
             configurable: true,
             enumerable: false,
@@ -1742,7 +1900,7 @@
                 }
                 // Match Chrome: the callback fires asynchronously on
                 // the next microtask, not synchronously.
-                const url = this._canvasId ? ops.op_canvas_to_data_url(this._canvasId) : "data:,";
+                const url = _idl.own(this)._canvasId ? ops.op_canvas_to_data_url(_idl.own(this)._canvasId) : "data:,";
                 queueMicrotask(() => {
                     try {
                         cb(new Blob([_dataUrlToBytes(url)], { type: type || "image/png" }));
@@ -1781,20 +1939,20 @@
             super();
             this.width = width | 0;
             this.height = height | 0;
-            this._canvasId = 0;
-            this._context = null;
+            _idl.own(this)._canvasId = 0;
+            _idl.own(this)._context = null;
         }
         getContext(type, _opts) {
             if (type === "2d") {
-                if (!this._canvasId) {
-                    this._canvasId = ops.op_canvas_create(this.width, this.height, _getOsName(), _getCanvasSeed());
+                if (!_idl.own(this)._canvasId) {
+                    _idl.own(this)._canvasId = ops.op_canvas_create(this.width, this.height, _getOsName(), _getCanvasSeed());
                 }
-                if (!this._context) {
+                if (!_idl.own(this)._context) {
                     // The back-reference rides in the constructor: `canvas` is a
                     // getter on the prototype, so assigning it throws.
-                    this._context = new CanvasRenderingContext2D(this._canvasId, this);
+                    _idl.own(this)._context = new CanvasRenderingContext2D(_idl.own(this)._canvasId, this);
                 }
-                return this._context;
+                return _idl.own(this)._context;
             }
             if (type === "webgl" || type === "webgl2" || type === "experimental-webgl") {
                 // FP parity: a real OffscreenCanvas exposes WebGL. Some
@@ -1805,17 +1963,18 @@
                 // supports WebGL).
                 // Back it with the same profile-spoofed context that <canvas>
                 // getContext uses (canvas_bootstrap.js:1232-1234).
-                if (!this._canvasId) {
-                    this._canvasId = ops.op_canvas_create(this.width, this.height, _getOsName(), _getCanvasSeed());
+                if (!_idl.own(this)._canvasId) {
+                    _idl.own(this)._canvasId = ops.op_canvas_create(this.width, this.height, _getOsName(), _getCanvasSeed());
                 }
                 const _k = (type === "webgl2") ? "_glctx2" : "_glctx1";
                 if (!this[_k]) {
                     const isV2 = (type === "webgl2");
                     const gl = isV2
-                        ? new WebGL2RenderingContext(this._canvasId, this.width, this.height)
-                        : new WebGLRenderingContext(this._canvasId, this.width, this.height);
-                    gl._isWebGL2 = isV2;
-                    gl.canvas = this;
+                        ? new WebGL2RenderingContext(_idl.own(this)._canvasId, this.width, this.height)
+                        : new WebGLRenderingContext(_idl.own(this)._canvasId, this.width, this.height);
+                    const st = _gl(gl);
+                    st.isWebGL2 = isV2;
+                    st.canvas = this;
                     this[_k] = gl;
                 }
                 return this[_k];
@@ -1827,18 +1986,18 @@
             return {
                 width: self.width,
                 height: self.height,
-                _canvasId: self._canvasId,
+                _canvasId: _idl.own(self)._canvasId,
                 close() {},
             };
         }
         async convertToBlob(options) {
             const type = (options && options.type) || "image/png";
-            if (!this._canvasId) {
+            if (!_idl.own(this)._canvasId) {
                 return new Blob([], { type });
             }
             // toDataURL returns `data:<type>;base64,<data>` — strip
             // the prefix and decode to bytes for a real Blob body.
-            const url = ops.op_canvas_to_data_url(this._canvasId);
+            const url = ops.op_canvas_to_data_url(_idl.own(this)._canvasId);
             const comma = url.indexOf(",");
             if (comma < 0) return new Blob([], { type });
             const b64 = url.slice(comma + 1);
@@ -1905,7 +2064,7 @@
         // returned by `document.getElementById(...)` have that prototype
         // in their chain — not the standalone one — so without this
         // mirror, `elem.getContext` is `undefined` on every parsed canvas.
-        // The standalone methods read `this._canvasId` (initialised lazily
+        // The standalone methods read `_idl.own(this)._canvasId` (initialised lazily
         // via `_lazyInitCanvas`), which works for both kinds of canvas.
         if (_domCanvasProto && _domCanvasProto !== _HTMLCanvasProto) {
             for (const name of ['getContext', 'toDataURL', 'toBlob', 'transferControlToOffscreen']) {

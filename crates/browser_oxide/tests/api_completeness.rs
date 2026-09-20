@@ -79,11 +79,11 @@ async fn ctor_highlight_registry_exists() {
 /// Having it was a difference in the direction that gets reported as an unusual
 /// window property, so the expectation is inverted rather than the name restored.
 #[tokio::test]
-async fn ctor_css_pseudo_element_is_absent_like_in_chrome() {
+async fn ctor_css_pseudo_element_exists_like_in_chrome() {
     let t = evaluate("typeof globalThis.CSSPseudoElement").await;
     assert_eq!(
-        t, "undefined",
-        "CSSPseudoElement нет в глобалах Chrome — не должно быть и у нас"
+        t, "function",
+        "Chrome 152 отдаёт CSSPseudoElement в глобалах — должен быть и у нас"
     );
 }
 #[tokio::test]

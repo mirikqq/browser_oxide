@@ -42,7 +42,8 @@ async fn stealth_invariants_hold() {
     );
     // User-Agent matches the selected profile (coherence).
     let ua = p.evaluate("navigator.userAgent").unwrap();
-    assert!(ua.contains("Chrome/148"), "unexpected UA: {ua}");
+    let expected = format!("Chrome/{}.0.0.0", browser_oxide::net::tls::UA_CHROME_MAJOR);
+    assert!(ua.contains(&expected), "unexpected UA: {ua}");
     // Real navigators expose these; empty/missing is a tell.
     assert!(
         p.evaluate("navigator.languages.length")

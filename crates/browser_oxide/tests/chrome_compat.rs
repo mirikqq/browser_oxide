@@ -2392,6 +2392,42 @@ async fn worker_hardware_concurrency_matches_window() {
     assert_eq!(page.evaluate("window.__whc").unwrap(), expected);
 }
 
+/// `navigator.deviceMemory` is capped at 8 by the Device Memory spec, and
+/// the window path clamps it — the Worker path did not, so a profile
+/// carrying the machine's physical RAM (presets sample 16/18/32/36 to feed
+/// the Sec-CH-Device-Memory header) reported 8 on the window and the raw
+/// figure inside a Worker: an impossible value AND a cross-context
+/// contradiction, in the one place a fingerprint script looks for exactly
+/// that disagreement.
+#[tokio::test]
+async fn worker_device_memory_is_clamped_like_window() {
+    use browser_oxide::stealth::presets;
+    let mut profile = presets::chrome_148_windows();
+    profile.device_memory = 32; // physical RAM, as the samplers assign
+                                // https:// origin: `navigator.deviceMemory` is [SecureContext], so the
+                                // window side reads `undefined` on a plain from_html page.
+    let mut page = Page::from_html_with_url(&html(""), "https://example.com/", Some(profile))
+        .await
+        .unwrap();
+    page.evaluate(
+        r#"window.__wmem = null;
+        const src = 'self.postMessage(String(navigator.deviceMemory));';
+        const w = new Worker(URL.createObjectURL(new Blob([src],{type:'text/javascript'})));
+        w.onmessage = e => { window.__wmem = e.data; w.terminate(); };"#,
+    )
+    .unwrap();
+    page.evaluate_async("void 0", std::time::Duration::from_millis(500))
+        .await
+        .ok();
+    let in_worker = page.evaluate("window.__wmem").unwrap();
+    assert_eq!(in_worker, "8", "Worker must report the clamped value");
+    assert_eq!(
+        in_worker,
+        page.evaluate("String(navigator.deviceMemory)").unwrap(),
+        "window and Worker must agree"
+    );
+}
+
 // --- screen.availTop per-OS consistency ---
 // On macOS the 25px menu bar means availTop=25 (not 0).
 // On Windows/Linux there is no top bar so availTop=0.
@@ -3420,15 +3456,17 @@ async fn perf_now_is_finite_non_negative() {
 }
 
 #[tokio::test]
-async fn perf_now_hot_loop_produces_distinct_values() {
-    // 500 hot calls; expect more than 10 distinct values (real Chrome shows
-    // dozens-to-hundreds; pure quantizer shows ~1).
+async fn perf_now_hot_loop_stays_on_chromes_grid() {
+    // Chrome 153, same loop: one distinct value, every reading exactly on the
+    // 100 µs grid. The old assertion here (">10 distinct values") described a
+    // jittered clock this engine deliberately no longer has — off-grid
+    // readings are the detectable shape, not on-grid repetition.
     assert_eq!(
         check(
             "(() => { \
               const xs = []; \
               for (let i = 0; i < 500; i++) xs.push(performance.now()); \
-              return new Set(xs).size > 10; \
+              return xs.every((v) => Math.abs(v * 10 - Math.round(v * 10)) < 1e-6); \
              })()"
         )
         .await,
@@ -4449,6 +4487,55 @@ async fn reddit_smoke() {
     );
 }
 
+/// `PerformanceResourceTiming.name` used to be hardcoded to
+/// "https://example.com/placeholder" for every Rust-recorded sub-resource
+/// fetch (`op_perf_get_resource_timings`), regardless of what was
+/// actually fetched — a page whose own resource-timing entries reference
+/// a domain absent from its DOM entirely. Navigates somewhere with real
+/// external scripts/CSS and asserts none of the reported names is that
+/// placeholder, and that at least one genuinely matches a `<script src>`
+/// on the page.
+#[tokio::test]
+#[ignore = "network: hits reddit.com"]
+async fn resource_timing_names_are_real_urls() {
+    let profile = browser_oxide::stealth::presets::chrome_148_macos();
+    let mut page = Page::navigate("https://www.reddit.com/", profile, 5)
+        .await
+        .expect("navigate to reddit.com");
+
+    let js = r#"(() => {
+        const names = performance.getEntriesByType('resource').map(r => r.name);
+        const scriptSrcs = Array.from(document.querySelectorAll('script[src]')).map(s => s.src);
+        return JSON.stringify({ names, scriptSrcs });
+    })()"#;
+    let out = page.evaluate(js).expect("evaluate resource names");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+    let names: Vec<&str> = parsed["names"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    let script_srcs: Vec<&str> = parsed["scriptSrcs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+
+    assert!(
+        !names.iter().any(|n| n.contains("example.com/placeholder")),
+        "resource-timing entry still carries the hardcoded placeholder: {names:?}"
+    );
+    if !script_srcs.is_empty() {
+        assert!(
+            names.iter().any(|n| script_srcs.contains(n)),
+            "expected at least one resource-timing name to match a real <script src>; \
+             names={names:?} script_srcs={script_srcs:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn fingerprint_probe_vs_chrome() {
     let js = r#"(() => {
@@ -4830,7 +4917,7 @@ async fn check_payment_request_surface() {
     println!("PAYMENT REQUEST SYNC CHECK:\n{}", sync_result);
 
     assert!(sync_result.contains("\"PaymentRequest_typeof\": \"function\""));
-    assert!(sync_result.contains("\"PaymentRequest_length\": 2"));
+    assert!(sync_result.contains("\"PaymentRequest_length\": 1"));
     assert!(sync_result.contains("\"PaymentResponse_typeof\": \"function\""));
     assert!(sync_result.contains("\"PaymentMethodChangeEvent_typeof\": \"function\""));
     assert!(sync_result.contains("\"PaymentRequestUpdateEvent_typeof\": \"function\""));
@@ -5990,7 +6077,7 @@ async fn keystroke_schedule_slot_installed_and_monotonic() {
     let result = check(
         r#"
         (() => {
-            const fn = (function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return {};})().keystrokes;
+            const fn = (function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return {};})().keystrokes;
             if (typeof fn !== 'function') return JSON.stringify({err: 'slot missing'});
             const sch = fn('abc', 50);
             if (!Array.isArray(sch) || sch.length === 0) return JSON.stringify({err: 'empty schedule', sch});
@@ -6041,7 +6128,7 @@ async fn behavior_rand_slot_installed_and_in_unit_range() {
     let result = check(
         r#"
         (() => {
-            const fn = (function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return {};})().rand;
+            const fn = (function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return {};})().rand;
             if (typeof fn !== 'function') return JSON.stringify({err: 'slot missing'});
             const a = fn();
             const b = fn();
@@ -6190,7 +6277,7 @@ async fn raf_cadence_jitter() {
     let result = check(
         r#"
         (() => {
-            const fn = (function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return {};})().rafDelayMs;
+            const fn = (function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return {};})().rafDelayMs;
             if (typeof fn !== 'function') return JSON.stringify({err: 'sampler missing'});
             const n = 1000;
             const xs = new Array(n);

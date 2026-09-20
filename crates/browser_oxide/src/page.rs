@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-const DEVVIEW_CANVAS_MANIFEST_JS: &str = r#"(function(){return JSON.stringify([].map.call(document.querySelectorAll('canvas'),function(c,i){var r=c.getBoundingClientRect(),s=getComputedStyle(c);return{canvas_index:i,id:c._canvasId|0,rect:[r.left,r.top,r.width,r.height],viewport:[innerWidth,innerHeight],dpr:devicePixelRatio||1,visible:s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)>0&&r.width>0&&r.height>0};}));})()"#;
+const DEVVIEW_CANVAS_MANIFEST_JS: &str = r#"(function(){var _bo=(function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})();var _cid=function(c){return (_bo&&_bo.idl)?(_bo.idl.read(c,'_canvasId',0)|0):0;};return JSON.stringify([].map.call(document.querySelectorAll('canvas'),function(c,i){var r=c.getBoundingClientRect(),s=getComputedStyle(c);return{canvas_index:i,id:_cid(c),rect:[r.left,r.top,r.width,r.height],viewport:[innerWidth,innerHeight],dpr:devicePixelRatio||1,visible:s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)>0&&r.width>0&&r.height>0};}));})()"#;
 
 /// Stable address of a document realm in the diagnostic frame tree.
 #[doc(hidden)]
@@ -558,6 +558,19 @@ impl Drop for Page {
 
 /// JS that resolves the engine's symbol-keyed internal namespace.
 ///
+/// A `<link rel=preload as=...>` kind mapped to its fetch destination and
+/// whether the load is CORS-mode. Fonts are CORS-fetched even same-origin,
+/// so they carry an `Origin`; the rest are `no-cors` and do not.
+fn preload_dest(kind: &str) -> (&'static str, bool) {
+    match kind {
+        "font" => ("font", true),
+        "style" => ("style", false),
+        "image" => ("image", false),
+        "script" => ("script", false),
+        _ => ("empty", false),
+    }
+}
+
 /// Host-injected scripts run after `cleanup_bootstrap` has removed `Deno`, so
 /// they need a handle left behind by the bootstrap. It is symbol-keyed rather
 /// than a `__bo_*` global because `Object.getOwnPropertyNames(window)` — the
@@ -567,9 +580,9 @@ impl Drop for Page {
 /// document announces it is ready — the point a browser has already issued
 /// those requests. Markup images never pass through `setAttribute`, so this
 /// is the only thing that gets them loaded.
-const IMG_SCAN: &str = "(function(){var ns=null;try{var y=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<y.length;i++){var v=globalThis[y[i]];if(v&&v.__bo){ns=v;break;}}}catch(e){}try{if(ns&&ns.images)ns.images.scan();}catch(e){}})();";
+const IMG_SCAN: &str = "(function(){var ns=null;try{var y=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<y.length;i++){var v=globalThis[y[i]];if(v&&v.__bo){ns=v;break;}}}catch(e){}try{if(ns&&ns.images)ns.images.scan();}catch(e){}})();";
 
-const NS_RESOLVE: &str = "(function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()";
+const NS_RESOLVE: &str = "(function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()";
 
 /// Tell the DOM which script the host is about to run.
 ///
@@ -769,8 +782,11 @@ impl Page {
         let stylesheet_entries = stylesheet_collector::find_stylesheets(&dom);
         let stylesheets = stylesheet_collector::resolve_inline_only(&stylesheet_entries);
 
-        // Swap DOM in existing runtime (no new V8 isolate needed)
-        self.event_loop.runtime_mut().replace_dom(dom, stylesheets);
+        // Swap DOM in existing runtime (no new V8 isolate needed). This path
+        // fetches no external CSS, so there is none to carry across.
+        self.event_loop
+            .runtime_mut()
+            .replace_dom(dom, stylesheets, Vec::new());
 
         // Drop old iframe children
         self.children.clear();
@@ -814,6 +830,9 @@ impl Page {
         profile: Option<crate::stealth::StealthProfile>,
     ) -> Result<Self, deno_core::error::AnyError> {
         let dom = crate::html_parser::parse_html(html);
+        // Taken before `dom` moves into the runtime below; the fetches happen
+        // after the document's own scripts have run.
+        let preload_entries = stylesheet_collector::find_preloads(&dom);
 
         // Install CSP from any meta-tags present in the HTML (this code
         // path is for tests / synthetic HTML — there are no response
@@ -908,9 +927,13 @@ impl Page {
                                 event_loop.execute_script(&set_current_script_js(script.node_id));
                             if script.is_async {
                                 // Held back until after DOMContentLoaded — see
-                                // `cold_async` below.
-                                cold_async.push((src.clone(), code));
-                            } else if let Err(e) = event_loop.execute_script(&code) {
+                                // `cold_async` below. Carry the absolute URL, not
+                                // the raw attribute: stack frames report the
+                                // resolved script URL in Chrome.
+                                cold_async.push((full_url.clone(), code));
+                            } else if let Err(e) =
+                                event_loop.execute_script_with_name(&code, &full_url)
+                            {
                                 tracing::warn!(script_src = %src, error = %e, "Script error in external script");
                             }
                             let _ = event_loop.execute_script(&clear_current_script_js());
@@ -921,9 +944,13 @@ impl Page {
                     }
                 }
             } else if !script.code.is_empty() {
+                // Named with the document URL, as Chrome names inline scripts —
+                // the warm paths already did this; this one was left unnamed, so
+                // every frame from a page script read `<anonymous>`, which is
+                // exactly what Talon's `caller_stack_trace` collects.
                 // document.currentScript parity (see build_page_with_scripts_init_and_storage).
                 let _ = event_loop.execute_script(&set_current_script_js(script.node_id));
-                if let Err(e) = event_loop.execute_script(&script.code) {
+                if let Err(e) = event_loop.execute_script_with_name(&script.code, url) {
                     tracing::warn!(script_index = i, error = %e, "Script error in inline script");
                 }
                 let _ = event_loop.execute_script(&clear_current_script_js());
@@ -936,7 +963,7 @@ impl Page {
         // `globalThis.__browser_oxide.__documentReadyState = ...` assignments preserve
         // enumerable=false (writable=true, descriptor inherited).
         event_loop
-            .execute_script("(((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__documentReadyState = 'loading';")
+            .execute_script("(((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__documentReadyState = 'loading';")
             .ok();
 
         // Spec order ("the end", steps 4-5): readyState becomes "interactive"
@@ -947,7 +974,7 @@ impl Page {
         // an event that has already fired, so it loads, exposes its whole API and
         // silently never renders. hCaptcha's auto-render is one of these.
         event_loop
-            .execute_script("(((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__documentReadyState = 'interactive';")
+            .execute_script("(((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__documentReadyState = 'interactive';")
             .ok();
 
         // Fire DOMContentLoaded and load events — many scripts wait for these
@@ -956,6 +983,24 @@ impl Page {
                 &format!("{IMG_SCAN}document.dispatchEvent(new Event('DOMContentLoaded', {{bubbles: true}}));"),
             )
             .ok();
+
+        // Preloaded subresources. Chrome fetches every `rel=preload` /
+        // `modulepreload` / `stylesheet` target during navigation; skipping
+        // them left the page's fonts and stylesheets never requested at all,
+        // which the origin server sees without running any script.
+        {
+            let preloads = preload_entries;
+            for entry in preloads {
+                let Some(full) = Self::resolve_url(url, &entry.href) else {
+                    continue;
+                };
+                let (dest, cors) = preload_dest(&entry.kind);
+                let hdrs = crate::net::headers::nav_headers_subresource(&p, &full, url, dest, cors);
+                if let Err(e) = client.get_with_exact_headers(&full, &hdrs).await {
+                    tracing::debug!(preload = %full, kind = %entry.kind, error = %e, "preload fetch failed");
+                }
+            }
+        }
 
         // Async scripts, now that the page's own DOMContentLoaded handlers have
         // run and built whatever markup they build.
@@ -972,7 +1017,7 @@ impl Page {
         // readyState stuck at 'interactive' forever. The nav loop then believes the
         // page never finished and burns its whole budget on a page that is done.
         event_loop
-            .execute_script("(((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__documentReadyState = 'complete';")
+            .execute_script("(((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__documentReadyState = 'complete';")
             .ok();
 
         event_loop
@@ -1363,6 +1408,7 @@ impl Page {
                     match iframe::ChildIframe::from_url(
                         info.node_id,
                         &full_src,
+                        base_url,
                         client,
                         Some(profile),
                     )
@@ -1966,7 +2012,7 @@ impl Page {
     /// Generic navigation entry point.
     ///
     /// Loops by re-fetching whenever a script sets
-    /// `(((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).__pendingNavigation` (via `location.reload`,
+    /// `(((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).__pendingNavigation` (via `location.reload`,
     /// `location.href = ...`, `location.assign/replace`, or a
     /// `<meta http-equiv="refresh">` tag). Each iteration drops the
     /// previous V8 isolate and builds a fresh one — identical to how a
@@ -2063,11 +2109,19 @@ impl Page {
     /// 4-arg `navigate_with_init` forwards here with `default_solvers()`.
     pub async fn navigate_with_init_solvers(
         url: &str,
-        profile: crate::stealth::StealthProfile,
+        mut profile: crate::stealth::StealthProfile,
         max_iterations: u8,
         init_scripts: Vec<String>,
         solvers: std::sync::Arc<[std::sync::Arc<dyn crate::ChallengeSolver>]>,
     ) -> Result<Self, deno_core::error::AnyError> {
+        // Align locale/timezone/geo with the address the traffic actually
+        // leaves from, before the client (Accept-Language) and the first
+        // request are built — otherwise the profile's preset timezone (e.g.
+        // Europe/Amsterdam) rides out over an exit IP on another continent.
+        // Gated to proxy/forced runs so the offline test suite makes no
+        // network call; see `egress::align_to_egress`.
+        crate::stealth::egress::align_to_egress(&mut profile).await;
+
         let client = crate::net::HttpClient::shared(&profile)
             .map_err(|e| deno_core::error::AnyError::msg(e.to_string()))?;
 
@@ -2199,8 +2253,15 @@ impl Page {
             .collect();
         let html = resp.text();
         let resp_url = resp.url.clone();
-        let timings = resp.timings.clone();
-        let mut page = Self::navigate_loop_internal(
+        // The top-level document's own fetch is NOT a `resource` entry —
+        // per the Resource Timing spec it lives exclusively in
+        // `performance.getEntriesByType('navigation')`. It used to be
+        // pushed here too, which planted a spurious self-referencing
+        // entry into every page's own resource list — invisible while
+        // every entry shared one hardcoded placeholder name, but a clear
+        // "the document showed up as its own sub-resource" tell now that
+        // names are real.
+        let page = Self::navigate_loop_internal(
             html,
             resp_url,
             profile,
@@ -2215,10 +2276,6 @@ impl Page {
             solvers,
         )
         .await?;
-
-        page.event_loop()
-            .runtime_mut()
-            .record_resource_timing(timings);
         Ok(page)
     }
 
@@ -2298,7 +2355,7 @@ impl Page {
     /// - the symbol-keyed input buffer (mouse / key / touch / scroll
     ///   buffers + counters) — humanize.js re-installs into these and
     ///   sensors read them on POST, so stale values would skew detection.
-    /// - `(((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).__jsCookies` — cookie cache snapshot (the real
+    /// - `(((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).__jsCookies` — cookie cache snapshot (the real
     ///   source of truth is the HTTP client's jar, re-synced below).
     /// - `globalThis.__keepLongTimersRefed` — per-navigation challenge
     ///   flag; left set, it would pin long timers on every later page.
@@ -2319,7 +2376,7 @@ impl Page {
                 // V8 heap per load of a heavy page.
                 const _h = (function () {
                     try {
-                        const s = Object.getOwnPropertySymbols(globalThis);
+                        const s = Object.getOwnPropertySymbols(globalThis,1);
                         for (let i = 0; i < s.length; i++) {
                             const v = globalThis[s[i]];
                             if (v && v.__bo && v.host) return v.host;
@@ -2346,7 +2403,7 @@ impl Page {
                 const w = (g.window && g.window !== g) ? g.window : g;
                 try { if (Array.isArray(w.__cookieWrites)) w.__cookieWrites.length = 0; } catch (_) {}
                 try { if (Array.isArray(w.__scriptErrors)) w.__scriptErrors.length = 0; } catch (_) {}
-                var _ns = (function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})();
+                var _ns = (function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})();
                 if (_ns && _ns.input) {
                     _ns.input.mouse.length = 0;
                     _ns.input.key.length = 0;
@@ -2478,13 +2535,16 @@ impl Page {
             .collect();
         let html = resp.text();
         let resp_url = resp.url.clone();
-        let timings = resp.timings.clone();
         drop(resp);
         wmark!("fetch done");
 
         // Install CSP for this navigation (same logic as the cold build).
+        let preload_entries;
         {
             let csp_dom = crate::html_parser::parse_html(&html);
+            // Same parse serves the preload scan — Chrome issues these as soon
+            // as the parser sees the link, before the document's scripts run.
+            preload_entries = stylesheet_collector::find_preloads(&csp_dom);
             let header_refs: Vec<&str> = csp_headers.iter().map(|s| s.as_str()).collect();
             let report_refs: Vec<&str> = csp_headers_ro.iter().map(|s| s.as_str()).collect();
             let policy_set = crate::csp_collector::collect_csp_with_report_only(
@@ -2508,6 +2568,33 @@ impl Page {
                 crate::js_runtime::extensions::fetch_ext::clear_csp_policy();
             }
         }
+
+        // Preloaded fonts. Chrome fetches every `rel=preload as=font` target
+        // during navigation — six of them on Epic's login page — and we
+        // fetched none, so the origin server saw a client that took the JS and
+        // never once asked for a font. Stylesheets and scripts are left to the
+        // paths that already fetch them; only fonts had no owner.
+        let mut preload_timings: Vec<(String, u64, crate::net::TimingStats)> = Vec::new();
+        {
+            for entry in preload_entries.iter().filter(|e| e.kind == "font") {
+                let Some(full) = Self::resolve_url(&resp_url, &entry.href) else {
+                    continue;
+                };
+                let (dest, cors) = preload_dest(&entry.kind);
+                let hdrs = crate::net::headers::nav_headers_subresource(
+                    &profile, &full, &resp_url, dest, cors,
+                );
+                match client.get_with_exact_headers(&full, &hdrs).await {
+                    Ok(r) => {
+                        let size = r.body.len() as u64;
+                        preload_timings.push((full, size, r.timings));
+                    }
+                    Err(e) => {
+                        tracing::debug!(preload = %full, error = %e, "font preload failed");
+                    }
+                }
+            }
+        }
         wmark!("CSP set");
 
         // Parse + find subresources. Parsing the same DOM twice (once
@@ -2520,23 +2607,40 @@ impl Page {
         // Parallel fetch external CSS + external scripts. Mirrors the
         // cold build path; we only inline the bits we actually need
         // here so this method stays self-contained.
-        let mut inline_css: Vec<String> = Vec::new();
+        // Slots keep document order across the async fetch: inline sheets fill
+        // theirs immediately, external ones once their body lands. Collecting
+        // inline-then-external instead put every `<link>` after every
+        // `<style>`, which inverts the cascade whenever a page inlines
+        // overrides after a linked sheet — and reorders `document.fonts`.
+        let mut css_slots: Vec<Option<String>> = Vec::with_capacity(stylesheet_entries.len());
+        let mut external_slots: Vec<usize> = Vec::new();
         let css_futures: Vec<_> = stylesheet_entries
             .iter()
             .filter_map(|entry| match entry {
                 stylesheet_collector::StylesheetEntry::Inline(css) => {
-                    inline_css.push(css.clone());
+                    css_slots.push(Some(css.clone()));
                     None
                 }
                 stylesheet_collector::StylesheetEntry::External(href) => {
                     let full_url = Self::resolve_url(&resp_url, href)?;
+                    external_slots.push(css_slots.len());
+                    css_slots.push(None);
                     let client = client.clone();
+                    let referer = resp_url.clone();
                     Some(async move {
-                        match client.get(&full_url).await {
+                        let hdrs = crate::net::headers::nav_headers_subresource(
+                            client.profile(),
+                            &full_url,
+                            &referer,
+                            "style",
+                            false,
+                        );
+                        match client.get_with_exact_headers(&full_url, &hdrs).await {
                             Ok(r) if r.ok() => {
                                 let text = r.text();
                                 if !text.trim_start().starts_with("<!") {
-                                    Some((text, r.timings.clone()))
+                                    let size = text.len() as u64;
+                                    Some((text, full_url, size, r.timings.clone()))
                                 } else {
                                     None
                                 }
@@ -2576,18 +2680,16 @@ impl Page {
                 let profile = profile.clone();
                 let referer = resp_url.clone();
                 Some((i, async move {
-                    // Script fetches inherit the parent doc's
-                    // regional accept-language (real Chrome sends one
-                    // accept-language per session, not per-URL — keyed off
-                    // the doc URL keeps sub-resource requests consistent).
-                    let mut hdrs = crate::net::headers::nav_headers_for_url(&profile, &referer, false);
-                    hdrs.push(("referer".to_string(), referer));
-                    hdrs.push(("accept".to_string(), "*/*".to_string()));
-                    hdrs.push(("sec-fetch-dest".to_string(), "script".to_string()));
-                    hdrs.push(("sec-fetch-mode".to_string(), "no-cors".to_string()));
-                    hdrs.push(("sec-fetch-site".to_string(), "cross-site".to_string()));
+                    // `sec-fetch-site` was hardcoded `cross-site`, so the
+                    // page's own first-party scripts announced themselves as
+                    // third-party; and the nav base underneath left
+                    // `upgrade-insecure-requests` and `sec-fetch-user: ?1` on
+                    // a subresource that can carry neither.
+                    let hdrs = crate::net::headers::nav_headers_subresource(
+                        &profile, &full_url, &referer, "script", false,
+                    );
                     let dbg = std::env::var("BROWSER_OXIDE_DEBUG_NAV").is_ok();
-                    match client.get_follow_with_headers(&full_url, &hdrs, 5).await {
+                    match client.get_follow_exact_headers(&full_url, &hdrs, 5).await {
                         Ok(r) if r.ok() => {
                             let text = r.text();
                             if text.trim_start().starts_with("<!")
@@ -2657,17 +2759,32 @@ impl Page {
         .await;
         wmark!("subresources fetched");
 
-        let mut all_timings = vec![timings];
-        let mut stylesheets = inline_css;
-        for r in fetched_css.into_iter().flatten() {
-            stylesheets.push(r.0);
-            all_timings.push(r.1);
+        // No document-level entry seeded here: the top-level document's
+        // own fetch belongs exclusively to `getEntriesByType('navigation')`
+        // per spec, not `('resource')` — see the comment on the cold-nav
+        // `record_resource_timing` removal above for the full story.
+        let mut all_timings: Vec<(String, u64, crate::net::TimingStats)> = Vec::new();
+        // Preloaded fonts belong in `getEntriesByType('resource')` — Chrome
+        // lists them, and Talon ships that list in its payload.
+        all_timings.append(&mut preload_timings);
+        let mut external_css: Vec<String> = Vec::new();
+        for (slot, fetched) in external_slots.iter().zip(fetched_css) {
+            let Some(r) = fetched else { continue };
+            external_css.push(r.0.clone());
+            css_slots[*slot] = Some(r.0);
+            all_timings.push((r.1, r.2, r.3));
         }
+        let stylesheets: Vec<String> = css_slots.into_iter().flatten().collect();
         let mut prefetched: std::collections::HashMap<usize, String> =
             std::collections::HashMap::new();
+        // No timing pushed here for scripts (unlike CSS, just above): every
+        // script — sync or async — passes through `run_arrived!` below,
+        // which is the single place script resource-timing gets recorded,
+        // with the URL resolved against the *executing* script (correct
+        // for both a prefetched-but-not-yet-run sync script and one that
+        // arrives async). Recording here too would double up entries.
         for r in fetched_scripts.into_iter().flatten() {
             prefetched.insert(r.0, r.1);
-            all_timings.push(r.2);
         }
 
         // Cancel all in-flight timers from the previous page and clear
@@ -2677,12 +2794,16 @@ impl Page {
         wmark!("reset_for_reuse");
 
         // Swap DOM (also resets `TimerState` Rust-side).
-        self.event_loop.runtime_mut().replace_dom(dom, stylesheets);
+        self.event_loop
+            .runtime_mut()
+            .replace_dom(dom, stylesheets, external_css);
         self.children.clear();
         self.url = resp_url.clone();
         self.set_module_base_url(&resp_url);
-        for t in all_timings {
-            self.event_loop.runtime_mut().record_resource_timing(t);
+        for (u, sz, t) in all_timings {
+            self.event_loop
+                .runtime_mut()
+                .record_resource_timing(u, sz, t);
         }
         wmark!("replace_dom");
 
@@ -2774,7 +2895,6 @@ impl Page {
         macro_rules! run_arrived {
             ($item:expr) => {
                 if let Some((idx, code, timings)) = $item {
-                    self.event_loop.runtime_mut().record_resource_timing(timings);
                     // Resolved against the document, not taken raw. A `src` is
                     // usually relative, and for a `<script type="module">` this
                     // string becomes the module specifier: `ModuleSpecifier::parse`
@@ -2792,6 +2912,18 @@ impl Page {
                             .unwrap_or_else(|_| src.clone()),
                         None => resp_url.clone(),
                     };
+                    // Same resolved URL the script actually executes under —
+                    // real Chrome's `performance.getEntriesByType('resource')`
+                    // entry for a script matches its `src`, not some unrelated
+                    // placeholder domain. `code.len()` is the real decoded
+                    // body size — the same number `run_arrived!`'s own trace
+                    // print uses just below, not the always-zero the
+                    // resource-timing entry used to carry.
+                    self.event_loop.runtime_mut().record_resource_timing(
+                        name.clone(),
+                        code.len() as u64,
+                        timings,
+                    );
                     let len = code.len();
                     // `document.currentScript` for the warm path too — the cold
                     // build sets it around every script and this loop did not,
@@ -2914,11 +3046,11 @@ impl Page {
         // handler then waits for an event that has already fired.
         let _ = self.event_loop.execute_script(
             r#"setTimeout(() => {
-                (((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__documentReadyState = 'interactive';
-                (function(){var ns=null;try{var y=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<y.length;i++){var v=globalThis[y[i]];if(v&&v.__bo){ns=v;break;}}}catch(e){}try{if(ns&&ns.images)ns.images.scan();}catch(e){}})();
+                (((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__documentReadyState = 'interactive';
+                (function(){var ns=null;try{var y=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<y.length;i++){var v=globalThis[y[i]];if(v&&v.__bo){ns=v;break;}}}catch(e){}try{if(ns&&ns.images)ns.images.scan();}catch(e){}})();
                 document.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true}));
                 window.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true}));
-                (((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__documentReadyState = 'complete';
+                (((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__documentReadyState = 'complete';
                 window.dispatchEvent(new Event('load'));
             }, 0);"#,
         );
@@ -2953,7 +3085,7 @@ impl Page {
                     const delay = parseInt(match[1], 10) || 0;
                     const target = ((match[2] || '').trim()).replace(/^['"]|['"]$/g, '') || location.href;
                     setTimeout(() => {
-                        ((((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo||{}).__pendingNavigation = { url: target, kind: 'assign' };
+                        ((((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo||{}).__pendingNavigation = { url: target, kind: 'assign' };
                         try { Deno.core.ops.op_set_pending_nav(); } catch (_) {}
                     }, delay * 1000);
                     break;
@@ -3059,7 +3191,7 @@ impl Page {
         }
 
         const PENDING_NAV_JS: &str = "(function(){\
-                const browser_oxide = (((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo;\
+                const browser_oxide = (((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo;\
                 const p = browser_oxide && browser_oxide.__pendingNavigation;\
                 if (p) browser_oxide.__pendingNavigation = null;\
                 return p ? JSON.stringify({url: p.url, method: p.method || 'GET', body: p.body, kind: p.kind}) : '';\
@@ -3756,7 +3888,7 @@ impl Page {
                         let fl = page
                             .event_loop()
                             .execute_script(
-                                "JSON.stringify(((((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo&&(((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__fetchLog)||[])",
+                                "JSON.stringify(((((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo&&(((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__fetchLog)||[])",
                             )
                             .unwrap_or_default();
                         let secck = page
@@ -4442,12 +4574,21 @@ impl Page {
                 stylesheet_collector::StylesheetEntry::External(href) => {
                     let full_url = Self::resolve_url(url, href)?;
                     let client = client.clone();
+                    let referer = url.to_string();
                     Some(async move {
-                        match client.get(&full_url).await {
+                        let hdrs = crate::net::headers::nav_headers_subresource(
+                            client.profile(),
+                            &full_url,
+                            &referer,
+                            "style",
+                            false,
+                        );
+                        match client.get_with_exact_headers(&full_url, &hdrs).await {
                             Ok(resp) if resp.ok() => {
                                 let text = resp.text();
                                 if !text.trim_start().starts_with("<!") {
-                                    Some((text, resp.timings.clone()))
+                                    let size = text.len() as u64;
+                                    Some((text, full_url, size, resp.timings.clone()))
                                 } else {
                                     None
                                 }
@@ -4492,14 +4633,9 @@ impl Page {
                 let client = client.clone();
                 let profile = profile.clone();
                 Some(async move {
-                    // Script fetches inherit parent doc's
-                    // regional accept-language (see lib.rs::get_with_headers).
-                    let mut hdrs = crate::net::headers::nav_headers_for_url(&profile, url, false);
-                    hdrs.push(("referer".to_string(), url.to_string()));
-                    hdrs.push(("accept".to_string(), "*/*".to_string()));
-                    hdrs.push(("sec-fetch-dest".to_string(), "script".to_string()));
-                    hdrs.push(("sec-fetch-mode".to_string(), "no-cors".to_string()));
-                    hdrs.push(("sec-fetch-site".to_string(), "cross-site".to_string()));
+                    let hdrs = crate::net::headers::nav_headers_subresource(
+                        &profile, &full_url, url, "script", false,
+                    );
 
                     // Instrumentation: trace the i.js
                     // external-script fetch to get hard evidence of
@@ -4513,7 +4649,7 @@ impl Page {
                     // fetched + its size/status. Env-gated, default off ⇒
                     // zero impact.
                     let sc_trace = std::env::var("BROWSER_OXIDE_SECCPT_TRACE").is_ok();
-                    match client.get_follow_with_headers(&full_url, &hdrs, 5).await {
+                    match client.get_follow_exact_headers(&full_url, &hdrs, 5).await {
                         Ok(resp) if resp.ok() => {
                             let text = resp.text();
                             if dd_trace {
@@ -4542,7 +4678,8 @@ impl Page {
                                 tracing::debug!(script_index = i, url = %full_url, "Script fetch returned HTML, skipping");
                                 None
                             } else {
-                                Some((i, text, resp.timings.clone()))
+                                let size = text.len() as u64;
+                                Some((i, text, full_url, size, resp.timings.clone()))
                             }
                         }
                         Ok(resp) => {
@@ -4588,16 +4725,18 @@ impl Page {
 
         // Build stylesheet list: inline first, then fetched external
         let mut stylesheets = inline_css;
-        for (css, timings) in fetched_css_results.into_iter().flatten() {
+        let mut external_css: Vec<String> = Vec::new();
+        for (css, res_url, size, timings) in fetched_css_results.into_iter().flatten() {
+            external_css.push(css.clone());
             stylesheets.push(css);
-            all_timings.push(timings);
+            all_timings.push((res_url, size, timings));
         }
 
         // Build pre-fetched script map
         let mut prefetched = std::collections::HashMap::new();
-        for (i, text, timings) in fetched_scripts_results.into_iter().flatten() {
+        for (i, text, res_url, size, timings) in fetched_scripts_results.into_iter().flatten() {
             prefetched.insert(i, text);
-            all_timings.push(timings);
+            all_timings.push((res_url, size, timings));
         }
 
         let runtime = BrowserJsRuntime::with_options(
@@ -4605,6 +4744,7 @@ impl Page {
             BrowserRuntimeOptions {
                 stealth_profile: Some(profile.clone()),
                 stylesheets,
+                external_stylesheets: external_css,
                 init_scripts: init_scripts.to_vec(),
                 storage,
                 is_secure_context: is_secure_url(url),
@@ -4615,8 +4755,8 @@ impl Page {
         mark!("BrowserJsRuntime::with_options (V8 isolate + bootstrap)");
 
         // Install all sub-resource timings
-        for timings in all_timings {
-            event_loop.runtime_mut().record_resource_timing(timings);
+        for (u, sz, t) in all_timings {
+            event_loop.runtime_mut().record_resource_timing(u, sz, t);
         }
         mark!("record_resource_timing");
 
@@ -4719,7 +4859,7 @@ impl Page {
             });
             const _origFetch = globalThis.fetch;
             globalThis.fetch = async function(input, init) {
-                const log = ((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host && ((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()).host.bo && ((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()).host.bo.__fetchLog;
+                const log = ((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host && ((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()).host.bo && ((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()).host.bo.__fetchLog;
                 const entry = { method: 'GET', url: '', hasBody: false };
                 let args = Array.from(arguments);
 
@@ -4823,7 +4963,7 @@ impl Page {
                     }
                     entry.reqHeaders = hdrs;
                 } catch {}
-                const log = ((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host && ((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()).host.bo && ((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()).host.bo.__fetchLog;
+                const log = ((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host && ((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()).host.bo && ((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()).host.bo.__fetchLog;
                 if (log) log.push(entry);
                 try {
                     const resp = await _origFetch.apply(this, args);
@@ -4859,7 +4999,7 @@ impl Page {
                 _XHR.prototype.send = function(body) {
                     const entry = this.__logEntry || { method: this._method||'GET', url: this._url||'', sync: !this._async };
                     entry.hasBody = body != null && body !== '';
-                    const log = ((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host && ((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()).host.bo && ((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()).host.bo.__fetchLog;
+                    const log = ((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host && ((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()).host.bo && ((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()).host.bo.__fetchLog;
                 if (log) log.push(entry);
                     const _origRSC = this.onreadystatechange;
                     const self = this;
@@ -4887,7 +5027,7 @@ impl Page {
         // scripts, which start below.
         event_loop
             .execute_script(
-                "(((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).__markGlobalsBaseline && (((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).__markGlobalsBaseline();",
+                "(((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).__markGlobalsBaseline && (((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).__markGlobalsBaseline();",
             )
             .ok();
         mark!("__markGlobalsBaseline");
@@ -5041,11 +5181,11 @@ impl Page {
                 // 'complete' for any navigated page — frameworks that gate
                 // mounting on readyState==='complete' (or poll it) would
                 // spin/never mount. Fire readystatechange on each transition.
-                try { (((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__documentReadyState = 'interactive'; } catch (_e) {}
+                try { (((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__documentReadyState = 'interactive'; } catch (_e) {}
                 document.dispatchEvent(new Event('readystatechange'));
                 // Each dispatch is isolated: one framework's throwing DOMContentLoaded
                 // handler must not skip the transition to 'complete' below.
-                try { (function(){var ns=null;try{var y=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<y.length;i++){var v=globalThis[y[i]];if(v&&v.__bo){ns=v;break;}}}catch(e){}try{if(ns&&ns.images)ns.images.scan();}catch(e){}})(); } catch (_e) {}
+                try { (function(){var ns=null;try{var y=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<y.length;i++){var v=globalThis[y[i]];if(v&&v.__bo){ns=v;break;}}}catch(e){}try{if(ns&&ns.images)ns.images.scan();}catch(e){}})(); } catch (_e) {}
                 try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true})); } catch (_e) {}
                 try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true})); } catch (_e) {}
             }, 0);
@@ -5055,7 +5195,7 @@ impl Page {
             // 'interactive' forever — the nav loop reads that as "still loading" and burns
             // its entire budget (~90s) on a page that has actually finished rendering.
             setTimeout(() => {
-                try { (((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__documentReadyState = 'complete'; } catch (_e) {}
+                try { (((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo.__documentReadyState = 'complete'; } catch (_e) {}
                 try { document.dispatchEvent(new Event('readystatechange')); } catch (_e) {}
                 try { window.dispatchEvent(new Event('load')); } catch (_e) {}
             }, 0);
@@ -5082,7 +5222,7 @@ impl Page {
                     const delay = parseInt(match[1], 10) || 0;
                     const target = ((match[2] || '').trim()).replace(/^['"]|['"]$/g, '') || location.href;
                     setTimeout(() => {
-                        ((((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo||{}).__pendingNavigation = {
+                        ((((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).bo||{}).__pendingNavigation = {
                             url: target,
                             kind: 'assign',
                         };
@@ -5105,7 +5245,7 @@ impl Page {
         // any short async chains kicked off by inline scripts.
         //
         // Important: `humanize.js` now schedules its synthetic mouse /
-        // scroll timers via `(((function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).__bgSetTimeout` (timer_bootstrap.js)
+        // scroll timers via `(((function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()||{}).host||{}).__bgSetTimeout` (timer_bootstrap.js)
         // which is `.unref()`'d — so the humanize setTimeouts no longer
         // pin this drain to its full ceiling. Benign pages exit idle in
         // milliseconds; anti-bot challenge pages (AWS WAF / reddit verify /
@@ -5201,6 +5341,7 @@ impl Page {
                         match iframe::ChildIframe::from_url(
                             info.node_id,
                             &full_src,
+                            url,
                             client,
                             Some(profile),
                         )

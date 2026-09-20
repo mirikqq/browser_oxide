@@ -4,6 +4,7 @@
 //! Uses quinn+h3 for HTTP/3 (QUIC) with automatic Alt-Svc discovery and fallback.
 
 pub mod alt_svc;
+pub mod background;
 pub mod blocker;
 pub mod compression;
 pub mod cookies;
@@ -42,6 +43,13 @@ use url::Url;
 pub enum Method {
     Get,
     Post(Vec<u8>),
+}
+
+fn http_port(url: &Url) -> Result<u16, NetError> {
+    match url.scheme() {
+        "http" | "https" => Ok(url.port_or_known_default().unwrap()),
+        scheme => Err(NetError::Http(format!("unsupported URL scheme: {scheme}"))),
+    }
 }
 
 /// HTTP response.
@@ -300,6 +308,41 @@ impl HttpClient {
     /// though the very next attempt from the same client succeeds; real
     /// browsers retry transparently, so a lone reset shouldn't sink the
     /// whole request.
+    /// Bound on the TLS handshake itself, separate from the connect
+    /// timeout inside [`Self::connect_tcp`].
+    ///
+    /// Without one, a handshake that stalls after the TCP connect is only
+    /// given up on by the OS — on macOS that is ~75 s, surfacing as a raw
+    /// `Operation timed out (os error 60)` long after the request should
+    /// have failed over. A browser never waits that long: it fails the
+    /// attempt and falls back (here: H2 -> H1), which is what this makes
+    /// possible.
+    ///
+    /// 15 s is deliberately generous — a healthy handshake to a CDN edge
+    /// completes in well under a second — so this only ever fires on a
+    /// genuinely stuck connection, never on a slow-but-live one.
+    const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+    async fn handshake_with_timeout(
+        &self,
+        connector: &SslConnector,
+        host: &str,
+        tcp_stream: tokio::net::TcpStream,
+    ) -> Result<tokio_boring2::SslStream<tokio::net::TcpStream>, NetError> {
+        match tokio::time::timeout(
+            Self::TLS_HANDSHAKE_TIMEOUT,
+            tls::connect_tls(connector, &self.profile, host, tcp_stream),
+        )
+        .await
+        {
+            Ok(res) => res,
+            Err(_) => Err(NetError::Tls(format!(
+                "TLS handshake to {host} timed out after {}s",
+                Self::TLS_HANDSHAKE_TIMEOUT.as_secs()
+            ))),
+        }
+    }
+
     async fn connect_tcp_tls(
         &self,
         connector: &SslConnector,
@@ -307,13 +350,41 @@ impl HttpClient {
         port: u16,
     ) -> Result<tokio_boring2::SslStream<tokio::net::TcpStream>, NetError> {
         let tcp_stream = self.connect_tcp(host, port).await?;
-        match tls::connect_tls(connector, &self.profile, host, tcp_stream).await {
+        match self
+            .handshake_with_timeout(connector, host, tcp_stream)
+            .await
+        {
             Ok(stream) => Ok(stream),
             Err(e) if is_connection_reset(&e) => {
                 let tcp_stream = self.connect_tcp(host, port).await?;
-                tls::connect_tls(connector, &self.profile, host, tcp_stream).await
+                self.handshake_with_timeout(connector, host, tcp_stream)
+                    .await
             }
             Err(e) => Err(e),
+        }
+    }
+
+    async fn send_h1(
+        &self,
+        url: &Url,
+        headers: &[(String, String)],
+        body: Option<&[u8]>,
+    ) -> Result<h1_client::RawResponse, NetError> {
+        let port = http_port(url)?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| NetError::Http("URL has no host".into()))?;
+        let authority = &url[url::Position::BeforeHost..url::Position::AfterPort];
+        let path = &url[url::Position::BeforePath..url::Position::AfterQuery];
+        let method = if body.is_some() { "POST" } else { "GET" };
+        if url.scheme() == "http" {
+            let mut stream = self.connect_tcp(host, port).await?;
+            h1_client::send_request(&mut stream, method, authority, path, headers, body).await
+        } else {
+            let mut stream = self
+                .connect_tcp_tls(&self.tls_connector, host, port)
+                .await?;
+            h1_client::send_request(&mut stream, method, authority, path, headers, body).await
         }
     }
 
@@ -593,7 +664,9 @@ impl HttpClient {
     /// Connect TCP+TLS and perform HTTP/2 handshake, returning a sender.
     /// Also spawns the connection driver task.
     async fn connect_h2(&self, host: &str, port: u16) -> Result<SendRequest<Bytes>, NetError> {
-        let tls_stream = self.connect_tcp_tls(&self.tls_connector, host, port).await?;
+        let tls_stream = self
+            .connect_tcp_tls(&self.tls_connector, host, port)
+            .await?;
 
         // Check ALPN
         let alpn = tls::negotiated_alpn(&tls_stream);
@@ -695,7 +768,7 @@ impl HttpClient {
         let host = parsed
             .host_str()
             .ok_or_else(|| NetError::Http(format!("no host in URL: {url}")))?;
-        let port = parsed.port().unwrap_or(443);
+        let port = http_port(&parsed)?;
 
         let mut hdrs: Vec<(String, String)> = headers
             .iter()
@@ -714,6 +787,9 @@ impl HttpClient {
         }
 
         let response = 'h2: {
+            if parsed.scheme() == "http" {
+                break 'h2 None;
+            }
             for attempt in 0..2 {
                 let sender_res = self.get_sender(host, port).await;
                 let mut sender = match sender_res {
@@ -752,12 +828,6 @@ impl HttpClient {
         let response = match response {
             Some(r) => r,
             None => {
-                let mut tls_stream = self.connect_tcp_tls(&self.tls_connector, host, port).await?;
-                let path = if parsed.query().is_some() {
-                    format!("{}?{}", parsed.path(), parsed.query().unwrap())
-                } else {
-                    parsed.path().to_string()
-                };
                 if url.contains("/mfc")
                     || url.contains("/akam/13")
                     || url.contains("/tl")
@@ -768,7 +838,7 @@ impl HttpClient {
                         url, hdrs
                     );
                 }
-                let raw = h1_client::send_get(&mut tls_stream, host, &path, &hdrs).await?;
+                let raw = self.send_h1(&parsed, &hdrs, None).await?;
                 self.build_response_from_raw(raw, url, "GET", &hdrs, &[])
                     .await?
             }
@@ -819,7 +889,7 @@ impl HttpClient {
         let host = parsed
             .host_str()
             .ok_or_else(|| NetError::Http(format!("no host in URL: {url}")))?;
-        let port = parsed.port().unwrap_or(443);
+        let port = http_port(&parsed)?;
 
         // Browser-aware nav headers. For Chrome, may upgrade to high-entropy
         // Client Hints if this origin has sent Accept-CH. Firefox profiles
@@ -842,6 +912,9 @@ impl HttpClient {
         // connection has been closed by the server (GOAWAY), retry once with
         // a fresh connection.
         let response = 'h2: {
+            if parsed.scheme() == "http" {
+                break 'h2 None;
+            }
             for attempt in 0..2 {
                 let sender_res = self.get_sender(host, port).await;
                 let mut sender = match sender_res {
@@ -883,12 +956,6 @@ impl HttpClient {
             Some(r) => r,
             None => {
                 // HTTP/1.1 fallback
-                let mut tls_stream = self.connect_tcp_tls(&self.tls_connector, host, port).await?;
-                let path = if parsed.query().is_some() {
-                    format!("{}?{}", parsed.path(), parsed.query().unwrap())
-                } else {
-                    parsed.path().to_string()
-                };
                 if url.contains("/mfc")
                     || url.contains("/akam/13")
                     || url.contains("/tl")
@@ -899,7 +966,7 @@ impl HttpClient {
                         url, hdrs
                     );
                 }
-                let raw = h1_client::send_get(&mut tls_stream, host, &path, &hdrs).await?;
+                let raw = self.send_h1(&parsed, &hdrs, None).await?;
                 self.build_response_from_raw(raw, url, "GET", &hdrs, &[])
                     .await?
             }
@@ -1085,16 +1152,6 @@ impl HttpClient {
         headers: &[(String, String)],
     ) -> Result<Response, NetError> {
         let parsed = Url::parse(url)?;
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| NetError::Http(format!("no host in URL: {url}")))?;
-        let port = parsed.port().unwrap_or(443);
-        let path = if let Some(q) = parsed.query() {
-            format!("{}?{}", parsed.path(), q)
-        } else {
-            parsed.path().to_string()
-        };
-
         let mut hdrs: Vec<(String, String)> = headers
             .iter()
             .filter(|(k, _)| {
@@ -1113,10 +1170,7 @@ impl HttpClient {
         }
         drop(jar);
 
-        let connector = tls::chrome_connector(&self.profile)?;
-        let mut tls_stream = self.connect_tcp_tls(&connector, host, port).await?;
-
-        let raw = h1_client::send_post(&mut tls_stream, host, &path, &hdrs, body).await?;
+        let raw = self.send_h1(&parsed, &hdrs, Some(body)).await?;
         self.build_response_from_raw(raw, url, "POST", &hdrs, body)
             .await
     }
@@ -1132,7 +1186,7 @@ impl HttpClient {
         let host = parsed
             .host_str()
             .ok_or_else(|| NetError::Http(format!("no host in URL: {url}")))?;
-        let port = parsed.port().unwrap_or(443);
+        let port = http_port(&parsed)?;
 
         let mut hdrs: Vec<(String, String)> = headers
             .iter()
@@ -1152,6 +1206,12 @@ impl HttpClient {
         }
 
         // Env-gated POST body dump
+        // Chrome does not put headers on the wire in the order they were
+        // assembled; `order_like_chrome_fetch` carries the measured sequence.
+        // Applied here, after cookies and the caller's own headers, so every
+        // POST leaves in that order regardless of how it was built.
+        crate::net::headers::order_like_chrome_fetch(&mut hdrs);
+
         if let Ok(dir) = std::env::var("BROWSER_OXIDE_DUMP_POST_DIR") {
             use std::io::Write;
             let _ = std::fs::create_dir_all(&dir);
@@ -1188,6 +1248,9 @@ impl HttpClient {
         }
 
         let response = 'h2: {
+            if parsed.scheme() == "http" {
+                break 'h2 None;
+            }
             for attempt in 0..2 {
                 let sender_res = self.get_sender(host, port).await;
                 let mut sender = match sender_res {
@@ -1232,13 +1295,6 @@ impl HttpClient {
         let response = match response {
             Some(r) => r,
             None => {
-                let connector = tls::chrome_connector(&self.profile)?;
-                let mut tls_stream = self.connect_tcp_tls(&connector, host, port).await?;
-                let path = if parsed.query().is_some() {
-                    format!("{}?{}", parsed.path(), parsed.query().unwrap())
-                } else {
-                    parsed.path().to_string()
-                };
                 if url.contains("/mfc")
                     || url.contains("/akam/13")
                     || url.contains("/tl")
@@ -1249,7 +1305,7 @@ impl HttpClient {
                         url, hdrs
                     );
                 }
-                let raw = h1_client::send_post(&mut tls_stream, host, &path, &hdrs, body).await?;
+                let raw = self.send_h1(&parsed, &hdrs, Some(body)).await?;
                 self.build_response_from_raw(raw, url, "POST", &hdrs, body)
                     .await?
             }
@@ -1285,7 +1341,7 @@ impl HttpClient {
         let host = parsed
             .host_str()
             .ok_or_else(|| NetError::Http(format!("no host in URL: {url}")))?;
-        let port = parsed.port().unwrap_or(443);
+        let port = http_port(&parsed)?;
 
         // Browser-aware nav headers (Chrome may upgrade with high-entropy
         // Client Hints if origin sent Accept-CH; Firefox profiles skip).
@@ -1341,6 +1397,9 @@ impl HttpClient {
 
         // Same stale-connection recovery as GET.
         let response = 'h2: {
+            if parsed.scheme() == "http" {
+                break 'h2 None;
+            }
             for attempt in 0..2 {
                 let sender_res = self.get_sender(host, port).await;
                 let mut sender = match sender_res {
@@ -1373,12 +1432,7 @@ impl HttpClient {
         let response = match response {
             Some(r) => r,
             None => {
-                let mut tls_stream = self.connect_tcp_tls(&self.tls_connector, host, port).await?;
-                let path = match parsed.query() {
-                    Some(q) => format!("{}?{}", parsed.path(), q),
-                    None => parsed.path().to_string(),
-                };
-                let raw = h1_client::send_post(&mut tls_stream, host, &path, &hdrs, body).await?;
+                let raw = self.send_h1(&parsed, &hdrs, Some(body)).await?;
                 self.build_response_from_raw(raw, url, "POST", &hdrs, body)
                     .await?
             }
@@ -1629,6 +1683,42 @@ fn resolve_redirect(current_url: &str, location: &str) -> Result<String, NetErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A peer that completes the TCP connect and then says nothing must
+    /// fail on OUR clock, not the OS's. Without the handshake timeout the
+    /// future simply waits until macOS gives up (~75 s) and surfaces a raw
+    /// `Operation timed out (os error 60)` — far too late for the H2 -> H1
+    /// fallback to be worth anything.
+    #[tokio::test]
+    async fn tls_handshake_to_a_silent_peer_times_out_on_our_clock() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept and hold the connection open without ever replying.
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let profile = crate::stealth::chrome_148_linux();
+        let client = HttpClient::new(&profile).expect("client");
+        let connector = tls::chrome_connector(&profile).expect("connector");
+        let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+
+        // Drive the timeout with a paused clock: asserts the bound exists
+        // without spending 15 s of wall time.
+        tokio::time::pause();
+        let handshake = client.handshake_with_timeout(&connector, "localhost", tcp);
+        tokio::pin!(handshake);
+        tokio::time::advance(HttpClient::TLS_HANDSHAKE_TIMEOUT + std::time::Duration::from_secs(1))
+            .await;
+        let err = handshake.await.expect_err("silent peer must not handshake");
+        assert!(
+            err.to_string().contains("timed out"),
+            "expected a timeout error, got: {err}"
+        );
+    }
 
     #[test]
     fn client_creates_successfully() {

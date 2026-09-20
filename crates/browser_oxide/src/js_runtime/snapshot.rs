@@ -134,31 +134,7 @@ pub fn get_snapshot() -> &'static [u8] {
         }
 
         // Execute bootstrap JS
-        const BOOTSTRAP_JS: &str = concat!(
-            include_str!("js/console_bootstrap.js"),
-            "\n",
-            include_str!("js/stealth_bootstrap.js"),
-            "\n",
-            include_str!("js/interfaces_bootstrap.js"),
-            "\n",
-            include_str!("js/instances_bootstrap.js"),
-            "\n",
-            include_str!("js/fetch_bootstrap.js"),
-            "\n",
-            include_str!("js/timer_bootstrap.js"),
-            "\n",
-            include_str!("js/dom_bootstrap.js"),
-            "\n",
-            include_str!("js/event_bootstrap.js"),
-            "\n",
-            include_str!("js/canvas_bootstrap.js"),
-            "\n",
-            include_str!("js/window_bootstrap.js"),
-            "\n",
-            include_str!("js/streams_bootstrap.js"),
-            "\n",
-            include_str!("js/structured_clone.js"),
-        );
+        const BOOTSTRAP_JS: &str = crate::js_runtime::runtime::window_bootstrap_js!();
 
         // Script name "<anonymous>" matches V8's eval-default so
         // Error.stack frames from inside the bootstrap don't leak

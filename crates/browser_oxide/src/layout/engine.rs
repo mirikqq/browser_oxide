@@ -171,9 +171,27 @@ fn ua_declarations(tag: &str) -> HashMap<PropertyId, CssValue> {
         "head", "base", "basefont", "bgsound", "datalist", "link", "meta", "noembed", "noframes",
         "param", "rp", "script", "style", "template", "title",
     ];
+    use crate::css_values::types::length::{Length as CssLength, LengthPercentageAuto as CssLpa};
     let mut out = HashMap::new();
     if HIDDEN.contains(&tag) {
         out.insert(PropertyId::Display, CssValue::Display(Display::None));
+    }
+    // Chrome's UA sheet gives the body an 8px margin, which is why a page's
+    // body measures `viewport - 16` wide and its rect starts at y=8. Without it
+    // every `document.body.getBoundingClientRect()` here started at 0,0 and
+    // spanned the full viewport — a one-line difference from any real browser.
+    if tag == "body" {
+        for prop in [
+            PropertyId::MarginTop,
+            PropertyId::MarginRight,
+            PropertyId::MarginBottom,
+            PropertyId::MarginLeft,
+        ] {
+            out.insert(
+                prop,
+                CssValue::LengthPercentageAuto(CssLpa::Length(CssLength::Px(8.0))),
+            );
+        }
     }
     out
 }
@@ -514,6 +532,27 @@ impl LayoutEngine {
                 };
                 self.css_display.insert(node_id.to_raw(), display);
                 let mut taffy_style = computed_to_taffy(&computed, ctx);
+
+                // Quirks mode stretches the root boxes to the viewport. Chrome
+                // 153 on a doctype-less page: `documentElement.offsetHeight` is
+                // the full viewport and `body.offsetHeight` is the viewport
+                // minus the body's own margins (413 / 397 on a 413px viewport),
+                // where the same page with a doctype reports 8 / 0. Without
+                // this every such page measured its body at zero height.
+                if dom.quirks()
+                    && matches!(&*elem.name.local, "html" | "body")
+                    && taffy_style.size.height.is_auto()
+                {
+                    let margins = [taffy_style.margin.top, taffy_style.margin.bottom]
+                        .iter()
+                        .map(|m| {
+                            m.resolve_to_option(ctx.viewport_h, |_, _| 0.0)
+                                .unwrap_or(0.0)
+                        })
+                        .sum::<f32>();
+                    taffy_style.min_size.height =
+                        Dimension::length((ctx.viewport_h - margins).max(0.0));
+                }
 
                 // Inline-level children share a line.
                 //

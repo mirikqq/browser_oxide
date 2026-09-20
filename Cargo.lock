@@ -234,8 +234,6 @@ dependencies = [
 [[package]]
 name = "boring-sys2"
 version = "4.15.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab6c876a958d17057d9d3a31075bb9609237413a1fe665432782c31ef596eb6b"
 dependencies = [
  "autocfg",
  "bindgen",

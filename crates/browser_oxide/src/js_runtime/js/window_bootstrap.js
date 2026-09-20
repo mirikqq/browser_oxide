@@ -1,4 +1,19 @@
 ((globalThis) => {
+    const _boNs = (() => {
+        try {
+            const syms = Object.getOwnPropertySymbols(globalThis, 1);
+            for (let i = 0; i < syms.length; i++) {
+                const v = globalThis[syms[i]];
+                if (v && v.__bo) return v;
+            }
+        } catch (_e) {}
+        return null;
+    })();
+    const _idl = (_boNs && _boNs.idl) || {
+        own: (obj) => obj,
+        read: () => undefined,
+        fields: () => {},
+    };
     const ops = Deno.core.ops;
     const _browser_oxide = {
         __documentReadyState: "loading",
@@ -47,8 +62,11 @@
             throw new TypeError("Illegal constructor");
         }
         try {
-            if (typeof _ET === "function") {
-                Object.setPrototypeOf(Window, _ET);
+            const _globalProto = Object.getPrototypeOf(globalThis);
+            if (typeof _ET === "function") Object.setPrototypeOf(Window, _ET);
+            if (_globalProto && _globalProto !== Object.prototype) {
+                Window.prototype = _globalProto;
+            } else if (typeof _ET === "function") {
                 Window.prototype = Object.create(_ET.prototype);
             } else {
                 Window.prototype = Object.create(Object.prototype);
@@ -65,25 +83,15 @@
             });
             if (typeof _maskFunction === "function") _maskFunction(Window, "Window");
             globalThis.Window = Window;
-            // Symbol.hasInstance: any global proxy where .window===self is a Window
-            // (covers both main realm and child realms for iframe instanceof Window)
-            Object.defineProperty(Window, Symbol.hasInstance, {
-                value: function(instance) {
-                    if (instance == null) return false;
-                    try { return instance.window === instance; } catch(_) { return false; }
-                },
-                configurable: true, writable: true
-            });
             // NOTE: do NOT Object.setPrototypeOf(globalThis, Window.prototype)
             // here — deno_core's V8 global object is special; swapping its
             // [[Prototype]] breaks `ops`/secure-context resolution
             // (regressed Notification.permission default→denied,
-            // chrome147_parity). Defining the global `Window` is enough for
-            // `typeof Window==="function"` AND for _buildRemoteRealm to
-            // mirror it so iframe contentWindow.constructor.name==="Window".
-            // Main-window `window instanceof Window` parity needs a
-            // deno_core-level global-prototype fix (Rust side) — tracked
-            // separately, NOT a JS proto swap.
+            // chrome147_parity). The global's existing prototype object IS
+            // adopted as `Window.prototype` above instead, and
+            // event_bootstrap.js links it to EventTarget through a
+            // WindowProperties object, which gives the Chrome chain without
+            // touching the global itself.
         } catch (_) {}
     })();
 
@@ -119,6 +127,16 @@
         if (v !== "") try { return JSON.parse(v); } catch {}
         return fallback;
     };
+    const _svc = (() => {
+        try {
+            const syms = Object.getOwnPropertySymbols(globalThis, 1);
+            for (let i = 0; i < syms.length; i++) {
+                const v = globalThis[syms[i]];
+                if (v && v.__bo && v.services) return v.services;
+            }
+        } catch (_) {}
+        return null;
+    })();
 
     // iOS surface gating. Real iOS Safari has no UA-Client-Hints,
     // no `chrome` global, and no NetworkInformation / UserActivation /
@@ -173,7 +191,7 @@
             Object.defineProperty(wrapped, 'length', { value: fn.length, configurable: true });
         } catch (_) {}
         Object.defineProperty(proto, name, {
-            value: wrapped, writable: true, enumerable: false, configurable: true,
+            value: wrapped, writable: true, enumerable: true, configurable: true,
         });
         _maskFunction(wrapped, name);
     };
@@ -216,39 +234,7 @@
 
     // Stable-object references — object getters return the same reference
     // on every call, matching the behavior of real DOM-wrapped properties.
-    let NetworkInformation = globalThis.NetworkInformation || class NetworkInformation extends EventTarget {
-        constructor() { super(); }
-    };
-    // On the *prototype*, which is where WebIDL attributes live. Verified
-    // against Chrome: `Object.getOwnPropertyDescriptor(navigator.connection,
-    // 'effectiveType')` is undefined there and the descriptor sits on
-    // `NetworkInformation.prototype`. Defining them on the instance inverted
-    // both answers — an own-property probe is one line and this failed it.
-    //
-    // `downlinkMax` is deliberately absent: Chrome does not implement it either,
-    // and adding it would be its own mismatch.
-    const _NIProto = NetworkInformation.prototype;
-    _defProtoGetter(_NIProto, 'effectiveType', function effectiveType() {
-        return _p("connection_effective_type", "4g");
-    });
-    _defProtoGetter(_NIProto, 'rtt', function rtt() {
-        return Math.round(_pInt("connection_rtt", 50) / 25) * 25;
-    });
-    _defProtoGetter(_NIProto, 'downlink', function downlink() {
-        return Math.round(_pFloat("connection_downlink", 10) * 40) / 40;
-    });
-    _defProtoGetter(_NIProto, 'saveData', function saveData() { return false; });
-    const _niOnChange = new WeakMap();
-    _defProtoGetter(
-        _NIProto,
-        'onchange',
-        function onchange() { return _niOnChange.get(this) || null; },
-        function onchange(fn) { _niOnChange.set(this, typeof fn === "function" ? fn : null); },
-    );
-    Object.defineProperty(_NIProto, Symbol.toStringTag, {
-        value: "NetworkInformation", configurable: true,
-    });
-    const _navConnection = Object.create(_NIProto);
+    const _navConnection = _svc.make(globalThis.NetworkInformation);
 
     let PluginArray = globalThis.PluginArray || class PluginArray {};
     let MimeTypeArray = globalThis.MimeTypeArray || class MimeTypeArray {};
@@ -258,9 +244,9 @@
     // 1. Setup Plugin.prototype
     const _PluginProto = Plugin.prototype;
     Object.defineProperty(_PluginProto, Symbol.toStringTag, { value: "Plugin", enumerable: false, configurable: true });
-    _defProtoGetter(_PluginProto, 'name', function() { return this._name || ""; });
-    _defProtoGetter(_PluginProto, 'description', function() { return this._desc || ""; });
-    _defProtoGetter(_PluginProto, 'filename', function() { return this._file || ""; });
+    _defProtoGetter(_PluginProto, 'name', function() { return _idl.own(this)._name || ""; });
+    _defProtoGetter(_PluginProto, 'description', function() { return _idl.own(this)._desc || ""; });
+    _defProtoGetter(_PluginProto, 'filename', function() { return _idl.own(this)._file || ""; });
     _defProtoGetter(_PluginProto, 'length', function() { return 0; });
     _defProtoMethod(_PluginProto, 'item', function item() { return null; });
     _defProtoMethod(_PluginProto, 'namedItem', function namedItem() { return null; });
@@ -268,25 +254,30 @@
     // Setup MimeType.prototype
     const _MimeTypeProto = MimeType.prototype;
     Object.defineProperty(_MimeTypeProto, Symbol.toStringTag, { value: "MimeType", enumerable: false, configurable: true });
-    _defProtoGetter(_MimeTypeProto, 'type', function() { return this._type || ""; });
-    _defProtoGetter(_MimeTypeProto, 'description', function() { return this._desc || ""; });
-    _defProtoGetter(_MimeTypeProto, 'suffixes', function() { return this._suffixes || ""; });
-    _defProtoGetter(_MimeTypeProto, 'enabledPlugin', function() { return this._plugin || null; });
+    _defProtoGetter(_MimeTypeProto, 'type', function() { return _idl.own(this)._type || ""; });
+    _defProtoGetter(_MimeTypeProto, 'description', function() { return _idl.own(this)._desc || ""; });
+    _defProtoGetter(_MimeTypeProto, 'suffixes', function() { return _idl.own(this)._suffixes || ""; });
+    _defProtoGetter(_MimeTypeProto, 'enabledPlugin', function() { return _idl.own(this)._plugin || null; });
 
+    // The values live in the engine's IDL state, not on the object: a real
+    // Chrome Plugin/MimeType has no own properties at all, and everything a
+    // page can read comes off the prototype accessors above.
     const _makePlugin = (name, desc, file) => {
         const p = Object.create(_PluginProto);
-        Object.defineProperty(p, '_name', { value: name });
-        Object.defineProperty(p, '_desc', { value: desc });
-        Object.defineProperty(p, '_file', { value: file });
-        Object.defineProperty(p, '_mimeTypes', { value: [], writable: true });
+        const st = _idl.own(p);
+        st._name = name;
+        st._desc = desc;
+        st._file = file;
+        st._mimeTypes = [];
         return p;
     };
     const _makeMime = (type, suffixes, desc, plugin) => {
         const m = Object.create(_MimeTypeProto);
-        Object.defineProperty(m, '_type', { value: type });
-        Object.defineProperty(m, '_suffixes', { value: suffixes });
-        Object.defineProperty(m, '_desc', { value: desc });
-        Object.defineProperty(m, '_plugin', { value: plugin });
+        const st = _idl.own(m);
+        st._type = type;
+        st._suffixes = suffixes;
+        st._desc = desc;
+        st._plugin = plugin;
         return m;
     };
 
@@ -313,7 +304,7 @@
         _makeMime("text/pdf", "pdf", _PDF_DESC, _allPlugins[0]),
     ];
     // Cross-link: each plugin reports the same mime type list per Chrome.
-    _allPlugins.forEach(p => { p._mimeTypes = _allMimes; });
+    _allPlugins.forEach(p => { _idl.own(p)._mimeTypes = _allMimes; });
 
     // Runtime count resolvers — clamped to physical array size so a probe
     // that walks plugins[i] for i<length never hits undefined.
@@ -353,14 +344,6 @@
         for (let i = 0; i < len; i++) if (_allPlugins[i].name === n) return _allPlugins[i];
         return null;
     });
-    
-    // (Phase J) Add numeric accessors for navigator.plugins[0] etc.
-    for (let i = 0; i < 5; i++) {
-        Object.defineProperty(_PluginArrayProto, i, {
-            get: function() { return this.item(i); },
-            enumerable: true, configurable: true
-        });
-    }
 
     _defProtoMethod(_PluginArrayProto, 'refresh', () => {});
     // Symbol.iterator iterates the live sliced range.
@@ -393,13 +376,6 @@
         for (let i = 0; i < len; i++) if (_allMimes[i].type === n) return _allMimes[i];
         return null;
     });
-    // Numeric accessors for mimeTypes
-    for (let i = 0; i < 2; i++) {
-        Object.defineProperty(_MimeTypeArrayProto, i, {
-            get: function() { return this.item(i); },
-            enumerable: true, configurable: true
-        });
-    }
     Object.defineProperty(_MimeTypeArrayProto, Symbol.iterator, {
         value: function iter() {
             const n = _mimesLen();
@@ -435,7 +411,7 @@
     // Plugin instance behaves like a MimeTypeArray over its mime types.
     _allPlugins.forEach(p => {
         Object.defineProperty(p, 'length', { get: () => _mimesLen(), enumerable: false, configurable: true });
-        p._mimeTypes.forEach((m, i) => {
+        _idl.own(p)._mimeTypes.forEach((m, i) => {
              Object.defineProperty(p, i, {
                 get: () => (i < _mimesLen() ? m : undefined),
                 enumerable: true,
@@ -450,14 +426,14 @@
         Object.defineProperty(p, 'item', {
             value: function item(i) {
                 const n = _mimesLen();
-                return (i >= 0 && i < n) ? p._mimeTypes[i] : null;
+                return (i >= 0 && i < n) ? _idl.own(p)._mimeTypes[i] : null;
             },
             enumerable: false, configurable: true,
         });
         Object.defineProperty(p, 'namedItem', {
             value: function namedItem(n) {
                 const len = _mimesLen();
-                for (let i = 0; i < len; i++) if (p._mimeTypes[i].type === n) return p._mimeTypes[i];
+                for (let i = 0; i < len; i++) if (_idl.own(p)._mimeTypes[i].type === n) return _idl.own(p)._mimeTypes[i];
                 return null;
             },
             enumerable: false, configurable: true,
@@ -492,14 +468,13 @@
     //   (2) label === "" until the corresponding permission is GRANTED
     //       (audioinput/audiooutput → microphone; videoinput → camera).
     //       Leaking populated labels pre-permission is a classic automation
-    //       tell. _PERMISSION_STATE_MAP is defined below; reference resolves
-    //       lazily when this function is called. §6.6 item 9 / item 7.
+    //       tell. §6.6 item 9 / item 7.
     _navMediaDevices.enumerateDevices = ({
         enumerateDevices() {
             const raw = _pJson("media_devices", []);
             const permFor = (kind) => {
-                if (kind === "videoinput") return _PERMISSION_STATE_MAP["camera"] || "prompt";
-                if (kind === "audioinput" || kind === "audiooutput") return _PERMISSION_STATE_MAP["microphone"] || "prompt";
+                if (kind === "videoinput") return _svc.permissionState("camera");
+                if (kind === "audioinput" || kind === "audiooutput") return _svc.permissionState("microphone");
                 return "granted"; // unknown kinds — don't blank
             };
             const out = raw.map((d) => {
@@ -536,81 +511,7 @@
     _navMediaDevices.dispatchEvent = ({ dispatchEvent() { return true; } }).dispatchEvent;
     _maskFunction(_navMediaDevices.dispatchEvent, 'dispatchEvent');
 
-    // Permission name → state map matching headed Chrome defaults.
-    // W3C PermissionState enum: 'granted' | 'denied' | 'prompt'. Headless
-    // Chrome's well-known 'denied' return for notifications differs from a
-    // real browser; this function matches the real-browser behavior.
-    const _PERMISSION_STATE_MAP = {
-        "notifications": "prompt",
-        "geolocation": "prompt",
-        "camera": "prompt",
-        "microphone": "prompt",
-        "midi": "prompt",
-        "push": "prompt",
-        "persistent-storage": "granted",
-        "background-sync": "granted",
-        "background-fetch": "granted",
-        "clipboard-read": "prompt",
-        "clipboard-write": "granted",
-        "payment-handler": "granted",
-        "accelerometer": "granted",
-        "gyroscope": "granted",
-        "magnetometer": "granted",
-        "ambient-light-sensor": "granted",
-        "screen-wake-lock": "granted",
-        "nfc": "prompt",
-        "display-capture": "prompt",
-        "window-management": "prompt",
-    };
-
-    // Permissions that require secure context — on data:/http:/about:blank
-    // these report "denied" instead of "prompt" per Permissions Policy
-    // (geolocation, camera, mic, midi, etc. are all [SecureContext] APIs
-    // and the corresponding permissions are unobtainable). Phase 7.
-    const _SC_GATED_PERMISSIONS = new Set([
-        "geolocation", "camera", "microphone", "midi", "push",
-        "notifications", "clipboard-read",
-        "nfc", "display-capture", "window-management",
-    ]);
-
-    class PermissionStatus extends EventTarget {
-        constructor(name) { super(); this._name = name; }
-        get name() { return this._name; }
-        get state() {
-            if (!_secure() && _SC_GATED_PERMISSIONS.has(this._name)) {
-                return "denied";
-            }
-            return _PERMISSION_STATE_MAP[this._name] || "prompt";
-        }
-        get onchange() { return null; }
-        set onchange(_v) {}
-    }
-    Object.defineProperty(PermissionStatus.prototype, Symbol.toStringTag, {
-        value: "PermissionStatus", configurable: true,
-    });
-    globalThis.PermissionStatus = PermissionStatus;
-
-    class Permissions {}
-    Object.defineProperty(Permissions.prototype, Symbol.toStringTag, {
-        value: "Permissions", configurable: true,
-    });
-    _defProtoMethod(Permissions.prototype, 'query', function query(desc) {
-        if (desc == null || typeof desc !== 'object') {
-            return Promise.reject(new TypeError(
-                "Failed to execute 'query' on 'Permissions': parameter 1 is not of type 'PermissionDescriptor'."
-            ));
-        }
-        const name = desc.name;
-        if (typeof name !== 'string' || !(name in _PERMISSION_STATE_MAP)) {
-            return Promise.reject(new TypeError(
-                "Failed to execute 'query' on 'Permissions': The provided value '" +
-                String(name) + "' is not a valid enum value of type PermissionName."
-            ));
-        }
-        return Promise.resolve(new PermissionStatus(name));
-    });
-    globalThis.Permissions = Permissions;
-    const _navPermissions = Object.create(Permissions.prototype);
+    const _navPermissions = _svc.make(globalThis.Permissions);
 
     // ================================================================
     // WebAuthn + FedCM (detection-shape only)
@@ -764,57 +665,10 @@
     globalThis.Bluetooth = Bluetooth;
     const _navBluetooth = Object.create(Bluetooth.prototype);
 
-    // Phase 7 — instances need Symbol.toStringTag so
-    // `Object.prototype.toString.call(navigator.usb)` returns
-    // `[object USB]` (not `[object Object]`). Real Chrome's IDL gives
-    // each one a class identity even when they're effectively stubs.
-    const _navUsb = (() => {
-        const _UProto = globalThis.USB && globalThis.USB.prototype;
-        const u = _UProto ? Object.create(_UProto) : {};
-        u.getDevices = ({ getDevices() { return Promise.resolve([]); } }).getDevices;
-        _maskFunction(u.getDevices, 'getDevices');
-        u.requestDevice = ({ requestDevice() { return Promise.reject(new DOMException("User denied", "NotFoundError")); } }).requestDevice;
-        _maskFunction(u.requestDevice, 'requestDevice');
-        u.onconnect = null;
-        u.ondisconnect = null;
-        return u;
-    })();
-    const _navSerial = (() => {
-        const _SProto = globalThis.Serial && globalThis.Serial.prototype;
-        const s = _SProto ? Object.create(_SProto) : {};
-        s.getPorts = ({ getPorts() { return Promise.resolve([]); } }).getPorts;
-        _maskFunction(s.getPorts, 'getPorts');
-        s.requestPort = ({ requestPort() { return Promise.reject(new DOMException("User denied", "NotFoundError")); } }).requestPort;
-        _maskFunction(s.requestPort, 'requestPort');
-        s.onconnect = null;
-        s.ondisconnect = null;
-        return s;
-    })();
-    const _navHid = (() => {
-        const _HProto = globalThis.HID && globalThis.HID.prototype;
-        const h = _HProto ? Object.create(_HProto) : {};
-        h.getDevices = ({ getDevices() { return Promise.resolve([]); } }).getDevices;
-        _maskFunction(h.getDevices, 'getDevices');
-        h.requestDevice = ({ requestDevice() { return Promise.reject(new DOMException("User denied", "NotFoundError")); } }).requestDevice;
-        _maskFunction(h.requestDevice, 'requestDevice');
-        h.onconnect = null;
-        h.ondisconnect = null;
-        return h;
-    })();
-    const _navLocks = (() => {
-        const _LProto = globalThis.LockManager && globalThis.LockManager.prototype;
-        const l = _LProto ? Object.create(_LProto) : {};
-        l.query = ({ query() { return Promise.resolve({ held: [], pending: [] }); } }).query;
-        _maskFunction(l.query, 'query');
-        l.request = ({ request() { return new Promise(() => {}); } }).request;
-        _maskFunction(l.request, 'request');
-        return l;
-    })();
-
-    Object.defineProperty(_navUsb, Symbol.toStringTag, { value: "USB", configurable: true });
-    Object.defineProperty(_navSerial, Symbol.toStringTag, { value: "Serial", configurable: true });
-    Object.defineProperty(_navHid, Symbol.toStringTag, { value: "HID", configurable: true });
-    Object.defineProperty(_navLocks, Symbol.toStringTag, { value: "LockManager", configurable: true });
+    const _navUsb = _svc.make(globalThis.USB);
+    const _navSerial = _svc.make(globalThis.Serial);
+    const _navHid = _svc.make(globalThis.HID);
+    const _navLocks = _svc.make(globalThis.LockManager);
 
     // navigator.keyboard — Keyboard API (commonly probed by fingerprint scripts).
     // Real Chrome exposes a Keyboard instance with getLayoutMap() returning a
@@ -846,16 +700,17 @@
     ]);
 
     class KeyboardLayoutMap {
-        constructor(map) { this._m = map; }
-        get size() { return this._m.size; }
-        get(key) { return this._m.get(key); }
-        has(key) { return this._m.has(key); }
-        entries() { return this._m.entries(); }
-        keys() { return this._m.keys(); }
-        values() { return this._m.values(); }
-        forEach(cb, thisArg) { return this._m.forEach(cb, thisArg); }
+        #m;
+        constructor(map) { this.#m = map; }
+        get size() { return this.#m.size; }
+        get(key) { return this.#m.get(key); }
+        has(key) { return this.#m.has(key); }
+        entries() { return this.#m.entries(); }
+        keys() { return this.#m.keys(); }
+        values() { return this.#m.values(); }
+        forEach(cb, thisArg) { return this.#m.forEach(cb, thisArg); }
         [Symbol.iterator]() {
-            const it = this._m[Symbol.iterator]();
+            const it = this.#m[Symbol.iterator]();
             return {
                 next() { return it.next(); },
                 [Symbol.iterator]() { return this; }
@@ -880,48 +735,22 @@
     globalThis.Keyboard = Keyboard;
     const _navKeyboard = new Keyboard();
 
-    class StorageManager {}
-    Object.defineProperty(StorageManager.prototype, Symbol.toStringTag, {
-        value: "StorageManager", configurable: true,
-    });
-    StorageManager.prototype.estimate = ({
-        estimate() {
-            // Real Chrome on modern macOS/Windows desktops reports ~60% of
-            // free disk as quota. ~120 GB is a typical-disk plausible value
-            // — the previous 1 GB constant differs from real Chrome, whose
-            // quota is always many tens of GB. Usage breakdown matches
-            // Chrome's documented `usageDetails` shape so iteration probes
-            // (e.g. `for (k in details)`) see the same key set.
-            return Promise.resolve({
-                quota: 128849018880,                 // ~120 GB
-                usage: 0,
-                usageDetails: { indexedDB: 0, caches: 0, serviceWorkerRegistrations: 0 },
-            });
-        }
-    }).estimate;
-    _maskFunction(StorageManager.prototype.estimate, 'estimate');
-
-    StorageManager.prototype.persist = ({ persist() { return Promise.resolve(false); } }).persist;
-    _maskFunction(StorageManager.prototype.persist, 'persist');
-
-    StorageManager.prototype.persisted = ({ persisted() { return Promise.resolve(false); } }).persisted;
-    _maskFunction(StorageManager.prototype.persisted, 'persisted');
-
-    globalThis.StorageManager = StorageManager;
-    const _navStorage = Object.create(StorageManager.prototype);
+    const _navStorage = _svc.make(globalThis.StorageManager);
 
     class ServiceWorkerContainer extends EventTarget {
         constructor() {
             super();
-            this.controller = null;
+            const _st = _idl.own(this);
+            _st.controller = null;
             this.oncontrollerchange = null;
             this.onmessage = null;
-            this.ready = Promise.resolve({
+            _st.ready = Promise.resolve({
                 active: null, installing: null, waiting: null, scope: "/",
                 unregister() { return Promise.resolve(true); },
             });
         }
     }
+    _idl.fields(ServiceWorkerContainer.prototype, ["controller", "ready"]);
     Object.defineProperty(ServiceWorkerContainer.prototype, Symbol.toStringTag, {
         value: "ServiceWorkerContainer", configurable: true,
     });
@@ -950,12 +779,6 @@
 
     ServiceWorkerContainer.prototype.startMessages = ({ startMessages() {} }).startMessages;
     _maskFunction(ServiceWorkerContainer.prototype.startMessages, 'startMessages');
-
-    ServiceWorkerContainer.prototype.addEventListener = ({ addEventListener() {} }).addEventListener;
-    _maskFunction(ServiceWorkerContainer.prototype.addEventListener, 'addEventListener');
-
-    ServiceWorkerContainer.prototype.removeEventListener = ({ removeEventListener() {} }).removeEventListener;
-    _maskFunction(ServiceWorkerContainer.prototype.removeEventListener, 'removeEventListener');
 
     globalThis.ServiceWorkerContainer = ServiceWorkerContainer;
     const _navServiceWorker = new ServiceWorkerContainer();
@@ -1098,28 +921,28 @@
     // Safari and Firefox have no `connection` on Navigator (Gecko gates it
     // behind a pref, off by default). Skip on iOS + Firefox.
     if (!_isMobileIOS() && !_isFirefox()) {
-        Object.defineProperty(_NavProto, 'connection', { get: () => _navConnection, enumerable: false, configurable: true });
+        Object.defineProperty(_NavProto, 'connection', { get: () => _navConnection, enumerable: true, configurable: true });
     }
-    Object.defineProperty(_NavProto, 'plugins', { get: () => _navPlugins, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'mimeTypes', { get: () => _navMimeTypes, enumerable: false, configurable: true });
+    Object.defineProperty(_NavProto, 'plugins', { get: () => _navPlugins, enumerable: true, configurable: true });
+    Object.defineProperty(_NavProto, 'mimeTypes', { get: () => _navMimeTypes, enumerable: true, configurable: true });
     // Navigator getters. Properties marked /* SC */ are
     // [SecureContext]-only per their IDL — return undefined on
     // insecure contexts so the surface matches real Chrome on
     // data:/http:/about:blank URLs. Phase 7 fix.
-    Object.defineProperty(_NavProto, 'mediaDevices', { get: () => _secure() ? _navMediaDevices : undefined, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'permissions', { get: () => _navPermissions, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'credentials', { get: () => _secure() ? _navCredentials : undefined, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'bluetooth', { get: () => _secure() ? _navBluetooth : undefined, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'usb', { get: () => _secure() ? _navUsb : undefined, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'serial', { get: () => _secure() ? _navSerial : undefined, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'hid', { get: () => _secure() ? _navHid : undefined, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'keyboard', { get: () => _secure() ? _navKeyboard : undefined, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'locks', { get: () => _secure() ? _navLocks : undefined, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'storage', { get: () => _secure() ? _navStorage : undefined, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'serviceWorker', { get: () => _secure() ? _navServiceWorker : undefined, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'clipboard', { get: () => _secure() ? _navClipboard : undefined, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'geolocation', { get: () => _navGeolocation, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'wakeLock', { get: () => _secure() ? _navWakeLock : undefined, enumerable: false, configurable: true });
+    Object.defineProperty(_NavProto, 'mediaDevices', { get: () => _secure() ? _navMediaDevices : undefined, enumerable: true, configurable: true });
+    Object.defineProperty(_NavProto, 'permissions', { get: () => _navPermissions, enumerable: true, configurable: true });
+    Object.defineProperty(_NavProto, 'credentials', { get: () => _secure() ? _navCredentials : undefined, enumerable: true, configurable: true });
+    Object.defineProperty(_NavProto, 'bluetooth', { get: () => _secure() ? _navBluetooth : undefined, enumerable: true, configurable: true });
+    Object.defineProperty(_NavProto, 'usb', { get: () => _secure() ? _navUsb : undefined, enumerable: true, configurable: true });
+    Object.defineProperty(_NavProto, 'serial', { get: () => _secure() ? _navSerial : undefined, enumerable: true, configurable: true });
+    Object.defineProperty(_NavProto, 'hid', { get: () => _secure() ? _navHid : undefined, enumerable: true, configurable: true });
+    Object.defineProperty(_NavProto, 'keyboard', { get: () => _secure() ? _navKeyboard : undefined, enumerable: true, configurable: true });
+    Object.defineProperty(_NavProto, 'locks', { get: () => _secure() ? _navLocks : undefined, enumerable: true, configurable: true });
+    Object.defineProperty(_NavProto, 'storage', { get: () => _secure() ? _navStorage : undefined, enumerable: true, configurable: true });
+    Object.defineProperty(_NavProto, 'serviceWorker', { get: () => _secure() ? _navServiceWorker : undefined, enumerable: true, configurable: true });
+    Object.defineProperty(_NavProto, 'clipboard', { get: () => _secure() ? _navClipboard : undefined, enumerable: true, configurable: true });
+    Object.defineProperty(_NavProto, 'geolocation', { get: () => _navGeolocation, enumerable: true, configurable: true });
+    Object.defineProperty(_NavProto, 'wakeLock', { get: () => _secure() ? _navWakeLock : undefined, enumerable: true, configurable: true });
 
     // Apply native masking to all getters
     _maskAsNative(_NavProto, 'userAgent', 'platform', 'vendor', 'vendorSub', 'productSub', 
@@ -1267,12 +1090,20 @@
             return Promise.resolve(_batteryInstance);
         });
     }
-    _defNavMethod('getUserMedia', function getUserMedia(constraints, success, error) {
-        if (error) error(new Error("Permission denied"));
-        return undefined;
-    });
-    _defNavMethod('webkitGetUserMedia', function webkitGetUserMedia(c, s, e) { if (e) e(new Error("Permission denied")); });
-    _defNavMethod('mozGetUserMedia', function mozGetUserMedia(c, s, e) { if (e) e(new Error("Permission denied")); });
+    if (_isFirefox()) {
+        _defNavMethod('mozGetUserMedia', function mozGetUserMedia(c, s, e) { if (e) e(new Error("Permission denied")); });
+    } else {
+        _defNavMethod('getUserMedia', function getUserMedia(constraints, success, error) {
+            if (error) error(new Error("Permission denied"));
+            return undefined;
+        });
+        _defNavMethod('webkitGetUserMedia', function webkitGetUserMedia(c, s, e) { if (e) e(new Error("Permission denied")); });
+    }
+    if (_secure()) {
+        _defNavMethod('requestMIDIAccess', function requestMIDIAccess(options) {
+            return Promise.reject(new DOMException("Permission denied", "SecurityError"));
+        });
+    }
     // Additional Navigator.prototype methods that some scripts walk via
     // computed names. Missing any of these causes
     // `obj[computed_name](...) is not a function` errors in such scripts.
@@ -1341,6 +1172,127 @@
     });
     _defNavMethod('clearAppBadge', function clearAppBadge() { return Promise.resolve(); });
     _defNavMethod('setAppBadge', function setAppBadge(count) { return Promise.resolve(); });
+
+    const _tagProto = (ctor, name) => Object.defineProperty(ctor.prototype, Symbol.toStringTag, {
+        value: name, configurable: true,
+    });
+    const _rejectNotAllowed = (what) => Promise.reject(
+        new DOMException(`${what}: not allowed`, 'NotAllowedError'));
+
+    class DeprecatedStorageQuota {}
+    _tagProto(DeprecatedStorageQuota, 'DeprecatedStorageQuota');
+    _defProtoMethod(DeprecatedStorageQuota.prototype, 'queryUsageAndQuota',
+        function queryUsageAndQuota(successCallback, errorCallback) {
+            if (typeof successCallback === 'function') successCallback(0, 0);
+        });
+    _defProtoMethod(DeprecatedStorageQuota.prototype, 'requestQuota',
+        function requestQuota(newQuota, successCallback, errorCallback) {
+            if (typeof successCallback === 'function') successCallback(newQuota | 0);
+        });
+    const _navTemporaryStorage = Object.create(DeprecatedStorageQuota.prototype);
+    const _navPersistentStorage = Object.create(DeprecatedStorageQuota.prototype);
+
+    class ProtectedAudience {}
+    _tagProto(ProtectedAudience, 'ProtectedAudience');
+    _defProtoMethod(ProtectedAudience.prototype, 'queryFeatureSupport',
+        function queryFeatureSupport(feature) { return false; });
+    globalThis.ProtectedAudience = ProtectedAudience;
+    const _navProtectedAudience = Object.create(ProtectedAudience.prototype);
+
+    class NavigatorManagedData extends EventTarget {}
+    _tagProto(NavigatorManagedData, 'NavigatorManagedData');
+    for (const _m of ['getManagedConfiguration', 'getDirectoryId', 'getHostname',
+                      'getSerialNumber', 'getAnnotatedAssetId', 'getAnnotatedLocation']) {
+        _defProtoMethod(NavigatorManagedData.prototype, _m,
+            function () { return _rejectNotAllowed('managed'); });
+    }
+    globalThis.NavigatorManagedData = NavigatorManagedData;
+    const _navManaged = new NavigatorManagedData();
+
+    class NavigatorLogin {}
+    _tagProto(NavigatorLogin, 'NavigatorLogin');
+    _defProtoMethod(NavigatorLogin.prototype, 'setStatus',
+        function setStatus(status) { return Promise.resolve(undefined); });
+    globalThis.NavigatorLogin = NavigatorLogin;
+    const _navLogin = Object.create(NavigatorLogin.prototype);
+
+    class Ink {}
+    _tagProto(Ink, 'Ink');
+    _defProtoMethod(Ink.prototype, 'requestPresenter', function requestPresenter(param) {
+        return Promise.reject(new DOMException('Ink presenter unavailable', 'NotSupportedError'));
+    });
+    globalThis.Ink = Ink;
+    const _navInk = Object.create(Ink.prototype);
+
+    class Presentation {}
+    _tagProto(Presentation, 'Presentation');
+    _defProtoGetter(Presentation.prototype, 'defaultRequest', () => null, (_v) => {});
+    _defProtoGetter(Presentation.prototype, 'receiver', () => null);
+    globalThis.Presentation = Presentation;
+    const _navPresentation = Object.create(Presentation.prototype);
+
+    class XRSystem extends EventTarget {}
+    _tagProto(XRSystem, 'XRSystem');
+    _defProtoMethod(XRSystem.prototype, 'isSessionSupported', function isSessionSupported(mode) {
+        return Promise.resolve(false);
+    });
+    _defProtoMethod(XRSystem.prototype, 'requestSession', function requestSession(mode, options) {
+        return Promise.reject(new DOMException('No XR device', 'NotSupportedError'));
+    });
+    globalThis.XRSystem = XRSystem;
+    const _navXr = new XRSystem();
+
+    const _navStorageBuckets = _svc.make(globalThis.StorageBucketManager);
+
+    _defNav('webkitTemporaryStorage', () => _navTemporaryStorage);
+    _defNav('webkitPersistentStorage', () => _navPersistentStorage);
+    if (_secure()) {
+        _defNav('protectedAudience', () => _navProtectedAudience);
+        _defNav('managed', () => _navManaged);
+        _defNav('login', () => _navLogin);
+        _defNav('ink', () => _navInk);
+        _defNav('presentation', () => _navPresentation);
+        _defNav('xr', () => _navXr);
+        _defNav('storageBuckets', () => _navStorageBuckets);
+        _defNav('deprecatedRunAdAuctionEnforcesKAnonymity', () => true);
+
+        _defNavMethod('runAdAuction', function runAdAuction(config) {
+            return Promise.resolve(null);
+        });
+        _defNavMethod('joinAdInterestGroup', function joinAdInterestGroup(group) {
+            return Promise.resolve(undefined);
+        });
+        _defNavMethod('leaveAdInterestGroup', function leaveAdInterestGroup(group) {
+            return Promise.resolve(undefined);
+        });
+        _defNavMethod('updateAdInterestGroups', function updateAdInterestGroups() {});
+        _defNavMethod('clearOriginJoinedAdInterestGroups',
+            function clearOriginJoinedAdInterestGroups(owner, interestGroupsToKeep) {
+                return Promise.resolve(undefined);
+            });
+        _defNavMethod('createAuctionNonce', function createAuctionNonce() {
+            return Promise.resolve(crypto.randomUUID());
+        });
+        _defNavMethod('adAuctionComponents', function adAuctionComponents(numAdComponents) {
+            throw new DOMException(
+                "Failed to execute 'adAuctionComponents' on 'Navigator': " +
+                'May only be called from a frame that was loaded from an ad auction.',
+                'NotAllowedError');
+        });
+        _defNavMethod('canLoadAdAuctionFencedFrame', function canLoadAdAuctionFencedFrame() {
+            return true;
+        });
+        _defNavMethod('deprecatedReplaceInURN', function deprecatedReplaceInURN(urnOrConfig, replacements) {
+            return Promise.reject(new TypeError('Passed URN is not valid.'));
+        });
+        _defNavMethod('deprecatedURNToURL', function deprecatedURNToURL(urnOrConfig, sendReports) {
+            return Promise.resolve(null);
+        });
+        _defNavMethod('getInterestGroupAdAuctionData', function getInterestGroupAdAuctionData(config) {
+            return Promise.reject(new DOMException(
+                'getInterestGroupAdAuctionData API not available.', 'NotSupportedError'));
+        });
+    }
 
     // Symbol.toStringTag — some scripts check Object.prototype.toString.call(navigator)
     // and expect "[object Navigator]". Without this, it returns "[object Object]".
@@ -1417,8 +1369,14 @@
     const _LocProto = globalThis.Location.prototype;
     Object.defineProperty(_LocProto, Symbol.toStringTag, { value: "Location", enumerable: false, configurable: true });
 
+    // Every Location member is [LegacyUnforgeable]: in Chrome they are own,
+    // non-configurable properties of `window.location` itself, and
+    // `Location.prototype` carries nothing but `constructor`. They are built on
+    // this holder first so the existing masking helpers still name them, then
+    // copied onto the instance below.
+    const _locHolder = {};
     function _defLoc(prop, getter, setter) {
-        _defProtoGetter(_LocProto, prop, getter, setter);
+        _defProtoGetter(_locHolder, prop, getter, setter);
     }
 
     // Signal the Rust event loop that a navigation is pending. Without this,
@@ -1478,29 +1436,45 @@
         return _ao;
     });
 
-    _defProtoMethod(_LocProto, 'assign', (url) => {
+    _defProtoMethod(_locHolder, 'assign', (url) => {
         _parseLocationUrl(url);
         _browser_oxide.__pendingNavigation = 
  { url: _locationData.href, kind: "assign" };
         _signalNav();
     });
-    _defProtoMethod(_LocProto, 'replace', (url) => {
+    _defProtoMethod(_locHolder, 'replace', (url) => {
         _parseLocationUrl(url);
         _browser_oxide.__pendingNavigation = 
  { url: _locationData.href, kind: "replace" };
         _signalNav();
     });
-    _defProtoMethod(_LocProto, 'reload', () => {
+    _defProtoMethod(_locHolder, 'reload', () => {
         _browser_oxide.__pendingNavigation = 
  { url: _locationData.href, kind: "reload" };
         _signalNav();
     });
-    _defProtoMethod(_LocProto, 'toString', function() { return this.href; });
-    _LocProto[Symbol.toPrimitive] = function() { return this.href; };
+    _defProtoMethod(_locHolder, 'toString', function() { return this.href; });
 
-    _maskAsNative(_LocProto, 'assign', 'replace', 'reload', 'toString');
+    _maskAsNative(_locHolder, 'assign', 'replace', 'reload', 'toString');
 
     const _locationInstance = Object.create(_LocProto);
+    {
+        const order = ['ancestorOrigins', 'href', 'origin', 'protocol', 'host', 'hostname',
+            'port', 'pathname', 'search', 'hash', 'assign', 'reload', 'replace', 'toString'];
+        Object.defineProperty(_locationInstance, 'valueOf', {
+            value: Object.prototype.valueOf, writable: false, enumerable: false, configurable: false,
+        });
+        for (const key of order) {
+            const d = Object.getOwnPropertyDescriptor(_locHolder, key);
+            if (!d) continue;
+            Object.defineProperty(_locationInstance, key, d.get || d.set
+                ? { get: d.get, set: d.set, enumerable: true, configurable: false }
+                : { value: d.value, writable: false, enumerable: true, configurable: false });
+        }
+        Object.defineProperty(_locationInstance, Symbol.toPrimitive, {
+            value: undefined, writable: false, enumerable: false, configurable: false,
+        });
+    }
     try {
         // Delete Deno's location getter if it exists
         delete globalThis.location;
@@ -1516,33 +1490,43 @@
         globalThis.location = _locationInstance;
     }
 
-    // Frame-tree globals. `window`/`self`/`frames` are always this window.
-    for (const key of ['window', 'self', 'frames']) {
-        Object.defineProperty(globalThis, key, {
-            value: globalThis,
-            writable: false,
-            configurable: false,
-            enumerable: true
-        });
-    }
-    // `parent`/`top` are accessors (as in Chrome, where they live on Window as
-    // getters) so a child realm can be pointed at a bridge to its real parent.
-    // As plain self-referential data properties, a child's `parent.postMessage`
-    // just talked to itself and no widget could ever reach the embedder.
+    // Frame-tree globals. Measured against a live Chrome 151: every one of
+    // these is an accessor, `window`/`top` are [LegacyUnforgeable] and so
+    // non-configurable, and the [Replaceable] ones carry a setter that turns
+    // the property into a plain data property. `window`/`self`/`frames` used to
+    // be non-configurable data properties here, which `getOwnPropertyDescriptor`
+    // reports as `.get === undefined` — a difference no real browser shows.
     const _frameLinks = { parent: globalThis, top: globalThis };
-    for (const key of ['parent', 'top']) {
-        Object.defineProperty(globalThis, key, {
-            get() { return _frameLinks[key]; },
-            configurable: false,
-            enumerable: true
-        });
-    }
+    const _replaceableSetter = (key) => Object.getOwnPropertyDescriptor({
+        set [key](v) {
+            Object.defineProperty(globalThis, key, {
+                value: v, writable: true, enumerable: true, configurable: true,
+            });
+        },
+    }, key).set;
+    const _defFrameRef = (key, read, configurable, replaceable) => {
+        const get = Object.getOwnPropertyDescriptor({ get [key]() { return read(); } }, key).get;
+        const desc = { get, enumerable: true, configurable };
+        if (replaceable) desc.set = _replaceableSetter(key);
+        Object.defineProperty(globalThis, key, desc);
+        _maskFunction(get, `get ${key}`);
+        if (desc.set) _maskFunction(desc.set, `set ${key}`);
+    };
+    const _thisWindow = () => globalThis;
+    _defFrameRef('window', _thisWindow, true, false);
+    _defFrameRef('self', _thisWindow, true, true);
+    _defFrameRef('frames', _thisWindow, true, true);
+    // `parent`/`top` read through `_frameLinks` so a child realm can be pointed
+    // at a bridge to its real parent; as self-referential data properties a
+    // child's `parent.postMessage` just talked to itself.
+    _defFrameRef('parent', () => _frameLinks.parent, true, true);
+    _defFrameRef('top', () => _frameLinks.top, true, false);
     // Privileged setter for the child-frame installer. It lives on the
     // symbol-keyed namespace rather than as a `__bo_*` global: a string key is
     // listed by `Object.getOwnPropertyNames(window)` whether enumerable or not,
     // and that sweep is exactly what fingerprinting scripts run.
     try {
-        const _ns = (function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})();
+        const _ns = (function(){try{var s=Object.getOwnPropertySymbols(globalThis, 1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})();
         if (_ns) {
             Object.defineProperty(_ns, 'setFrameLinks', {
                 value: (parent, top) => {
@@ -1653,7 +1637,7 @@
     // through to the profile.
     const _frameBox = () => {
         try {
-            const syms = Object.getOwnPropertySymbols(globalThis);
+            const syms = Object.getOwnPropertySymbols(globalThis, 1);
             for (let i = 0; i < syms.length; i++) {
                 const v = globalThis[syms[i]];
                 if (v && v.__bo) return v.frame || null;
@@ -1898,8 +1882,6 @@
         _defProtoGetter(_ScreenProto, 'pixelDepth', () => _pInt("screen_color_depth", 24));
     }
 
-    // Explicitly define documentMode as undefined to pass 'prop in document' checks quietly
-    Object.defineProperty(Document.prototype, 'documentMode', { value: undefined, enumerable: false, configurable: true });
 
     const _hunt = (obj, name) => {
         return obj;
@@ -1925,142 +1907,10 @@
     // Chrome exposes low-entropy fields synchronously (brands, mobile,
     // platform). High-entropy values go through getHighEntropyValues()
     // which returns a Promise and rejects on invalid descriptor shape.
-    (function setupUaData() {
-        // Chrome userAgentData.platform enum: "Windows" | "macOS" | "Linux"
-        // | "Android" | "Chrome OS" | "Chromium OS" | "Fuchsia" | "iOS" | "".
-        // Our os_name already uses these exact strings (with macOS not Mac OS X).
-        const _uaPlatform = () => _p("os_name", "Windows");
-        const _uaBrowserMajor = () => _p("browser_version", "130.0.6723.91").split(".")[0];
-        const _uaBrowserFull = () => _p("browser_version", "130.0.6723.91");
-        const _uaArch = () => _p("cpu_architecture", "x86");
-        const _uaBitness = () => _p("cpu_bitness", "64");
-        const _uaPlatformVersion = () => {
-            // Chrome on Linux reports empty; profile already honors this.
-            const v = _p("platform_version", "");
-            if (v) return v;
-            if (_uaPlatform() === "Linux") return "";
-            // Fallback: zero-pad os_version to a triple when platform_version
-            // not set (keeps legacy profiles working).
-            const ver = _p("os_version", "");
-            const parts = ver.split(".");
-            if (parts.length >= 3) return ver;
-            if (parts.length === 2) return parts[0] + "." + parts[1] + ".0";
-            if (parts.length === 1 && parts[0]) return parts[0] + ".0.0";
-            return "";
-        };
-        const _uaModel = () => _p("ua_model", "");
-        const _uaWow64 = () => _p("ua_wow64", "false") === "true";
-
-        // GREASE: Chrome's brand array lists Chromium / Google Chrome /
-        // Not-A.Brand in RANDOM order per startup. Real Chrome draws from
-        // a cryptographic RNG; Date.now() shuffling was pseudo-random
-        // enough to be detected in some probes. Use crypto.getRandomValues
-        // when available, fall back to Math.random.
-        const _secureRand = (n) => {
-            try {
-                const a = new Uint32Array(1);
-                crypto.getRandomValues(a);
-                return a[0] % n;
-            } catch (_) {
-                return Math.floor(Math.random() * n);
-            }
-        };
-        const _shuffled = (arr) => {
-            const copy = arr.slice();
-            for (let i = copy.length - 1; i > 0; i--) {
-                const j = _secureRand(i + 1);
-                [copy[i], copy[j]] = [copy[j], copy[i]];
-            }
-            return copy;
-        };
-
-        // Phase 7 — real Chrome 147 GREASE entry is
-        // `{brand: "Not.A/Brand", version: "8"}`, not "24".
-        // Chrome rotates the GREASE version periodically.
-        const _makeLowBrands = () => Object.freeze(_shuffled([
-            Object.freeze({ brand: "Chromium", version: _uaBrowserMajor() }),
-            Object.freeze({ brand: "Google Chrome", version: _uaBrowserMajor() }),
-            Object.freeze({ brand: "Not.A/Brand", version: "8" }),
-        ]).map(Object.freeze));
-        const _makeFullBrands = () => Object.freeze(_shuffled([
-            Object.freeze({ brand: "Chromium", version: _uaBrowserFull() }),
-            Object.freeze({ brand: "Google Chrome", version: _uaBrowserFull() }),
-            Object.freeze({ brand: "Not.A/Brand", version: "8.0.0.0" }),
-        ]).map(Object.freeze));
-        // Chrome re-uses the same GREASE ordering across a userAgentData
-        // object's lifetime; only randomized once per construction.
-        let _lowBrands = null, _fullBrands = null;
-        const _lowCached = () => (_lowBrands ||= _makeLowBrands());
-        const _fullCached = () => (_fullBrands ||= _makeFullBrands());
-
-        const _allowedHints = new Set([
-            "architecture", "bitness", "brands", "formFactors", "fullVersionList",
-            "mobile", "model", "platform", "platformVersion",
-            "uaFullVersion", "wow64",
-        ]);
-
-        const _navUaData = (() => {
-            const _UAProto = globalThis.NavigatorUAData && globalThis.NavigatorUAData.prototype;
-            const u = _UAProto ? Object.create(_UAProto) : {};
-            Object.defineProperties(u, {
-                brands: { get: () => _lowCached(), enumerable: true },
-                mobile: { get: () => false, enumerable: true },
-                platform: { get: () => _uaPlatform(), enumerable: true },
-            });
-            u.getHighEntropyValues = ({
-                getHighEntropyValues(hints) {
-                    // Chrome rejects with TypeError on non-array (or missing).
-                    if (!Array.isArray(hints)) {
-                        return Promise.reject(new TypeError(
-                            "Failed to execute 'getHighEntropyValues' on 'NavigatorUAData': " +
-                            "The provided value cannot be converted to a sequence."
-                        ));
-                    }
-                    const result = {
-                        brands: _lowCached(),
-                        mobile: false,
-                        platform: _uaPlatform(),
-                    };
-                    for (const key of hints) {
-                        if (typeof key !== "string") continue;
-                        switch (key) {
-                            case "architecture":      result.architecture = _uaArch(); break;
-                            case "bitness":           result.bitness = _uaBitness(); break;
-                            case "brands":            result.brands = _lowCached(); break;
-                            case "formFactors":       result.formFactors = ["Desktop"]; break;
-                            case "fullVersionList":   result.fullVersionList = _fullCached(); break;
-                            case "mobile":            result.mobile = false; break;
-                            case "model":             result.model = _uaModel(); break;
-                            case "platform":          result.platform = _uaPlatform(); break;
-                            case "platformVersion":   result.platformVersion = _uaPlatformVersion(); break;
-                            case "uaFullVersion":     result.uaFullVersion = _uaBrowserFull(); break;
-                            case "wow64":             result.wow64 = _uaWow64(); break;
-                        }
-                    }
-                    return Promise.resolve(result);
-                }
-            }).getHighEntropyValues;
-            _maskFunction(u.getHighEntropyValues, 'getHighEntropyValues');
-
-            u.toJSON = ({
-                toJSON() {
-                    return {
-                        brands: _lowCached().map(b => ({ brand: b.brand, version: b.version })),
-                        mobile: false,
-                        platform: _uaPlatform(),
-                    };
-                }
-            }).toJSON;
-            _maskFunction(u.toJSON, 'toJSON');
-            return u;
-        })();
-        // userAgentData is [SecureContext] — return undefined on
-        // insecure contexts so probes get a TypeError when reading
-        // navigator.userAgentData.brands. Phase 7.
-        // userAgentData is a Chrome-only (Client Hints) API — Gecko/WebKit
-        // never expose it. Returning it under a Firefox UA is a 100% tell.
+    {
+        const _navUaData = _svc.make(globalThis.NavigatorUAData);
         _defNav('userAgentData', () => (_isFirefox() ? undefined : (_secure() ? _navUaData : undefined)));
-    })();
+    }
 
     // Notification
     // globalThis.Notification = class Notification { static permission = "default"; };
@@ -2104,31 +1954,30 @@
             return '';
         }
 
-        globalThis.Worker = class Worker {
+        globalThis.Worker = class Worker extends EventTarget {
             constructor(scriptURL, options) {
-                this._url = String(scriptURL);
-                this._options = options || {};
-                this._name = (options && options.name) || '';
+                super();
+                _idl.own(this)._url = String(scriptURL);
+                _idl.own(this)._options = options || {};
+                _idl.own(this)._name = (options && options.name) || '';
                 // `type: 'module'` enables ES module semantics for the
                 // worker body (import.meta.url, async module eval,
                 // top-level await). Default is 'classic'.
-                this._type = (options && options.type) || 'classic';
-                const isModule = this._type === 'module';
-                this.onmessage = null;
-                this.onerror = null;
-                this.onmessageerror = null;
-                this._listeners = { message: [], messageerror: [], error: [] };
+                _idl.own(this)._type = (options && options.type) || 'classic';
+                const isModule = _idl.own(this)._type === 'module';
+                // The handler attributes are accessors on Worker.prototype,
+                // as in Chrome; assigning them here would leave own properties
+                // on an object that has none in a real browser.
 
-                const script = _resolveWorkerScript(this._url);
+                const script = _resolveWorkerScript(_idl.own(this)._url);
                 if (!script) {
                     // Script resolution failed; defer to next tick and fire error.
-                    this._id = 0;
+                    _idl.own(this)._id = 0;
                     const self = this;
                     Promise.resolve().then(() => {
-                        self._fireEvent('error', {
-                            type: 'error',
-                            message: 'Worker script could not be resolved: ' + self._url,
-                            filename: self._url,
+                        _dispatchTo(self, 'error', {
+                            message: 'Worker script could not be resolved: ' + _idl.own(self)._url,
+                            filename: _idl.own(self)._url,
                             lineno: 0,
                             colno: 0,
                         });
@@ -2141,9 +1990,9 @@
                 // with real Chrome's WorkerLocation. Some workers
                 // read `self.location.origin` to
                 // gate execution; empty location silently bails.
-                this._id = _wops.op_worker_spawn(script, this._name, isModule, this._url);
-                if (this._id <= 0) {
-                    this._id = 0;
+                _idl.own(this)._id = _wops.op_worker_spawn(script, _idl.own(this)._name, isModule, _idl.own(this)._url);
+                if (_idl.own(this)._id <= 0) {
+                    _idl.own(this)._id = 0;
                     return;
                 }
 
@@ -2159,9 +2008,9 @@
                 // pinning.
                 const self = this;
                 const _drainOnce = () => {
-                    if (!self._id) return;
-                    _wops.op_worker_await_message(self._id).then((raw) => {
-                        if (!raw || !self._id) return; // worker died
+                    if (!_idl.own(self)._id) return;
+                    _wops.op_worker_await_message(_idl.own(self)._id).then((raw) => {
+                        if (!raw || !_idl.own(self)._id) return; // worker died
                         const deserializer =
                             _browser_oxide && _browser_oxide.deserializeFromWire;
                         let payload = null;
@@ -2174,8 +2023,7 @@
                         if (payload && payload.error) {
                             const err = payload.error;
                             try {
-                                self._fireEvent('error', {
-                                    type: 'error',
+                                _dispatchTo(self, 'error', {
                                     message: String(err.message || ''),
                                     filename: String(err.filename || ''),
                                     lineno: err.lineno | 0,
@@ -2187,16 +2035,7 @@
                         const data = deserializer
                             ? deserializer(payload && payload.data)
                             : payload && payload.data;
-                        const event = {
-                            type: 'message',
-                            data,
-                            origin: '',
-                            lastEventId: '',
-                            source: null,
-                            ports: [],
-                            timeStamp: Date.now(),
-                        };
-                        try { self._fireEvent('message', event); }
+                        try { _dispatchTo(self, 'message', { data, origin: '', lastEventId: '', source: null, ports: [] }); }
                         catch (_) {}
                         _drainOnce(); // chain next await
                     }).catch(() => {});
@@ -2204,21 +2043,8 @@
                 _drainOnce();
             }
 
-            _fireEvent(type, event) {
-                const arr = this._listeners[type];
-                if (arr) {
-                    for (const fn of arr.slice()) {
-                        try { fn.call(this, event); } catch (e) {}
-                    }
-                }
-                const on = this['on' + type];
-                if (typeof on === 'function') {
-                    try { on.call(this, event); } catch (e) {}
-                }
-            }
-
             postMessage(message, transfer) {
-                if (!this._id) return;
+                if (!_idl.own(this)._id) return;
                 // Transferables: accepted as an array. Each entry (an
                 // ArrayBuffer or view) is reachable from the message
                 // and will be serialized with it. Real browsers
@@ -2258,13 +2084,13 @@
                 } catch (_e) {
                     payload = JSON.stringify({ data: null });
                 }
-                _wops.op_worker_post_to_worker(this._id, payload);
+                _wops.op_worker_post_to_worker(_idl.own(this)._id, payload);
             }
 
             terminate() {
-                if (this._id) {
-                    try { _wops.op_worker_terminate(this._id); } catch (e) {}
-                    this._id = 0;
+                if (_idl.own(this)._id) {
+                    try { _wops.op_worker_terminate(_idl.own(this)._id); } catch (e) {}
+                    _idl.own(this)._id = 0;
                 }
                 if (this._pollTimer) {
                     clearInterval(this._pollTimer);
@@ -2272,55 +2098,52 @@
                 }
             }
 
-            addEventListener(type, listener) {
-                if (!this._listeners[type]) this._listeners[type] = [];
-                this._listeners[type].push(listener);
-            }
-            removeEventListener(type, listener) {
-                const arr = this._listeners[type];
-                if (!arr) return;
-                const i = arr.indexOf(listener);
-                if (i >= 0) arr.splice(i, 1);
-            }
-            dispatchEvent(event) {
-                this._fireEvent(event && event.type, event);
-                return true;
-            }
         };
         Object.defineProperty(globalThis.Worker.prototype, Symbol.toStringTag, {
             value: 'Worker',
             configurable: true,
         });
     }
+    const _dispatchTo = (target, type, init) => {
+        const Ctor = type === 'error' ? globalThis.ErrorEvent
+            : (type === 'message' || type === 'messageerror') ? globalThis.MessageEvent
+                : globalThis.Event;
+        let ev;
+        try { ev = new Ctor(type, init); } catch (_e) { ev = Object.assign({ type }, init); }
+        let dispatched = false;
+        try { dispatched = target.dispatchEvent(ev) !== undefined; } catch (_e) {}
+        if (!dispatched) {
+            const on = target['on' + type];
+            if (typeof on === 'function') { try { on.call(target, ev); } catch (_e) {} }
+        }
+        return ev;
+    };
+
     if (!globalThis.SharedWorker) {
-        globalThis.SharedWorker = class SharedWorker {
+        globalThis.SharedWorker = class SharedWorker extends EventTarget {
+            #url;
             constructor(scriptURL, options) {
-                this.port = {
-                    onmessage: null,
-                    postMessage() {},
-                    start() {},
-                    close() {},
-                    addEventListener() {},
-                    removeEventListener() {},
-                };
+                super();
+                const _st = _idl.own(this);
+                _st.port = new MessageChannel().port1;
                 this.onerror = null;
-                this._url = String(scriptURL);
+                this.#url = String(scriptURL);
             }
-            addEventListener() {}
-            removeEventListener() {}
-            dispatchEvent() { return true; }
         };
+    _idl.fields(SharedWorker.prototype, ["port"]);
     }
     if (!globalThis.ServiceWorker) {
         globalThis.ServiceWorker = class ServiceWorker extends EventTarget {
             constructor() {
                 super();
-                this.scriptURL = "";
-                this.state = "activated";
+                const _st = _idl.own(this);
+                _st.scriptURL = "";
+                _st.state = "activated";
                 this.onstatechange = null;
             }
             postMessage() {}
         };
+    _idl.fields(ServiceWorker.prototype, ["scriptURL", "state"]);
     }
     if (!globalThis.WorkerGlobalScope) {
         // WorkerGlobalScope is the class that Worker's `self` is an instance
@@ -2371,7 +2194,7 @@
             }
             readAsText(blob, encoding) {
                 try {
-                    const bytes = (blob && blob._data) ? blob._data : new Uint8Array(0);
+                    const bytes = (blob && _idl.own(blob)._data) ? _idl.own(blob)._data : new Uint8Array(0);
                     const dec = new TextDecoder(encoding || 'utf-8');
                     this.result = dec.decode(bytes);
                 } catch (e) { this.error = e; this.result = null; }
@@ -2380,7 +2203,7 @@
             }
             readAsDataURL(blob) {
                 try {
-                    const bytes = (blob && blob._data) ? blob._data : new Uint8Array(0);
+                    const bytes = (blob && _idl.own(blob)._data) ? _idl.own(blob)._data : new Uint8Array(0);
                     const b64 = _readerEncode2(bytes);
                     const mime = (blob && blob.type) || 'application/octet-stream';
                     this.result = `data:${mime};base64,${b64}`;
@@ -2390,7 +2213,7 @@
             }
             readAsArrayBuffer(blob) {
                 try {
-                    const bytes = (blob && blob._data) ? blob._data : new Uint8Array(0);
+                    const bytes = (blob && _idl.own(blob)._data) ? _idl.own(blob)._data : new Uint8Array(0);
                     const buf = new ArrayBuffer(bytes.byteLength);
                     new Uint8Array(buf).set(bytes);
                     this.result = buf;
@@ -2400,7 +2223,7 @@
             }
             readAsBinaryString(blob) {
                 try {
-                    const bytes = (blob && blob._data) ? blob._data : new Uint8Array(0);
+                    const bytes = (blob && _idl.own(blob)._data) ? _idl.own(blob)._data : new Uint8Array(0);
                     let bin = '';
                     const CHUNK = 0x8000;
                     for (let i = 0; i < bytes.length; i += CHUNK) {
@@ -2440,10 +2263,11 @@
         });
         // Read by CanvasRenderingContext2D.prototype.drawImage to find the
         // backing surface. Non-enumerable, like the canvas element's own.
-        Object.defineProperty(ImageBitmap.prototype, "_canvasId", {
-            get() { const s = _bmp.get(this); return s && s.canvas ? s.canvas._canvasId : undefined; },
-            configurable: true,
-        });
+        const _bmpCanvasId = (o) => {
+            const st = _bmp.get(o);
+            return st && st.canvas ? _idl.own(st.canvas)._canvasId : undefined;
+        };
+        if (_boNs) _boNs.bitmapCanvasId = _bmpCanvasId;
         globalThis.ImageBitmap = ImageBitmap;
         if (typeof _maskFunction === "function") _maskFunction(ImageBitmap, "ImageBitmap");
 
@@ -2474,8 +2298,8 @@
                 throw new TypeError(
                     "Failed to execute 'createImageBitmap' on 'Window': The provided value is not of type '(HTMLImageElement or SVGImageElement or HTMLVideoElement or HTMLCanvasElement or Blob or ImageData or ImageBitmap or OffscreenCanvas)'");
             }
-            if (src._canvasId !== undefined) return src;
-            if (src._decodedImageId !== undefined && src._decodedImageId >= 0) return src;
+            if (_idl.own(src)._canvasId !== undefined || _bmpCanvasId(src) !== undefined) return src;
+            if (_boNs && _boNs.decodedImageId && _boNs.decodedImageId(src) >= 0) return src;
             // An <img> still in flight.
             if (typeof src.decode === "function" && "src" in src) {
                 await src.decode();
@@ -2559,164 +2383,12 @@
         if (typeof _maskFunction === "function") _maskFunction(createImageBitmap, "createImageBitmap");
     }
 
-    {
-        globalThis.DOMPoint = class DOMPoint {
-            constructor(x, y, z, w) {
-                this.x = x || 0;
-                this.y = y || 0;
-                this.z = z || 0;
-                this.w = w === undefined ? 1 : w;
-            }
-            matrixTransform() { return new DOMPoint(this.x, this.y, this.z, this.w); }
-            toJSON() { return { x: this.x, y: this.y, z: this.z, w: this.w }; }
-            static fromPoint(p) { return new DOMPoint(p?.x, p?.y, p?.z, p?.w); }
-        };
-        globalThis.DOMPointReadOnly = globalThis.DOMPoint;
-    }
-
-    // ── DOMMatrix — real 2D math.
-    //
-    // The stub here ignored its constructor argument and every operation
-    // returned a fresh identity, so `inverse()` and `transformPoint()` were
-    // pure noise. Canvas code maps pointer coordinates into canvas space with
-    // exactly that pair, so a page doing hit-testing against its own transform
-    // got answers unrelated to where the pointer actually was.
-    // Installed unconditionally: an earlier bootstrap may already have put a
-    // name here, and a guarded install silently loses to it.
-    {
-        const _sync = (m) => {
-            m.m11 = m.a; m.m12 = m.b; m.m21 = m.c; m.m22 = m.d; m.m41 = m.e; m.m42 = m.f;
-            m.isIdentity = m.a === 1 && m.b === 0 && m.c === 0
-                && m.d === 1 && m.e === 0 && m.f === 0;
-            return m;
-        };
-        const _from = (a, b, c, d, e, f) => {
-            const m = Object.create(DOMMatrix.prototype);
-            m.a = a; m.b = b; m.c = c; m.d = d; m.e = e; m.f = f;
-            m.m13 = 0; m.m14 = 0; m.m23 = 0; m.m24 = 0;
-            m.m31 = 0; m.m32 = 0; m.m33 = 1; m.m34 = 0; m.m43 = 0; m.m44 = 1;
-            m.is2D = true;
-            return _sync(m);
-        };
-        class DOMMatrix {
-            constructor(init) {
-                let v = [1, 0, 0, 1, 0, 0];
-                if (typeof init === "string") {
-                    const nums = init.match(/-?[\d.eE+]+/g);
-                    if (nums && nums.length >= 6) v = nums.slice(0, 6).map(Number);
-                } else if (init && typeof init.length === "number") {
-                    if (init.length >= 16) {
-                        v = [init[0], init[1], init[4], init[5], init[12], init[13]];
-                    } else if (init.length >= 6) {
-                        v = [init[0], init[1], init[2], init[3], init[4], init[5]];
-                    }
-                } else if (init && typeof init === "object") {
-                    v = [init.a ?? 1, init.b ?? 0, init.c ?? 0, init.d ?? 1, init.e ?? 0, init.f ?? 0];
-                }
-                this.a = v[0]; this.b = v[1]; this.c = v[2];
-                this.d = v[3]; this.e = v[4]; this.f = v[5];
-                this.m13 = 0; this.m14 = 0; this.m23 = 0; this.m24 = 0;
-                this.m31 = 0; this.m32 = 0; this.m33 = 1; this.m34 = 0;
-                this.m43 = 0; this.m44 = 1;
-                this.is2D = true;
-                _sync(this);
-            }
-            multiply(o) {
-                if (!o) return _from(this.a, this.b, this.c, this.d, this.e, this.f);
-                return _from(
-                    this.a * o.a + this.c * o.b,
-                    this.b * o.a + this.d * o.b,
-                    this.a * o.c + this.c * o.d,
-                    this.b * o.c + this.d * o.d,
-                    this.a * o.e + this.c * o.f + this.e,
-                    this.b * o.e + this.d * o.f + this.f,
-                );
-            }
-            translate(tx, ty) { return this.multiply(_from(1, 0, 0, 1, tx || 0, ty || 0)); }
-            scale(sx, sy) {
-                const x = sx === undefined ? 1 : sx;
-                return this.multiply(_from(x, 0, 0, sy === undefined ? x : sy, 0, 0));
-            }
-            rotate(deg) {
-                const r = ((deg || 0) * Math.PI) / 180;
-                const c = Math.cos(r), s = Math.sin(r);
-                return this.multiply(_from(c, s, -s, c, 0, 0));
-            }
-            inverse() {
-                const det = this.a * this.d - this.b * this.c;
-                if (!det || !isFinite(det)) return _from(NaN, NaN, NaN, NaN, NaN, NaN);
-                return _from(
-                    this.d / det, -this.b / det, -this.c / det, this.a / det,
-                    (this.c * this.f - this.d * this.e) / det,
-                    (this.b * this.e - this.a * this.f) / det,
-                );
-            }
-            transformPoint(p) {
-                const x = (p && p.x) || 0, y = (p && p.y) || 0;
-                return new DOMPoint(
-                    this.a * x + this.c * y + this.e,
-                    this.b * x + this.d * y + this.f,
-                    (p && p.z) || 0,
-                    p && p.w === undefined ? 1 : (p && p.w),
-                );
-            }
-            toString() {
-                return "matrix(" + [this.a, this.b, this.c, this.d, this.e, this.f].join(", ") + ")";
-            }
-            toFloat32Array() { return new Float32Array(this.toFloat64Array()); }
-            toFloat64Array() {
-                return new Float64Array([
-                    this.a, this.b, 0, 0, this.c, this.d, 0, 0,
-                    0, 0, 1, 0, this.e, this.f, 0, 1,
-                ]);
-            }
-        }
-        globalThis.DOMMatrix = DOMMatrix;
-        if (typeof _maskFunction === "function") _maskFunction(DOMMatrix, "DOMMatrix");
-    }
-
     // Path2D DELIBERATELY NOT STUBBED. Our JS-class stub creates non-native
     // method descriptors observable via `Object
     // .getOwnPropertyDescriptor(Path2D.prototype, 'addPath')` — a class
     // method is a data descriptor, real Chrome's is a native accessor.
     // Better to report `typeof Path2D === 'undefined'` than to expose a
     // stub whose descriptors differ from real Chrome.
-    // PerformanceObserver / PerformanceEntry / ReportingObserver
-    if (!globalThis.PerformanceObserver) {
-        globalThis.PerformanceObserver = class PerformanceObserver {
-            constructor(cb) { this._cb = cb; }
-            observe() {}
-            disconnect() {}
-            takeRecords() { return []; }
-        };
-        // Real Chrome exposes supportedEntryTypes as a static GETTER, not a
-        // data property. Fingerprinters do Object.getOwnPropertyDescriptor
-        // and a data descriptor is distinctive.
-        Object.defineProperty(globalThis.PerformanceObserver, "supportedEntryTypes", {
-            get() {
-                return ["element", "event", "first-input", "largest-contentful-paint",
-                        "layout-shift", "longtask", "mark", "measure", "navigation",
-                        "paint", "resource", "visibility-state"];
-            },
-            configurable: true,
-            enumerable: true,
-        });
-    }
-    if (!globalThis.PerformanceEntry) {
-        globalThis.PerformanceEntry = class PerformanceEntry {
-            constructor() { this.name = ""; this.entryType = ""; this.startTime = 0; this.duration = 0; }
-            toJSON() { return { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration }; }
-        };
-    }
-
-    if (!globalThis.ReportingObserver) {
-        globalThis.ReportingObserver = class ReportingObserver {
-            constructor() {}
-            observe() {}
-            disconnect() {}
-            takeRecords() { return []; }
-        };
-    }
 
     // Streams, channels, EventSource, compression — second batch-2 block
     if (!globalThis.ReadableStream) {
@@ -2748,179 +2420,9 @@
     if (!globalThis.ReadableStreamDefaultReader) globalThis.ReadableStreamDefaultReader = class ReadableStreamDefaultReader {};
     if (!globalThis.WritableStreamDefaultWriter) globalThis.WritableStreamDefaultWriter = class WritableStreamDefaultWriter {};
 
-    if (!globalThis.BroadcastChannel) {
-        globalThis.BroadcastChannel = class BroadcastChannel extends EventTarget {
-            constructor(name) { super(); this.name = name; this.onmessage = null; this.onmessageerror = null; }
-            postMessage() {}
-            close() {}
-        };
-    }
 
-    // Proper MessageChannel / MessagePort
-    // implementation per HTML spec §9.4. The pre-fix no-op stub broke
-    // any worker that relays via a channel. Behavior:
-    //   - paired ports route postMessage bidirectionally
-    //   - port stays in "non-started" mode until start() / onmessage
-    //     setter / addEventListener('message') is called (HTML spec
-    //     enables-message-dispatch trigger). Messages queued before
-    //     enabling are delivered when enabled.
-    //   - close() detaches the port from its pair; further postMessage
-    //     is a silent no-op (spec: discard).
-    // Structured-clone is approximated via globalThis.structuredClone
-    // (the engine ships a real impl in structured_clone.js); falls back
-    // to identity if unavailable so tests that bypass the polyfill
-    // still see the right wiring.
-    {
-        const _PortPaired = new WeakMap();   // port → paired port
-        const _PortQueue = new WeakMap();    // port → Array<msg> queued pre-start
-        const _PortEnabled = new WeakMap();  // port → bool (start gate)
-        const _PortClosed = new WeakMap();   // port → bool
 
-        const _clone = (data) => {
-            try {
-                if (typeof globalThis.structuredClone === 'function') {
-                    return globalThis.structuredClone(data);
-                }
-            } catch (_e) {}
-            return data;
-        };
 
-        const _enable = (port) => {
-            if (_PortEnabled.get(port)) return;
-            _PortEnabled.set(port, true);
-            const q = _PortQueue.get(port);
-            if (!q || !q.length) return;
-            _PortQueue.set(port, []);
-            // Drain synchronously. HTML spec routes via the event loop;
-            // we drain inline so that `port.onmessage = fn; port.start()`
-            // sees its queued messages before control returns to the
-            // caller (deno_core's microtask drain across `execute_script`
-            // boundaries isn't reliable for this).
-            for (const msg of q) _deliver(port, msg);
-        };
-
-        const _deliver = (port, data) => {
-            if (_PortClosed.get(port)) return;
-            if (!_PortEnabled.get(port)) {
-                let q = _PortQueue.get(port);
-                if (!q) { q = []; _PortQueue.set(port, q); }
-                q.push(data);
-                return;
-            }
-            // Deliver as a MACROTASK, not synchronously. React 18's concurrent
-            // scheduler is built on a MessageChannel: it sets port1.onmessage =
-            // performWorkUntilDeadline and calls port2.postMessage(null) to
-            // schedule the NEXT chunk of work, REQUIRING that callback to run on
-            // a later task so it can yield between units. Synchronous re-entrant
-            // delivery (the previous behaviour) ran performWorkUntilDeadline
-            // inside postMessage — re-entering the scheduler — so the concurrent
-            // render never completed and `#root` stayed an empty shell (the
-            // thin-render gap on duolingo/douyin/adidas/ozon/wildberries). The
-            // event loop drives this timer during the nav drain, so React's
-            // render chain now runs to completion.
-            const _fire = () => {
-                if (_PortClosed.get(port)) return;
-                try {
-                    const ev = new MessageEvent('message', { data, bubbles: false, cancelable: false });
-                    // dispatchEvent fires both addEventListener handlers AND the
-                    // on-property (deno_core's EventTarget auto-promotes
-                    // `onmessage`). Calling the on-property explicitly too would
-                    // double-fire it.
-                    port.dispatchEvent(ev);
-                } catch (_e) {}
-            };
-            const _sched = globalThis.__bgSetTimeout || globalThis.setTimeout;
-            try { _sched(_fire, 0); } catch (_e) { _fire(); }
-        };
-
-        globalThis.MessagePort = class MessagePort extends EventTarget {
-            constructor() {
-                super();
-                this._onmessage = null;
-                this.onmessageerror = null;
-            }
-            get onmessage() { return this._onmessage; }
-            set onmessage(fn) {
-                this._onmessage = (typeof fn === 'function') ? fn : null;
-                // Spec: setting onmessage implicitly enables dispatch.
-                if (this._onmessage) _enable(this);
-            }
-            postMessage(data /*, transfer */) {
-                if (_PortClosed.get(this)) return;
-                const paired = _PortPaired.get(this);
-                if (!paired) return;
-                const cloned = _clone(data);
-                // Delivery to the PAIRED port (spec semantics).
-                _deliver(paired, cloned);
-            }
-            start() { _enable(this); }
-            close() {
-                _PortClosed.set(this, true);
-                // Detach from pair so the other side stops being able
-                // to deliver to us. Pair is preserved on the other
-                // port's side so its close() still works.
-                const paired = _PortPaired.get(this);
-                if (paired) _PortPaired.delete(this);
-            }
-            addEventListener(type, listener, options) {
-                super.addEventListener(type, listener, options);
-                // Spec: addEventListener('message', …) also implicitly
-                // enables dispatch (mirrors onmessage setter).
-                if (type === 'message') _enable(this);
-            }
-        };
-
-        // Re-tag the constructor + prototype methods so the universal
-        // mask sweep (cleanup_bootstrap) tags them with the right name;
-        // they are already function declarations so their identity is
-        // fine. The Symbol-tagged closures (_PortPaired et al.) live in
-        // the bootstrap IIFE scope and survive the snapshot.
-
-        globalThis.MessageChannel = class MessageChannel {
-            constructor() {
-                this.port1 = new globalThis.MessagePort();
-                this.port2 = new globalThis.MessagePort();
-                _PortPaired.set(this.port1, this.port2);
-                _PortPaired.set(this.port2, this.port1);
-            }
-        };
-    }
-
-    if (!globalThis.EventSource) {
-        globalThis.EventSource = class EventSource extends EventTarget {
-            static CONNECTING = 0;
-            static OPEN = 1;
-            static CLOSED = 2;
-            constructor(url) {
-                super();
-                this.url = String(url);
-                this.readyState = 0;
-                this.withCredentials = false;
-                this.onopen = null;
-                this.onmessage = null;
-                this.onerror = null;
-            }
-            close() { this.readyState = 2; }
-        };
-    }
-
-    // CompressionStream / DecompressionStream (Chrome 80+)
-    if (!globalThis.CompressionStream) {
-        globalThis.CompressionStream = class CompressionStream {
-            constructor() {
-                this.readable = new globalThis.ReadableStream();
-                this.writable = new globalThis.WritableStream();
-            }
-        };
-    }
-    if (!globalThis.DecompressionStream) {
-        globalThis.DecompressionStream = class DecompressionStream {
-            constructor() {
-                this.readable = new globalThis.ReadableStream();
-                this.writable = new globalThis.WritableStream();
-            }
-        };
-    }
     // end batch 2
 
     // speechSynthesis — prototype-backed; bot tests check getVoices().length > 0
@@ -3002,6 +2504,12 @@
             };
             Patched.prototype = _Orig.prototype;
             if (_Orig.supportedLocalesOf) Patched.supportedLocalesOf = _Orig.supportedLocalesOf.bind(_Orig);
+            // Real Chrome's Intl.DateTimeFormat/etc. constructors report
+            // their own class name here — a wrapper's `.name` defaulting to
+            // "Patched" is a direct giveaway (`Intl.DateTimeFormat.name`
+            // is a one-line probe).
+            if (typeof _maskFunction === "function") _maskFunction(Patched, klass);
+            else Object.defineProperty(Patched, 'name', { value: klass, configurable: true });
             Object.defineProperty(globalThis.Intl, klass, { value: Patched, writable: true, configurable: true });
         };
 
@@ -3015,20 +2523,28 @@
             if (!globalThis.Intl[klass]) continue;
             const proto = globalThis.Intl[klass].prototype;
             const origResolved = proto.resolvedOptions;
-            proto.resolvedOptions = function() {
+            proto.resolvedOptions = { resolvedOptions() {
                 const res = origResolved.call(this);
                 const pTz = _profileTz();
                 const pLoc = _profileLocale();
                 if (pTz) res.timeZone = pTz;
                 if (pLoc) res.locale = pLoc;
                 return res;
-            };
+            } }.resolvedOptions;
+            if (typeof _maskAsNative === "function") _maskAsNative(proto, 'resolvedOptions');
         }
 
         // Date.prototype.getTimezoneOffset — compute the offset from the
         // profile timezone at each call so DST transitions stay accurate.
         const _origGetTimezoneOffset = Date.prototype.getTimezoneOffset;
-        Date.prototype.getTimezoneOffset = function () {
+        // Method-shorthand, not `function getTimezoneOffset() {}` — plus no
+        // own `toString`/`_nativeTag` property (the older pattern this
+        // replaces): an own `toString` is itself a shape tell (Chrome's
+        // real Date.prototype.getTimezoneOffset has none — `.toString`
+        // resolves up the chain to Function.prototype.toString). Masking
+        // goes through `_maskAsNative`, same as every other native-shaped
+        // method in this file.
+        Date.prototype.getTimezoneOffset = { getTimezoneOffset() {
             const profileTz = _profileTz();
             if (!profileTz) return _origGetTimezoneOffset.call(this);
             try {
@@ -3052,12 +2568,8 @@
             } catch (_e) {
                 return _origGetTimezoneOffset.call(this);
             }
-        };
-        Object.defineProperty(Date.prototype.getTimezoneOffset, "toString", {
-            value: () => "function getTimezoneOffset() { [native code] }",
-            configurable: true,
-        });
-        Object.defineProperty(Date.prototype.getTimezoneOffset, _nativeTag, { value: 'getTimezoneOffset', configurable: true });
+        } }.getTimezoneOffset;
+        if (typeof _maskAsNative === "function") _maskAsNative(Date.prototype, 'getTimezoneOffset');
 
         // =========================================================
         // Date.prototype toString patches — print the profile's
@@ -3324,6 +2836,14 @@
             let offset = 10;
             const _internalEntries = _browser_oxide.__perfResourceEntries || [];
             const _rustEntries = (ops.op_perf_get_resource_timings && ops.op_perf_get_resource_timings()) || [];
+            // The DOM scan below (source of truth for a synthetic
+            // `Page::from_html` page with no real fetches) and the Rust
+            // navigation pipeline both know about the same `<script src>`/
+            // `<link href>` sub-resources on a REAL navigation — without
+            // this, every one of them showed up twice, once from each
+            // source, with two different (and both partly fake) timings
+            // for what real Chrome reports as a single fetch.
+            const _rustNames = new Set(_rustEntries.map((rt) => rt.name));
 
             const mk = (name, startOffset, duration, type, size) => ({
                 name,
@@ -3351,25 +2871,52 @@
                 renderBlockingStatus: "non-blocking",
             });
 
+            // Also used to give `_rustEntries` (below) a real
+            // `initiatorType` instead of a blanket "other" — real Chrome
+            // reports "script"/"link" for exactly these DOM-sourced kinds.
+            const _scriptSrcs = new Set();
+            const _linkHrefs = new Set();
+            const _linkStylesheets = new Set();
+            const _imgSrcs = new Set();
             if (globalThis.document) {
                 const scripts = globalThis.document.scripts || [];
                 for (let i = 0; i < scripts.length; i++) {
-                    if (scripts[i].src) {
-                        entries.push(mk(scripts[i].src, offset, 50, "script", 48600));
-                        offset += 15;
-                    }
+                    if (scripts[i].src) _scriptSrcs.add(scripts[i].src);
                 }
+                // Chrome reports `initiatorType: "link"` for everything a
+                // `<link>` pulls, not just stylesheets — `rel=preload` fonts
+                // and `modulepreload` scripts land there too. That wider set
+                // only *classifies* fetches that really happened; the
+                // placeholder loop below stays on stylesheets, since inventing
+                // an entry for a resource we never requested is its own lie.
                 const links = globalThis.document.getElementsByTagName('link') || [];
                 for (let i = 0; i < links.length; i++) {
-                    if (links[i].rel === 'stylesheet' && links[i].href) {
-                        entries.push(mk(links[i].href, offset, 30, "link", 12500));
-                        offset += 10;
+                    const rel = (links[i].rel || '').toLowerCase();
+                    if (!links[i].href) continue;
+                    if (rel === 'stylesheet') _linkStylesheets.add(links[i].href);
+                    if (rel === 'stylesheet' || rel === 'preload' || rel === 'modulepreload') {
+                        _linkHrefs.add(links[i].href);
                     }
                 }
                 const images = globalThis.document.images || [];
                 for (let i = 0; i < images.length; i++) {
-                    if (images[i].src) {
-                        entries.push(mk(images[i].src, offset, 80, "img", 25000));
+                    if (images[i].src) _imgSrcs.add(images[i].src);
+                }
+                for (const src of _scriptSrcs) {
+                    if (!_rustNames.has(src)) {
+                        entries.push(mk(src, offset, 50, "script", 48600));
+                        offset += 15;
+                    }
+                }
+                for (const href of _linkStylesheets) {
+                    if (!_rustNames.has(href)) {
+                        entries.push(mk(href, offset, 30, "link", 12500));
+                        offset += 10;
+                    }
+                }
+                for (const src of _imgSrcs) {
+                    if (!_rustNames.has(src)) {
+                        entries.push(mk(src, offset, 80, "img", 25000));
                         offset += 20;
                     }
                 }
@@ -3393,17 +2940,41 @@
             }
 
             for (const rt of _rustEntries) {
-                const e = mk(rt.name, 0, rt.duration, "other", 0);
+                // Real `initiatorType`, not a blanket "other", when this
+                // fetch corresponds to a `<script src>`/`<link
+                // rel=stylesheet>` actually on the page — same distinction
+                // real Chrome makes.
+                const rtType = _scriptSrcs.has(rt.name) ? "script"
+                    : _linkHrefs.has(rt.name) ? "link"
+                    : _imgSrcs.has(rt.name) ? "img"
+                    : "other";
+                const e = mk(rt.name, 0, rt.duration, rtType, 0);
                 e.startTime = rt.start_time;
                 e.fetchStart = rt.fetch_start;
                 e.domainLookupStart = rt.domain_lookup_start;
                 e.domainLookupEnd = rt.domain_lookup_end;
                 e.connectStart = rt.connect_start;
-                e.connect_end = rt.connect_end;
+                e.connectEnd = rt.connect_end;
                 e.secureConnectionStart = rt.secure_connection_start;
                 e.requestStart = rt.request_start;
                 e.responseStart = rt.response_start;
                 e.responseEnd = rt.response_end;
+                // `mk()` was built with size=0 above — the transfer-encoding
+                // byte count (compressed on the wire) isn't tracked
+                // separately from the decoded body, so rather than run it
+                // through `mk()`'s size*3 placeholder ratio (fabricating a
+                // *different* wrong number), report the one real figure we
+                // have — decoded body bytes — and the closest honest
+                // estimate for the other two: uncompressed-equivalent
+                // (encodedBodySize = decodedBodySize) plus the same small
+                // header-overhead constant `mk()` uses elsewhere in this
+                // function. A real 0-byte fetch (204, HEAD) still reports
+                // zeros for all three, same as `mk()`'s own default.
+                if (rt.decoded_body_size > 0) {
+                    e.decodedBodySize = rt.decoded_body_size;
+                    e.encodedBodySize = rt.decoded_body_size;
+                    e.transferSize = rt.decoded_body_size + 300;
+                }
                 entries.push(e);
             }
 
@@ -3456,27 +3027,37 @@
         // it as an own property on the instance with a native-code toString.
         const _origNow = globalThis.performance.now && globalThis.performance.now.bind(globalThis.performance);
 
-        // Real Chrome QUANTIZES performance.memory to 100KB buckets (an
-        // anti-fingerprinting measure) and the values are STABLE within a page
-        // load — they do not jitter per call. The prior getter returned an
-        // unbucketed, per-call-varying value (totalJSHeapSize = base +
-        // Date.now()-derived jitter, used = total*0.85), so usedJSHeapSize was
-        // almost never a multiple of 100000 and changed every read — a value no
-        // real Chrome ever reports (a fingerprinting tell). Compute once
-        // per realm (closure cache) and bucket to 100KB.
+        // Measured against Chrome 151 on this very page: the values are
+        // byte-precise (38215185 / 33091241 — neither divisible by 100000),
+        // identical across reads in one synchronous block, and they grow when
+        // the page allocates. A previous note here claimed Chrome quantizes to
+        // 100 KB buckets and rounded accordingly, which made every value we
+        // reported a multiple of 100000 — something real Chrome never shows.
+        //
+        // V8's own heap totals have all three properties for free, so report
+        // those. Refreshed on a coarse clock so a tight read loop sees one
+        // stable value while the number still tracks real allocation.
         let _perfMemCache = null;
+        let _perfMemAt = 0;
+        const _PERF_MEM_TTL_MS = 1000;
         _defProtoGetter(_PerfProto, 'memory', () => {
-            if (!_perfMemCache) {
-                const Q = 100000;
-                const base = 10485760; // 10 MB
-                const jitter = ((Date.now() * 0x9e3779b9) >>> 0) % 5000000;
-                const totalJSHeapSize = Math.round((base + jitter) / Q) * Q;
-                const usedJSHeapSize = Math.round((totalJSHeapSize * 0.85) / Q) * Q;
-                _perfMemCache = {
-                    jsHeapSizeLimit: 4294705152,
-                    totalJSHeapSize,
-                    usedJSHeapSize,
-                };
+            const now = Date.now();
+            if (!_perfMemCache || now - _perfMemAt > _PERF_MEM_TTL_MS) {
+                let total = 0;
+                let used = 0;
+                try {
+                    const stats = ops.op_perf_heap_stats();
+                    total = stats[0];
+                    used = stats[1];
+                } catch (_) {}
+                if (total > 0 && used > 0) {
+                    _perfMemCache = {
+                        jsHeapSizeLimit: 4294705152,
+                        totalJSHeapSize: total,
+                        usedJSHeapSize: used,
+                    };
+                    _perfMemAt = now;
+                }
             }
             return _perfMemCache;
         });
@@ -3513,42 +3094,15 @@
             return _perfOrigin;
         });
         _defProtoGetter(_PerfProto, 'navigation', () => _perfNavigation);
-        _defProtoGetter(_PerfProto, 'onresourcetimingbufferfull', () => null);
+        {
+            const slot = new WeakMap();
+            _defProtoGetter(_PerfProto, 'onresourcetimingbufferfull',
+                function () { return slot.get(this) || null; },
+                function (v) { slot.set(this, typeof v === 'function' ? v : null); });
+        }
 
         _defProtoMethod(_PerfProto, 'getEntries', function getEntries() {
-            const entries = [_navEntry(), ..._buildResourceEntries()];
-            const origin = globalThis.location ? globalThis.location.origin : "";
-            
-            // Add challenge-resource fallback entries if not present
-            if (!entries.some(e => e.name.includes('qauth') || e.name.includes('wbaas'))) {
-                const start = 12.5;
-                const dur = 45.2;
-                entries.push({
-                    name: `${origin}/__qrator/qauth_utm_v2d_v9118.js`,
-                    entryType: 'resource',
-                    startTime: start,
-                    duration: dur,
-                    initiatorType: 'script',
-                    nextHopProtocol: 'h2',
-                    workerStart: 0,
-                    redirectStart: 0,
-                    redirectEnd: 0,
-                    fetchStart: start,
-                    domainLookupStart: start,
-                    domainLookupEnd: start,
-                    connectStart: start,
-                    connectEnd: start,
-                    secureConnectionStart: start,
-                    requestStart: start + 1,
-                    responseStart: start + 5,
-                    responseEnd: start + dur,
-                    transferSize: 349878,
-                    encodedBodySize: 349800,
-                    decodedBodySize: 349800,
-                    serverTiming: []
-                });
-            }
-            return entries;
+            return [_navEntry(), ..._buildResourceEntries()];
         });
         _defProtoMethod(_PerfProto, 'getEntriesByType', function getEntriesByType(type) {
             if (type === "navigation") return [_navEntry()];
@@ -3796,65 +3350,6 @@
             Object.defineProperty(TextEncoder, 'name', { value: 'TextEncoder', configurable: true });
         } catch {}
     }
-    if (!globalThis.TextDecoder || !('encoding' in TextDecoder.prototype)) {
-        class TextDecoder {
-            constructor(label = "utf-8", options = {}) {
-                this._label = String(label).toLowerCase();
-                this._fatal = !!options.fatal;
-                this._ignoreBOM = !!options.ignoreBOM;
-            }
-            decode(buf, options) {
-                if (buf === undefined) return "";
-                let bytes;
-                if (buf instanceof ArrayBuffer) bytes = new Uint8Array(buf);
-                else if (ArrayBuffer.isView(buf)) bytes = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
-                else bytes = new Uint8Array(buf);
-                let str = "";
-                let i = 0;
-                // Skip BOM unless ignoreBOM is set
-                if (!this._ignoreBOM && bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
-                    i = 3;
-                }
-                while (i < bytes.length) {
-                    const b0 = bytes[i];
-                    if (b0 < 0x80) { str += String.fromCharCode(b0); i++; }
-                    else if ((b0 & 0xe0) === 0xc0 && i + 1 < bytes.length) {
-                        const cp = ((b0 & 0x1f) << 6) | (bytes[i+1] & 0x3f);
-                        str += String.fromCharCode(cp); i += 2;
-                    }
-                    else if ((b0 & 0xf0) === 0xe0 && i + 2 < bytes.length) {
-                        const cp = ((b0 & 0x0f) << 12) | ((bytes[i+1] & 0x3f) << 6) | (bytes[i+2] & 0x3f);
-                        str += String.fromCharCode(cp); i += 3;
-                    }
-                    else if ((b0 & 0xf8) === 0xf0 && i + 3 < bytes.length) {
-                        let cp = ((b0 & 0x07) << 18) | ((bytes[i+1] & 0x3f) << 12) | ((bytes[i+2] & 0x3f) << 6) | (bytes[i+3] & 0x3f);
-                        cp -= 0x10000;
-                        str += String.fromCharCode(0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3ff));
-                        i += 4;
-                    }
-                    else {
-                        // Invalid byte — fatal throws, otherwise emits replacement char U+FFFD
-                        if (this._fatal) throw new TypeError("The encoded data was not valid.");
-                        str += "\uFFFD"; i++;
-                    }
-                }
-                return str;
-            }
-        }
-        globalThis.TextDecoder = TextDecoder;
-        _defProtoGetter(TextDecoder.prototype, 'encoding', function encoding() { return this._label || "utf-8"; });
-        _defProtoGetter(TextDecoder.prototype, 'fatal', function fatal() { return this._fatal; });
-        _defProtoGetter(TextDecoder.prototype, 'ignoreBOM', function ignoreBOM() { return this._ignoreBOM; });
-        _defProtoMethod(TextDecoder.prototype, 'decode', TextDecoder.prototype.decode);
-        try {
-            Object.defineProperty(TextDecoder, 'toString', {
-                value: function toString() { return 'function TextDecoder() { [native code] }'; },
-                configurable: true,
-            });
-            Object.defineProperty(TextDecoder, _nativeTag, { value: 'TextDecoder', configurable: true });
-            Object.defineProperty(TextDecoder, 'name', { value: 'TextDecoder', configurable: true });
-        } catch {}
-    }
 
     // atob / btoa
     if (!globalThis.atob) {
@@ -3992,28 +3487,32 @@
     // self-redirects to /errors/not-supported.html. Class getters land
     // on the prototype, satisfying the `in prototype` checks.
     globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {
-        constructor(init = {}) { this._i = init || {}; }
-        get target() { return this._i.target ?? null; }
-        get isIntersecting() { return this._i.isIntersecting ?? false; }
-        get intersectionRatio() { return this._i.intersectionRatio ?? 0; }
-        get boundingClientRect() { return this._i.boundingClientRect ?? null; }
-        get intersectionRect() { return this._i.intersectionRect ?? null; }
-        get rootBounds() { return this._i.rootBounds ?? null; }
-        get time() { return this._i.time ?? 0; }
+        #i;
+        constructor(init = {}) { this.#i = init || {}; }
+        get target() { return this.#i.target ?? null; }
+        get isIntersecting() { return this.#i.isIntersecting ?? false; }
+        get intersectionRatio() { return this.#i.intersectionRatio ?? 0; }
+        get boundingClientRect() { return this.#i.boundingClientRect ?? null; }
+        get intersectionRect() { return this.#i.intersectionRect ?? null; }
+        get rootBounds() { return this.#i.rootBounds ?? null; }
+        get time() { return this.#i.time ?? 0; }
     };
 
     // IntersectionObserver — fires immediately since all elements are "in viewport" in headless
     globalThis.IntersectionObserver = class IntersectionObserver {
+        #callback;
+        #elements;
+        #options;
         constructor(callback, options = {}) {
-            this._callback = callback;
-            this._options = options;
-            this._elements = new Set();
+            this.#callback = callback;
+            this.#options = options;
+            this.#elements = new Set();
         }
         observe(target) {
-            this._elements.add(target);
+            this.#elements.add(target);
             // In headless mode, all elements are considered intersecting
             Promise.resolve().then(() => {
-                if (!this._elements.has(target)) return;
+                if (!this.#elements.has(target)) return;
                 const entry = new globalThis.IntersectionObserverEntry({
                     target,
                     isIntersecting: true,
@@ -4023,35 +3522,37 @@
                     rootBounds: null,
                     time: performance.now(),
                 });
-                this._callback([entry], this);
+                this.#callback([entry], this);
             });
         }
-        unobserve(target) { this._elements.delete(target); }
-        disconnect() { this._elements.clear(); }
+        unobserve(target) { this.#elements.delete(target); }
+        disconnect() { this.#elements.clear(); }
         takeRecords() { return []; }
     };
 
     // ResizeObserver — fires on observe() with current dimensions
     globalThis.ResizeObserver = class ResizeObserver {
+        #callback;
+        #elements;
         constructor(callback) {
-            this._callback = callback;
-            this._elements = new Set();
+            this.#callback = callback;
+            this.#elements = new Set();
         }
         observe(target) {
-            this._elements.add(target);
+            this.#elements.add(target);
             Promise.resolve().then(() => {
-                if (!this._elements.has(target)) return;
+                if (!this.#elements.has(target)) return;
                 const entry = {
                     target,
                     contentRect: target.getBoundingClientRect ? target.getBoundingClientRect() : { x: 0, y: 0, width: 0, height: 0 },
                     borderBoxSize: [{ inlineSize: target.offsetWidth || 0, blockSize: target.offsetHeight || 0 }],
                     contentBoxSize: [{ inlineSize: target.offsetWidth || 0, blockSize: target.offsetHeight || 0 }],
                 };
-                this._callback([entry], this);
+                this.#callback([entry], this);
             });
         }
-        unobserve(target) { this._elements.delete(target); }
-        disconnect() { this._elements.clear(); }
+        unobserve(target) { this.#elements.delete(target); }
+        disconnect() { this.#elements.clear(); }
     };
 
     // requestIdleCallback stub
@@ -4162,7 +3663,7 @@
 
     /// The `.response` value for a finished XHR, from the raw response bytes.
     ///
-    /// It used to be `xhr.response = xhr.responseText` unconditionally — every
+    /// It used to be `_idl.own(xhr).response = xhr.responseText` unconditionally — every
     /// `responseType` came back as the lossy UTF-8 text, so `responseType =
     /// "arraybuffer"` handed a page a buffer built from a string that had
     /// already lost every non-UTF-8 byte to U+FFFD, and `"blob"` wrapped that
@@ -4175,7 +3676,7 @@
                 return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
             case "blob": {
                 const b = new Blob([]);
-                b._data = bytes;
+                _idl.own(b)._data = bytes;
                 b.size = bytes.byteLength;
                 b.type = contentType || "";
                 return b;
@@ -4200,22 +3701,23 @@
     globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
         constructor() {
             super();
-            this.readyState = 0;
-            this.status = 0;
-            this.statusText = "";
-            this.responseText = "";
-            this.responseXML = null;
-            this.response = "";
+            const _st = _idl.own(this);
+            _st.readyState = 0;
+            _st.status = 0;
+            _st.statusText = "";
+            _st.responseText = "";
+            _st.responseXML = null;
+            _st.response = "";
             this.responseType = "";
-            this.responseURL = "";
+            _st.responseURL = "";
             this.withCredentials = false;
             this.timeout = 0;
-            this._method = "GET";
-            this._url = "";
-            this._async = true;
-            this._headers = {};
-            this._respHeaders = {};
-            this._aborted = false;
+            _idl.own(this)._method = "GET";
+            _idl.own(this)._url = "";
+            _idl.own(this)._async = true;
+            _idl.own(this)._headers = {};
+            _idl.own(this)._respHeaders = {};
+            _idl.own(this)._aborted = false;
             // Event handler properties — match Chrome's XHR interface.
             this.onreadystatechange = null;
             this.onload = null;
@@ -4239,7 +3741,7 @@
                 }
             };
             Object.defineProperty(_XHRU.prototype, Symbol.toStringTag, { value: "XMLHttpRequestUpload", configurable: true });
-            this.upload = new _XHRU();
+            _st.upload = new _XHRU();
         }
         static UNSENT = 0;
         static OPENED = 1;
@@ -4247,8 +3749,9 @@
         static LOADING = 3;
         static DONE = 4;
         open(method, url, async = true, user, password) {
+            const _st = _idl.own(this);
             console.log(`[XHR] open ${method} ${url}`);
-            this._method = String(method || "GET").toUpperCase();
+            _idl.own(this)._method = String(method || "GET").toUpperCase();
             let urlStr = String(url || "");
             if (urlStr && !urlStr.startsWith('http') && !urlStr.startsWith('data:') && !urlStr.startsWith('blob:')) {
                 try {
@@ -4261,17 +3764,17 @@
                 } catch(e) {
                 }
             }
-            this._url = urlStr;
-            this._async = async !== false;
-            this._headers = {};
-            this._respHeaders = {};
-            this._aborted = false;
-            this.readyState = 1;
-            this.status = 0;
-            this.statusText = "";
-            this.responseText = "";
-            this.response = "";
-            this.responseURL = "";
+            _idl.own(this)._url = urlStr;
+            _idl.own(this)._async = async !== false;
+            _idl.own(this)._headers = {};
+            _idl.own(this)._respHeaders = {};
+            _idl.own(this)._aborted = false;
+            _st.readyState = 1;
+            _st.status = 0;
+            _st.statusText = "";
+            _st.responseText = "";
+            _st.response = "";
+            _st.responseURL = "";
             try {
                 const ev = new Event("readystatechange");
                 if (typeof this.dispatchEvent === 'function') this.dispatchEvent(ev);
@@ -4279,13 +3782,13 @@
             } catch {}
         }
         setRequestHeader(name, value) {
-            this._headers[String(name)] = String(value);
+            _idl.own(this)._headers[String(name)] = String(value);
         }
         overrideMimeType(mime) { this._overrideMime = String(mime); }
         send(body) {
-            console.log(`[XHR] send ${this._method} ${this._url}`);
+            console.log(`[XHR] send ${_idl.own(this)._method} ${_idl.own(this)._url}`);
             const xhr = this;
-            if (xhr._aborted) return;
+            if (_idl.own(xhr)._aborted) return;
             const fireEvent = (type) => {
                 try {
                     const ev = new Event(type);
@@ -4330,14 +3833,14 @@
                     mp += '--' + boundary + '--\r\n';
                     bodyEncoded = 's:' + mp;
                     // Force the browser-controlled Content-Type (drop any prior variant).
-                    for (const k of Object.keys(xhr._headers)) {
-                        if (k.toLowerCase() === 'content-type') delete xhr._headers[k];
+                    for (const k of Object.keys(_idl.own(xhr)._headers)) {
+                        if (k.toLowerCase() === 'content-type') delete _idl.own(xhr)._headers[k];
                     }
-                    xhr._headers['Content-Type'] = 'multipart/form-data; boundary=' + boundary;
+                    _idl.own(xhr)._headers['Content-Type'] = 'multipart/form-data; boundary=' + boundary;
                 } else if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
                     bodyEncoded = 's:' + body.toString();
-                    const hasCT = Object.keys(xhr._headers).some((k) => k.toLowerCase() === 'content-type');
-                    if (!hasCT) xhr._headers['Content-Type'] = 'application/x-www-form-urlencoded;charset=UTF-8';
+                    const hasCT = Object.keys(_idl.own(xhr)._headers).some((k) => k.toLowerCase() === 'content-type');
+                    if (!hasCT) _idl.own(xhr)._headers['Content-Type'] = 'application/x-www-form-urlencoded;charset=UTF-8';
                 } else {
                     bodyEncoded = 's:' + String(body);
                 }
@@ -4347,45 +3850,45 @@
             // xhr.open('POST', url, false) + xhr.send() and read xhr.status immediately
             // after send() returns. The async fetch() path can never satisfy this because
             // it requires V8 to yield, which doesn't happen when a proof-of-work busy-wait is running.
-            if (!xhr._async && typeof ops !== 'undefined' && typeof ops.op_net_xhr_sync === 'function') {
+            if (!_idl.own(xhr)._async && typeof ops !== 'undefined' && typeof ops.op_net_xhr_sync === 'function') {
                 const startTime = performance.now();
                 try {
                     const origin = (globalThis.location && globalThis.location.origin !== 'null')
                         ? globalThis.location.origin : '';
                     const headersJson = JSON.stringify(
-                        Object.entries(xhr._headers).map(([k, v]) => [k, String(v)])
+                        Object.entries(_idl.own(xhr)._headers).map(([k, v]) => [k, String(v)])
                     );
                     const resultJson = ops.op_net_xhr_sync(
-                        xhr._url, xhr._method, headersJson, bodyEncoded, origin
+                        _idl.own(xhr)._url, _idl.own(xhr)._method, headersJson, bodyEncoded, origin
                     );
                     const result = JSON.parse(resultJson);
                     
                     const _internalEntries = _browser_oxide.__perfResourceEntries;
                     if (_internalEntries) {
-                        _internalEntries.push({ url: xhr._url, type: "xmlhttprequest", startTime, duration: performance.now() - startTime, size: result.body ? result.body.length : 0 });
+                        _internalEntries.push({ url: _idl.own(xhr)._url, type: "xmlhttprequest", startTime, duration: performance.now() - startTime, size: result.body ? result.body.length : 0 });
                     }
                     
-                    xhr.status = result.status || 0;
-                    xhr.statusText = '';
-                    xhr.responseURL = result.url || xhr._url;
+                    _idl.own(xhr).status = result.status || 0;
+                    _idl.own(xhr).statusText = '';
+                    _idl.own(xhr).responseURL = result.url || _idl.own(xhr)._url;
                     if (Array.isArray(result.headers)) {
                         for (const [k, v] of result.headers) {
-                            xhr._respHeaders[String(k).toLowerCase()] = String(v);
+                            _idl.own(xhr)._respHeaders[String(k).toLowerCase()] = String(v);
                         }
                     }
-                    xhr.responseText = result.body || '';
+                    _idl.own(xhr).responseText = result.body || '';
                     {
                         const bytes = _xhrB64ToBytes(result.bodyBase64 || '');
-                        const ct = xhr._respHeaders['content-type'] || '';
-                        xhr.response = _xhrResponseFor(xhr, bytes, xhr.responseText, ct);
+                        const ct = _idl.own(xhr)._respHeaders['content-type'] || '';
+                        _idl.own(xhr).response = _xhrResponseFor(xhr, bytes, xhr.responseText, ct);
                     }
-                    xhr.readyState = 2; fireEvent('readystatechange');
-                    xhr.readyState = 3; fireEvent('readystatechange');
-                    xhr.readyState = 4; fireEvent('readystatechange');
+                    _idl.own(xhr).readyState = 2; fireEvent('readystatechange');
+                    _idl.own(xhr).readyState = 3; fireEvent('readystatechange');
+                    _idl.own(xhr).readyState = 4; fireEvent('readystatechange');
                     fireEvent('load');
                     fireEvent('loadend');
                 } catch(e) {
-                    xhr.readyState = 4;
+                    _idl.own(xhr).readyState = 4;
                     fireEvent('readystatechange');
                     fireEvent('error');
                     fireEvent('loadend');
@@ -4395,9 +3898,9 @@
 
             // Fallback: async fetch() path (used only when op_net_xhr_sync is unavailable).
             fireEvent('loadstart');
-            fetch(xhr._url, {
-                method: xhr._method,
-                headers: xhr._headers,
+            fetch(_idl.own(xhr)._url, {
+                method: _idl.own(xhr)._method,
+                headers: _idl.own(xhr)._headers,
                 body,
                 credentials: xhr.withCredentials ? 'include' : 'same-origin',
             })
@@ -4406,42 +3909,43 @@
                     if (_internalEntries && _internalEntries.length > 0) {
                         _internalEntries[_internalEntries.length - 1].type = "xmlhttprequest";
                     }
-                    if (xhr._aborted) return;
-                    xhr.status = resp.status;
-                    xhr.statusText = resp.statusText || "";
-                    xhr.responseURL = resp.url || xhr._url;
+                    if (_idl.own(xhr)._aborted) return;
+                    _idl.own(xhr).status = resp.status;
+                    _idl.own(xhr).statusText = resp.statusText || "";
+                    _idl.own(xhr).responseURL = resp.url || _idl.own(xhr)._url;
                     try {
                         if (resp.headers && typeof resp.headers.forEach === 'function') {
-                            resp.headers.forEach((v, k) => { xhr._respHeaders[String(k).toLowerCase()] = String(v); });
+                            resp.headers.forEach((v, k) => { _idl.own(xhr)._respHeaders[String(k).toLowerCase()] = String(v); });
                         }
                     } catch {}
-                    xhr.readyState = 2;
+                    _idl.own(xhr).readyState = 2;
                     fireEvent('readystatechange');
-                    xhr.readyState = 3;
+                    _idl.own(xhr).readyState = 3;
                     fireEvent('readystatechange');
-                    xhr.responseText = await resp.text();
+                    _idl.own(xhr).responseText = await resp.text();
                     {
                         const buf = await resp.arrayBuffer();
                         const bytes = new Uint8Array(buf);
-                        const ct = xhr._respHeaders['content-type'] || '';
-                        xhr.response = _xhrResponseFor(xhr, bytes, xhr.responseText, ct);
+                        const ct = _idl.own(xhr)._respHeaders['content-type'] || '';
+                        _idl.own(xhr).response = _xhrResponseFor(xhr, bytes, xhr.responseText, ct);
                     }
-                    xhr.readyState = 4;
+                    _idl.own(xhr).readyState = 4;
                     fireEvent('readystatechange');
                     fireEvent('load');
                     fireEvent('loadend');
                 })
                 .catch((e) => {
-                    if (xhr._aborted) return;
-                    xhr.readyState = 4;
+                    if (_idl.own(xhr)._aborted) return;
+                    _idl.own(xhr).readyState = 4;
                     fireEvent('readystatechange');
                     fireEvent('error');
                     fireEvent('loadend');
                 });
         }
         abort() {
-            this._aborted = true;
-            this.readyState = 0;
+            const _st = _idl.own(this);
+            _idl.own(this)._aborted = true;
+            _st.readyState = 0;
             try {
                 const ev = new Event("abort");
                 if (typeof this.dispatchEvent === 'function') this.dispatchEvent(ev);
@@ -4449,14 +3953,15 @@
             } catch {}
         }
         getResponseHeader(name) {
-            return this._respHeaders[String(name).toLowerCase()] || null;
+            return _idl.own(this)._respHeaders[String(name).toLowerCase()] || null;
         }
         getAllResponseHeaders() {
-            return Object.entries(this._respHeaders)
+            return Object.entries(_idl.own(this)._respHeaders)
                 .map(([k, v]) => `${k}: ${v}`)
                 .join("\r\n");
         }
     };
+    _idl.fields(XMLHttpRequest.prototype, ["readyState", "response", "responseText", "responseURL", "responseXML", "status", "statusText", "upload"]);
     Object.defineProperty(globalThis.XMLHttpRequest.prototype, Symbol.toStringTag, { value: "XMLHttpRequest", configurable: true });
 
     // WebSocket — real connections via tokio-tungstenite ops
@@ -4466,76 +3971,80 @@
     // so any library that registers listeners instead of assigning `onmessage`
     // (which is most of them) saw a socket that opened and then went silent.
     globalThis.WebSocket = class WebSocket extends EventTarget {
+        #origin;
+        #wsId;
         static CONNECTING = 0;
         static OPEN = 1;
         static CLOSING = 2;
         static CLOSED = 3;
         constructor(url, protocols) {
             super();
-            this.url = url;
-            this.readyState = WebSocket.CONNECTING;
+            const _st = _idl.own(this);
+            _st.url = url;
+            _st.readyState = WebSocket.CONNECTING;
             // `MessageEvent.origin` for the socket's own origin, as a browser
             // reports it.
             try {
-                this._origin = new URL(String(url)).origin.replace(/^ws/, "http");
-            } catch (_) { this._origin = ""; }
+                this.#origin = new URL(String(url)).origin.replace(/^ws/, "http");
+            } catch (_) { this.#origin = ""; }
             this.onopen = null;
             this.onmessage = null;
             this.onclose = null;
             this.onerror = null;
-            this._wsId = -1;
+            this.#wsId = -1;
 
             // Connect asynchronously
             ops.op_ws_connect(String(url)).then((result) => {
                 if (result.ok) {
-                    this._wsId = result.id;
-                    this.readyState = WebSocket.OPEN;
+                    this.#wsId = result.id;
+                    _st.readyState = WebSocket.OPEN;
                     this.dispatchEvent(new Event("open"));
                     // Start receive loop
-                    this._pollMessages();
+                    this.#pollMessages();
                 } else {
-                    this.readyState = WebSocket.CLOSED;
+                    _st.readyState = WebSocket.CLOSED;
                     this.dispatchEvent(new Event("error"));
                     this.dispatchEvent(new CloseEvent("close", { code: 1006, reason: result.error, wasClean: false }));
                 }
             }).catch((e) => {
-                this.readyState = WebSocket.CLOSED;
+                _st.readyState = WebSocket.CLOSED;
                 this.dispatchEvent(new Event("error"));
             });
         }
-        async _pollMessages() {
-            while (this.readyState === WebSocket.OPEN && this._wsId >= 0) {
+        async #pollMessages() {
+            while (this.readyState === WebSocket.OPEN && this.#wsId >= 0) {
                 try {
-                    const msg = await ops.op_ws_recv(this._wsId);
+                    const msg = await ops.op_ws_recv(this.#wsId);
                     if (!msg && msg !== "") {
                         // Connection closed
-                        this.readyState = WebSocket.CLOSED;
+                        _st.readyState = WebSocket.CLOSED;
                         this.dispatchEvent(new CloseEvent("close", { code: 1000 }));
                         break;
                     }
                     if (msg !== "") {
                         this.dispatchEvent(new MessageEvent("message", {
-                            data: msg, origin: this._origin,
+                            data: msg, origin: this.#origin,
                         }));
                     }
                 } catch (e) {
-                    this.readyState = WebSocket.CLOSED;
+                    _st.readyState = WebSocket.CLOSED;
                     this.dispatchEvent(new Event("error"));
                     break;
                 }
             }
         }
         send(data) {
-            if (this.readyState === WebSocket.OPEN && this._wsId >= 0) {
-                ops.op_ws_send(this._wsId, String(data));
+            if (this.readyState === WebSocket.OPEN && this.#wsId >= 0) {
+                ops.op_ws_send(this.#wsId, String(data));
             }
         }
         close(code, reason) {
-            if (this._wsId >= 0) {
-                ops.op_ws_close(this._wsId);
-                this._wsId = -1;
+            const _st = _idl.own(this);
+            if (this.#wsId >= 0) {
+                ops.op_ws_close(this.#wsId);
+                this.#wsId = -1;
             }
-            this.readyState = WebSocket.CLOSED;
+            _st.readyState = WebSocket.CLOSED;
             this.dispatchEvent(new CloseEvent("close", {
                 code: code || 1000, reason: reason || "",
             }));
@@ -4546,18 +4055,8 @@
         get binaryType() { return "blob"; }
         set binaryType(v) {}
     };
+    _idl.fields(WebSocket.prototype, ["readyState", "url"]);
 
-    // CloseEvent for WebSocket
-    if (!globalThis.CloseEvent) {
-        globalThis.CloseEvent = class CloseEvent extends Event {
-            constructor(type, options = {}) {
-                super(type, options);
-                this.code = options.code || 1000;
-                this.reason = options.reason || "";
-                this.wasClean = options.wasClean !== undefined ? options.wasClean : true;
-            }
-        };
-    }
 
     // --- history — prototype-backed ---
     const _historyStack = [{ state: null, title: "", url: globalThis.location?.href || "about:blank" }];
@@ -4791,16 +4290,19 @@
         };
 
         class MediaQueryList extends EventTarget {
+            #matches;
+            #media;
+            #onchange;
             constructor(query) {
                 super();
-                this._media = String(query || "");
-                this._matches = _evalQuery(this._media);
-                this._onchange = null;
+                this.#media = String(query || "");
+                this.#matches = _evalQuery(this.#media);
+                this.#onchange = null;
             }
-            get matches() { return this._matches; }
-            get media() { return this._media; }
-            get onchange() { return this._onchange; }
-            set onchange(v) { this._onchange = (typeof v === "function") ? v : null; }
+            get matches() { return this.#matches; }
+            get media() { return this.#media; }
+            get onchange() { return this.#onchange; }
+            set onchange(v) { this.#onchange = (typeof v === "function") ? v : null; }
             // Deprecated aliases — kept for legacy compat (Safari, etc.).
             addListener(cb) { try { this.addEventListener("change", cb); } catch(_) {} }
             removeListener(cb) { try { this.removeEventListener("change", cb); } catch(_) {} }
@@ -4872,53 +4374,6 @@
         _maskFunction(globalThis.prompt, "prompt");
 
 
-    // --- AbortController / AbortSignal ---
-    class AbortSignal {
-        constructor() {
-            this.aborted = false;
-            this.reason = undefined;
-            this._listeners = [];
-        }
-        addEventListener(type, cb) {
-            if (type === "abort") this._listeners.push(cb);
-        }
-        removeEventListener(type, cb) {
-            if (type === "abort") this._listeners = this._listeners.filter(l => l !== cb);
-        }
-        throwIfAborted() {
-            if (this.aborted) throw this.reason;
-        }
-        static abort(reason) {
-            const sig = new AbortSignal();
-            sig.aborted = true;
-            sig.reason = reason || new DOMException("The operation was aborted.", "AbortError");
-            return sig;
-        }
-        static timeout(ms) {
-            const sig = new AbortSignal();
-            setTimeout(() => {
-                sig.aborted = true;
-                sig.reason = new DOMException("The operation timed out.", "TimeoutError");
-                for (const cb of sig._listeners) cb();
-            }, ms);
-            return sig;
-        }
-    }
-
-    class AbortController {
-        constructor() {
-            this.signal = new AbortSignal();
-        }
-        abort(reason) {
-            if (this.signal.aborted) return;
-            this.signal.aborted = true;
-            this.signal.reason = reason || new DOMException("The operation was aborted.", "AbortError");
-            for (const cb of this.signal._listeners) cb();
-        }
-    }
-
-    globalThis.AbortController = AbortController;
-    globalThis.AbortSignal = AbortSignal;
 
     // --- DOMException ---
     if (!globalThis.DOMException) {
@@ -4948,149 +4403,6 @@
         });
     }
 
-    // --- URLSearchParams ---
-    if (!globalThis.URLSearchParams) {
-        globalThis.URLSearchParams = class URLSearchParams {
-            #params;
-            constructor(init) {
-                this.#params = [];
-                if (typeof init === "string") {
-                    const s = init.startsWith("?") ? init.slice(1) : init;
-                    for (const pair of s.split("&")) {
-                        const [k, ...v] = pair.split("=");
-                        if (k) this.#params.push([decodeURIComponent(k), decodeURIComponent(v.join("="))]);
-                    }
-                } else if (init && typeof init === "object") {
-                    for (const [k, v] of Object.entries(init)) {
-                        this.#params.push([String(k), String(v)]);
-                    }
-                }
-            }
-            get(name) { const p = this.#params.find(([k]) => k === name); return p ? p[1] : null; }
-            getAll(name) { return this.#params.filter(([k]) => k === name).map(([, v]) => v); }
-            has(name) { return this.#params.some(([k]) => k === name); }
-            set(name, value) {
-                let found = false;
-                this.#params = this.#params.filter(([k]) => { if (k === name && !found) { found = true; return true; } return k !== name; });
-                if (found) { this.#params.find(([k]) => k === name)[1] = String(value); }
-                else { this.#params.push([name, String(value)]); }
-            }
-            append(name, value) { this.#params.push([String(name), String(value)]); }
-            delete(name) { this.#params = this.#params.filter(([k]) => k !== name); }
-            toString() { return this.#params.map(([k, v]) => encodeURIComponent(k) + "=" + encodeURIComponent(v)).join("&"); }
-            forEach(cb, thisArg) { for (const [k, v] of this.#params) cb.call(thisArg, v, k, this); }
-            keys() { return this.#params.map(([k]) => k)[Symbol.iterator](); }
-            values() { return this.#params.map(([, v]) => v)[Symbol.iterator](); }
-            entries() { return this.#params[Symbol.iterator](); }
-            [Symbol.iterator]() { return this.entries(); }
-            get size() { return this.#params.length; }
-        };
-    }
-
-    // --- URL ---
-    if (!globalThis.URL) {
-    // RFC 3986 §5.2.4 — a resolved path must have its `.` and `..` segments
-    // removed. Without it `new URL('./w.js', 'https://h/dir/')` yields
-    // "https://h/dir/./w.js", which a server may well 404: measured as
-    // `new Worker('./creep.js')` failing to load on a site whose own script
-    // sits right next to the document.
-    function _removeDotSegments(path) {
-        if (path.indexOf('.') === -1) return path;
-        const out = [];
-        for (const seg of path.split('/')) {
-            if (seg === '.') continue;
-            if (seg === '..') { if (out.length > 1) out.pop(); continue; }
-            out.push(seg);
-        }
-        let res = out.join('/');
-        // A path ending in a dot segment keeps its trailing slash.
-        if (/(^|\/)\.\.?$/.test(path) && !res.endsWith('/')) res += '/';
-        return res || '/';
-    }
-
-        globalThis.URL = class URL {
-            constructor(url, base) {
-                let full = String(url);
-                // Any string that starts with a scheme is already absolute and
-                // the base is ignored — including the schemes without `//`:
-                // `data:`, `blob:`, `mailto:`, `about:`. Matching only
-                // `scheme://` turned `new URL('data:image/png;base64,…', base)`
-                // into `https://host/data:image/png;base64,…`, so every inline
-                // image and every `URL.createObjectURL` result was corrupted the
-                // moment it was resolved against the document.
-                if (base && !full.match(/^[a-z][a-z0-9+.-]*:/i)) {
-                    const b = String(base);
-                    if (full.startsWith('//')) {
-                        const proto = b.match(/^([a-z]+:)/i);
-                        full = (proto ? proto[1] : 'https:') + full;
-                    } else if (full.startsWith('/')) {
-                        const m = b.match(/^([a-z]+:\/\/[^/]+)/i);
-                        full = m ? m[1] + full : full;
-                    } else {
-                        full = b.replace(/[^/]*$/, '') + full;
-                    }
-                }
-                const m = full.match(/^([a-z]+):\/\/([^/:]+)(?::(\d+))?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/i);
-                if (m) {
-                    this.protocol = m[1].toLowerCase() + ':';
-                    this.hostname = m[2];
-                    this.port = m[3] || '';
-                    this.pathname = _removeDotSegments(m[4] || '/');
-                    this.search = m[5] || '';
-                    this.hash = m[6] || '';
-                    this.host = this.port ? this.hostname + ':' + this.port : this.hostname;
-                    this.origin = this.protocol + '//' + this.host;
-                    this.href = this.origin + this.pathname + this.search + this.hash;
-                } else {
-                    // A scheme without an authority (`data:`, `blob:`,
-                    // `mailto:`): the protocol is still reported, the rest is
-                    // the path, and the origin is opaque.
-                    const nm = full.match(/^([a-z][a-z0-9+.-]*):([^?#]*)(\?[^#]*)?(#.*)?$/i);
-                    this.href = full;
-                    if (nm) {
-                        this.protocol = nm[1].toLowerCase() + ':';
-                        this.pathname = nm[2] || '';
-                        this.search = nm[3] || '';
-                        this.hash = nm[4] || '';
-                    } else {
-                        this.protocol = ''; this.pathname = full;
-                        this.search = ''; this.hash = '';
-                    }
-                    this.hostname = ''; this.port = '';
-                    this.host = ''; this.origin = 'null';
-                }
-                this.username = ''; this.password = '';
-                this.searchParams = new URLSearchParams(this.search);
-            }
-            toString() { return this.href; }
-            toJSON() { return this.href; }
-            static createObjectURL(obj) {
-                // Allocate a stable blob URL backed by the Rust BlobRegistry
-                // so Workers (and blob: fetches) can resolve to the bytes.
-                const u = 'blob:' + (globalThis.location && globalThis.location.origin || 'null') + '/' + _randomUUID();
-                let data;
-                let contentType = '';
-                if (obj && obj._data instanceof Uint8Array) {
-                    data = obj._data;
-                    // Preserve Blob.type so fetch(blob:URL) can echo it
-                    // back as the Response's content-type header.
-                    contentType = String(obj.type || '');
-                } else if (obj instanceof Uint8Array) {
-                    data = obj;
-                } else if (typeof obj === 'string') {
-                    data = new TextEncoder().encode(obj);
-                } else {
-                    data = new Uint8Array();
-                }
-                try { ops.op_blob_register(u, data, contentType); } catch (e) {}
-                return u;
-            }
-            static revokeObjectURL(url) {
-                try { ops.op_blob_revoke(url); } catch (e) {}
-            }
-        };
-    }
-    // Small helper for URL allocation
     function _randomUUID() {
         if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
             try { return globalThis.crypto.randomUUID(); } catch (e) {}
@@ -5182,45 +4494,6 @@
     globalThis._customElementsRegistry = _customElementsRegistry;
 
     // --- Blob ---
-    if (!globalThis.Blob) {
-        const _encoder = new TextEncoder();
-        const _decoder = new TextDecoder();
-
-        globalThis.Blob = class Blob {
-            constructor(parts = [], options = {}) {
-                this.type = options.type || "";
-                // Convert all parts to Uint8Array and concatenate
-                const arrays = parts.map(p => {
-                    if (typeof p === "string") return _encoder.encode(p);
-                    if (p instanceof ArrayBuffer) return new Uint8Array(p);
-                    if (ArrayBuffer.isView(p)) return new Uint8Array(p.buffer, p.byteOffset, p.byteLength);
-                    if (p instanceof Blob) return p._data;
-                    return _encoder.encode(String(p));
-                });
-                const totalLen = arrays.reduce((s, a) => s + a.byteLength, 0);
-                const merged = new Uint8Array(totalLen);
-                let offset = 0;
-                for (const a of arrays) { merged.set(a, offset); offset += a.byteLength; }
-                this._data = merged;
-                this.size = totalLen;
-            }
-            text() { return Promise.resolve(_decoder.decode(this._data)); }
-            arrayBuffer() {
-                const buf = this._data.buffer.slice(
-                    this._data.byteOffset,
-                    this._data.byteOffset + this._data.byteLength
-                );
-                return Promise.resolve(buf);
-            }
-            slice(start = 0, end = this.size, type = "") {
-                const sliced = this._data.slice(start, end);
-                const b = new Blob([], { type });
-                b._data = sliced;
-                b.size = sliced.byteLength;
-                return b;
-            }
-        };
-    }
 
     // --- OffscreenCanvas ---
     // Chrome since 69 ships OffscreenCanvas as a global. Its absence reads
@@ -5271,533 +4544,17 @@
     // mutations back to the caller. Persistent storage is NOT
     // implemented — every page load starts with an empty DB registry,
     // which is fine for scraping (no cross-session state).
-    if (!globalThis.indexedDB || !globalThis.indexedDB._browserOxideReal) {
-        // Process-global registry so the same origin's opens get the
-        // same underlying state within a page load.
-        const _dbRegistry = new Map();
-
-        // Deep-clone via structuredClone when available, else a JSON
-        // fallback. structuredClone isn't strictly installed yet at
-        // IDB definition time in the bootstrap order, so we pick it
-        // up lazily.
-        function _clone(v) {
-            if (typeof globalThis.structuredClone === "function") {
-                try { return globalThis.structuredClone(v); } catch (_e) {}
-            }
-            try { return JSON.parse(JSON.stringify(v)); } catch (_e) { return v; }
-        }
-
-        // Compare keys per IndexedDB key ordering:
-        // number < Date < string < array (with element-wise comparison).
-        // Simplified to number/string here — sufficient for fingerprint
-        // probes which key by number or small string.
-        function _keyCmp(a, b) {
-            if (typeof a === typeof b) {
-                if (a < b) return -1;
-                if (a > b) return 1;
-                return 0;
-            }
-            // Cross-type: number < string.
-            if (typeof a === "number") return -1;
-            if (typeof b === "number") return 1;
-            return 0;
-        }
-
-        function _extractKey(value, keyPath) {
-            if (!keyPath) return undefined;
-            if (Array.isArray(keyPath)) {
-                return keyPath.map((p) => value?.[p]);
-            }
-            const parts = String(keyPath).split(".");
-            let cur = value;
-            for (const p of parts) {
-                if (cur == null) return undefined;
-                cur = cur[p];
-            }
-            return cur;
-        }
-
-        class IDBRequest {
-            constructor(source) {
-                this.result = undefined;
-                this.error = null;
-                this.source = source || null;
-                this.transaction = null;
-                this.readyState = "pending";
-                this.onsuccess = null;
-                this.onerror = null;
-                this._listeners = { success: [], error: [] };
-            }
-            addEventListener(type, listener) {
-                if (!this._listeners[type]) this._listeners[type] = [];
-                this._listeners[type].push(listener);
-            }
-            removeEventListener(type, listener) {
-                const arr = this._listeners[type];
-                if (!arr) return;
-                const i = arr.indexOf(listener);
-                if (i >= 0) arr.splice(i, 1);
-            }
-            _fireSuccess() {
-                this.readyState = "done";
-                queueMicrotask(() => {
-                    const ev = { target: this, type: "success" };
-                    if (typeof this.onsuccess === "function") {
-                        try { this.onsuccess(ev); } catch (_e) {}
-                    }
-                    for (const l of (this._listeners.success || []).slice()) {
-                        try { l.call(this, ev); } catch (_e) {}
-                    }
-                });
-            }
-            _fireError(err) {
-                this.readyState = "done";
-                this.error = err;
-                queueMicrotask(() => {
-                    const ev = { target: this, type: "error" };
-                    if (typeof this.onerror === "function") {
-                        try { this.onerror(ev); } catch (_e) {}
-                    }
-                    for (const l of (this._listeners.error || []).slice()) {
-                        try { l.call(this, ev); } catch (_e) {}
-                    }
-                });
-            }
-        }
-
-        class IDBOpenDBRequest extends IDBRequest {
-            constructor() {
-                super();
-                this.onupgradeneeded = null;
-                this.onblocked = null;
-            }
-        }
-
-        class IDBKeyRange {
-            constructor(lower, upper, lowerOpen, upperOpen) {
-                this.lower = lower;
-                this.upper = upper;
-                this.lowerOpen = !!lowerOpen;
-                this.upperOpen = !!upperOpen;
-            }
-            includes(key) {
-                if (this.lower !== undefined) {
-                    const c = _keyCmp(key, this.lower);
-                    if (c < 0) return false;
-                    if (c === 0 && this.lowerOpen) return false;
-                }
-                if (this.upper !== undefined) {
-                    const c = _keyCmp(key, this.upper);
-                    if (c > 0) return false;
-                    if (c === 0 && this.upperOpen) return false;
-                }
-                return true;
-            }
-            static bound(lower, upper, lowerOpen = false, upperOpen = false) {
-                return new IDBKeyRange(lower, upper, lowerOpen, upperOpen);
-            }
-            static only(value) {
-                return new IDBKeyRange(value, value, false, false);
-            }
-            static lowerBound(lower, open = false) {
-                return new IDBKeyRange(lower, undefined, open, false);
-            }
-            static upperBound(upper, open = false) {
-                return new IDBKeyRange(undefined, upper, false, open);
-            }
-        }
-
-        class IDBCursor {
-            constructor(store, range, direction) {
-                this.source = store;
-                this.direction = direction || "next";
-                this._store = store;
-                this._range = range;
-                // Snapshot the store's key order at cursor creation.
-                this._keys = store._sortedKeys().filter((k) =>
-                    !range || range.includes(k)
-                );
-                if (this.direction === "prev" || this.direction === "prevunique") {
-                    this._keys.reverse();
-                }
-                this._idx = -1;
-                this.key = undefined;
-                this.primaryKey = undefined;
-                this.value = undefined;
-            }
-            _advanceTo(idx) {
-                this._idx = idx;
-                if (idx < this._keys.length) {
-                    this.key = this._keys[idx];
-                    this.primaryKey = this.key;
-                    this.value = _clone(this._store._data.get(this.key));
-                } else {
-                    this.key = undefined;
-                    this.primaryKey = undefined;
-                    this.value = undefined;
-                }
-            }
-            continue(_targetKey) {
-                // Advance the request that produced this cursor.
-                this._step();
-            }
-            advance(count) {
-                for (let i = 0; i < count; i++) this._step();
-            }
-            _step() {
-                this._advanceTo(this._idx + 1);
-                if (this._request) {
-                    const done = this._idx >= this._keys.length;
-                    this._request.result = done ? null : this;
-                    this._request._fireSuccess();
-                }
-            }
-        }
-
-        class IDBObjectStore {
-            constructor(name, options, transaction) {
-                this.name = name;
-                this.keyPath = (options && options.keyPath) || null;
-                this.indexNames = [];
-                this.autoIncrement = !!(options && options.autoIncrement);
-                this.transaction = transaction || null;
-                this._data = new Map();
-                this._nextKey = 1;
-            }
-            _sortedKeys() {
-                return [...this._data.keys()].sort(_keyCmp);
-            }
-            _resolveKey(value, explicitKey) {
-                if (this.keyPath) {
-                    const extracted = _extractKey(value, this.keyPath);
-                    if (extracted !== undefined) return extracted;
-                    if (this.autoIncrement) return this._nextKey++;
-                    return undefined;
-                }
-                if (explicitKey !== undefined) return explicitKey;
-                if (this.autoIncrement) return this._nextKey++;
-                return undefined;
-            }
-            put(value, key) {
-                const r = new IDBRequest(this);
-                const resolvedKey = this._resolveKey(value, key);
-                if (resolvedKey === undefined) {
-                    r._fireError(new Error("DataError: no key"));
-                    return r;
-                }
-                this._data.set(resolvedKey, _clone(value));
-                if (this.autoIncrement && typeof resolvedKey === "number" && resolvedKey >= this._nextKey) {
-                    this._nextKey = resolvedKey + 1;
-                }
-                r.result = resolvedKey;
-                r._fireSuccess();
-                return r;
-            }
-            add(value, key) {
-                const r = new IDBRequest(this);
-                const resolvedKey = this._resolveKey(value, key);
-                if (resolvedKey === undefined) {
-                    r._fireError(new Error("DataError: no key"));
-                    return r;
-                }
-                if (this._data.has(resolvedKey)) {
-                    r._fireError(new Error("ConstraintError: key exists"));
-                    return r;
-                }
-                this._data.set(resolvedKey, _clone(value));
-                r.result = resolvedKey;
-                r._fireSuccess();
-                return r;
-            }
-            get(key) {
-                const r = new IDBRequest(this);
-                if (key instanceof IDBKeyRange) {
-                    for (const k of this._sortedKeys()) {
-                        if (key.includes(k)) {
-                            r.result = _clone(this._data.get(k));
-                            r._fireSuccess();
-                            return r;
-                        }
-                    }
-                    r.result = undefined;
-                } else {
-                    const v = this._data.get(key);
-                    r.result = v === undefined ? undefined : _clone(v);
-                }
-                r._fireSuccess();
-                return r;
-            }
-            getAll(queryOrRange, count) {
-                const r = new IDBRequest(this);
-                const out = [];
-                const limit = count ?? Infinity;
-                for (const k of this._sortedKeys()) {
-                    if (out.length >= limit) break;
-                    if (queryOrRange == null) {
-                        out.push(_clone(this._data.get(k)));
-                    } else if (queryOrRange instanceof IDBKeyRange) {
-                        if (queryOrRange.includes(k)) out.push(_clone(this._data.get(k)));
-                    } else if (_keyCmp(k, queryOrRange) === 0) {
-                        out.push(_clone(this._data.get(k)));
-                    }
-                }
-                r.result = out;
-                r._fireSuccess();
-                return r;
-            }
-            getAllKeys(queryOrRange, count) {
-                const r = new IDBRequest(this);
-                const out = [];
-                const limit = count ?? Infinity;
-                for (const k of this._sortedKeys()) {
-                    if (out.length >= limit) break;
-                    if (queryOrRange == null) {
-                        out.push(k);
-                    } else if (queryOrRange instanceof IDBKeyRange) {
-                        if (queryOrRange.includes(k)) out.push(k);
-                    } else if (_keyCmp(k, queryOrRange) === 0) {
-                        out.push(k);
-                    }
-                }
-                r.result = out;
-                r._fireSuccess();
-                return r;
-            }
-            delete(key) {
-                const r = new IDBRequest(this);
-                if (key instanceof IDBKeyRange) {
-                    for (const k of this._sortedKeys()) {
-                        if (key.includes(k)) this._data.delete(k);
-                    }
-                } else {
-                    this._data.delete(key);
-                }
-                r._fireSuccess();
-                return r;
-            }
-            clear() {
-                const r = new IDBRequest(this);
-                this._data.clear();
-                r._fireSuccess();
-                return r;
-            }
-            count(query) {
-                const r = new IDBRequest(this);
-                if (query == null) {
-                    r.result = this._data.size;
-                } else if (query instanceof IDBKeyRange) {
-                    let n = 0;
-                    for (const k of this._data.keys()) {
-                        if (query.includes(k)) n++;
-                    }
-                    r.result = n;
-                } else {
-                    r.result = this._data.has(query) ? 1 : 0;
-                }
-                r._fireSuccess();
-                return r;
-            }
-            openCursor(range, direction) {
-                const r = new IDBRequest(this);
-                let rangeObj = null;
-                if (range instanceof IDBKeyRange) rangeObj = range;
-                else if (range != null) rangeObj = IDBKeyRange.only(range);
-                const cursor = new IDBCursor(this, rangeObj, direction);
-                cursor._request = r;
-                // First step — null if no keys, cursor otherwise.
-                queueMicrotask(() => cursor._step());
-                return r;
-            }
-            createIndex(name, _keyPath, _options) {
-                if (!this.indexNames.includes(name)) this.indexNames.push(name);
-                return {
-                    name,
-                    get: (k) => this.get(k),
-                    getAll: (q, c) => this.getAll(q, c),
-                };
-            }
-            index(name) {
-                return {
-                    name,
-                    get: (k) => this.get(k),
-                    getAll: (q, c) => this.getAll(q, c),
-                };
-            }
-        }
-
-        class IDBTransaction {
-            constructor(db, storeNames, mode) {
-                this._db = db;
-                this._storeNames = storeNames;
-                this.mode = mode || "readonly";
-                this.db = db;
-                this.error = null;
-                this.oncomplete = null;
-                this.onerror = null;
-                this.onabort = null;
-                this._listeners = { complete: [], error: [], abort: [] };
-                this._active = true;
-                // Fire oncomplete on the next microtask after the
-                // caller's sync op chain finishes (matches Chrome).
-                queueMicrotask(() => this._complete());
-            }
-            objectStore(name) {
-                if (!this._db._stores.has(name)) {
-                    // Transactions can't create stores — spec throws
-                    // NotFoundError. The one exception is an
-                    // upgrade transaction, where createObjectStore
-                    // was called synchronously on the db.
-                    throw new Error("NotFoundError: store " + name);
-                }
-                const store = this._db._stores.get(name);
-                store.transaction = this;
-                return store;
-            }
-            commit() {
-                this._complete();
-            }
-            abort() {
-                this._active = false;
-                const ev = { target: this, type: "abort" };
-                if (typeof this.onabort === "function") {
-                    queueMicrotask(() => { try { this.onabort(ev); } catch (_e) {} });
-                }
-            }
-            addEventListener(type, listener) {
-                if (!this._listeners[type]) this._listeners[type] = [];
-                this._listeners[type].push(listener);
-            }
-            removeEventListener(type, listener) {
-                const arr = this._listeners[type];
-                if (!arr) return;
-                const i = arr.indexOf(listener);
-                if (i >= 0) arr.splice(i, 1);
-            }
-            _complete() {
-                if (!this._active) return;
-                this._active = false;
-                const ev = { target: this, type: "complete" };
-                if (typeof this.oncomplete === "function") {
-                    try { this.oncomplete(ev); } catch (_e) {}
-                }
-                for (const l of (this._listeners.complete || []).slice()) {
-                    try { l.call(this, ev); } catch (_e) {}
-                }
-            }
-        }
-
-        class IDBDatabase {
-            constructor(name, version) {
-                this.name = name;
-                this.version = version;
-                this._stores = new Map();
-                this.objectStoreNames = [];
-                this.onclose = null;
-                this.onversionchange = null;
-                this.onabort = null;
-                this.onerror = null;
-            }
-            createObjectStore(name, options) {
-                if (this._stores.has(name)) {
-                    throw new Error("ConstraintError: store already exists");
-                }
-                const store = new IDBObjectStore(name, options, null);
-                this._stores.set(name, store);
-                this.objectStoreNames.push(name);
-                return store;
-            }
-            deleteObjectStore(name) {
-                this._stores.delete(name);
-                this.objectStoreNames = this.objectStoreNames.filter((n) => n !== name);
-            }
-            transaction(storeNames, mode) {
-                const names = Array.isArray(storeNames) ? storeNames : [storeNames];
-                return new IDBTransaction(this, names, mode);
-            }
-            close() {}
-        }
-
-        class IDBFactory {
-            constructor() {
-                this._browserOxideReal = true;
-            }
-            open(name, version) {
-                const req = new IDBOpenDBRequest();
-                const targetVersion = version || 1;
-                let db = _dbRegistry.get(name);
-                const oldVersion = db ? db.version : 0;
-                if (!db) {
-                    db = new IDBDatabase(name, targetVersion);
-                    _dbRegistry.set(name, db);
-                } else if (db.version < targetVersion) {
-                    db.version = targetVersion;
-                }
-                req.result = db;
-
-                // Fire onupgradeneeded before onsuccess if the version
-                // jumped. Spec: the upgradeneeded handler runs in an
-                // upgrade-mode transaction that commits before success.
-                queueMicrotask(() => {
-                    if (oldVersion < targetVersion) {
-                        const tx = new IDBTransaction(db, [], "versionchange");
-                        req.transaction = tx;
-                        const ev = {
-                            target: req,
-                            oldVersion,
-                            newVersion: targetVersion,
-                            type: "upgradeneeded",
-                        };
-                        if (typeof req.onupgradeneeded === "function") {
-                            try { req.onupgradeneeded(ev); } catch (_e) {}
-                        }
-                        // Override the auto-commit microtask — we
-                        // complete the versionchange tx synchronously
-                        // once the handler returns.
-                        tx._complete();
-                        req.transaction = null;
-                    }
-                    req._fireSuccess();
-                });
-                return req;
-            }
-            deleteDatabase(name) {
-                const r = new IDBOpenDBRequest();
-                _dbRegistry.delete(name);
-                r._fireSuccess();
-                return r;
-            }
-            databases() {
-                return Promise.resolve(
-                    [..._dbRegistry.entries()].map(([name, db]) => ({
-                        name,
-                        version: db.version,
-                    }))
-                );
-            }
-            cmp(a, b) {
-                return _keyCmp(a, b);
-            }
-        }
-
-        globalThis.indexedDB = new IDBFactory();
-        globalThis.IDBFactory = IDBFactory;
-        globalThis.IDBDatabase = IDBDatabase;
-        globalThis.IDBTransaction = IDBTransaction;
-        globalThis.IDBObjectStore = IDBObjectStore;
-        globalThis.IDBRequest = IDBRequest;
-        globalThis.IDBOpenDBRequest = IDBOpenDBRequest;
-        globalThis.IDBKeyRange = IDBKeyRange;
-        globalThis.IDBCursor = IDBCursor;
-    }
 
     // ================================================================
     // WebRTC leak prevention — block real IP exposure via ICE candidates
     // ================================================================
     globalThis.RTCDataChannel = class RTCDataChannel extends EventTarget {
-        constructor() { super(); this.label = ""; this.readyState = "connecting"; this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null; }
+        constructor() {
+            super(); const _st = _idl.own(this); _st.label = ""; _st.readyState = "connecting"; this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null; }
         send() {}
         close() {}
     };
+    _idl.fields(RTCDataChannel.prototype, ["label", "readyState"]);
     const _rtcHexDigit = () => Math.floor(Math.random() * 16).toString(16);
     const _rtcDigits = (n) => {
         let out = String(1 + Math.floor(Math.random() * 9));
@@ -5829,24 +4586,37 @@
     };
 
     globalThis.RTCPeerConnection = class RTCPeerConnection extends EventTarget {
+        #channels;
+        #ice;
+        #recvAudio;
+        #recvVideo;
         constructor(config) {
             super();
-            this.localDescription = null;
-            this.remoteDescription = null;
-            this.signalingState = "stable";
-            this.iceConnectionState = "new";
-            this.iceGatheringState = "new";
-            this.connectionState = "new";
+            const _st = _idl.own(this);
+            _st.localDescription = null;
+            _st.remoteDescription = null;
+            _st.signalingState = "stable";
+            _st.iceConnectionState = "new";
+            _st.iceGatheringState = "new";
+            _st.connectionState = "new";
             this.onicecandidate = null;
             this.oniceconnectionstatechange = null;
             this.onsignalingstatechange = null;
             this.ondatachannel = null;
             this.ontrack = null;
-            this._channels = [];
+            this.#channels = [];
+            // Set (and latched — real transceivers persist across
+            // renegotiation) by createOffer({offerToReceiveAudio/Video}).
+            // A fingerprint probe that requests both and then regexes the
+            // SDP for `m=audio`/`m=video` lines got `null` for both from
+            // the old data-channel-only SDP — a structural tell no real
+            // WebRTC stack produces for that call.
+            this.#recvAudio = false;
+            this.#recvVideo = false;
             // Per-connection identity, the way a browser mints one: ICE
             // credentials and a DTLS certificate fingerprint are fresh for every
             // RTCPeerConnection, so these are random rather than profile-derived.
-            this._ice = {
+            this.#ice = {
                 sessionId: _rtcDigits(19),
                 ufrag: _rtcBase64ish(4),
                 pwd: _rtcBase64ish(24),
@@ -5861,43 +4631,132 @@
         // which is not something any WebRTC stack emits — detectors parse the SDP
         // for exactly those fields and reported the transport as blocked or
         // unsupported because none of them were there.
-        _buildSdp(setup) {
-            const ice = this._ice;
-            const lines = [
-                'v=0',
-                `o=- ${ice.sessionId} 2 IN IP4 127.0.0.1`,
-                's=-',
-                't=0 0',
-                'a=group:BUNDLE 0',
-                'a=extmap-allow-mixed',
-                'a=msid-semantic: WMS',
-                'm=application 9 UDP/DTLS/SCTP webrtc-datachannel',
-                'c=IN IP4 0.0.0.0',
+        // Shared per-mid transport lines every BUNDLEd m-section repeats.
+        #transportLines(setup, mid) {
+            const ice = this.#ice;
+            return [
                 'a=ice-ufrag:' + ice.ufrag,
                 'a=ice-pwd:' + ice.pwd,
                 'a=ice-options:trickle',
                 'a=fingerprint:sha-256 ' + ice.fingerprint,
                 'a=setup:' + setup,
-                'a=mid:0',
+                'a=mid:' + mid,
+            ];
+        }
+        // recvonly section for a codec list, matching what this same
+        // connection's RTCRtpSender/Receiver.getCapabilities() advertises —
+        // a detector that cross-checks the SDP against that API sees the
+        // same codecs in both places, not a mismatch.
+        #mediaSection(kind, setup, mid, payloads) {
+            const proto = 'UDP/TLS/RTP/SAVPF';
+            const pts = payloads.map(p => p.pt).join(' ');
+            const lines = [
+                `m=${kind} 9 ${proto} ${pts}`,
+                'c=IN IP4 0.0.0.0',
+                'a=rtcp:9 IN IP4 0.0.0.0',
+                ...this.#transportLines(setup, mid),
+                'a=recvonly',
+                'a=rtcp-mux',
+            ];
+            if (kind === 'video') lines.push('a=rtcp-rsize');
+            for (const p of payloads) {
+                lines.push(`a=rtpmap:${p.pt} ${p.rtpmap}`);
+                if (p.fmtp) lines.push(`a=fmtp:${p.pt} ${p.fmtp}`);
+                if (kind === 'video') {
+                    lines.push(`a=rtcp-fb:${p.pt} goog-remb`);
+                    lines.push(`a=rtcp-fb:${p.pt} transport-cc`);
+                    lines.push(`a=rtcp-fb:${p.pt} ccm fir`);
+                    lines.push(`a=rtcp-fb:${p.pt} nack`);
+                    lines.push(`a=rtcp-fb:${p.pt} nack pli`);
+                }
+            }
+            return lines;
+        }
+        // A Chrome-shaped offer for a data channel (and, once requested,
+        // recvonly audio/video m-sections). The stub this replaces was
+        // four lines with no media section, no ICE credentials and no candidate,
+        // which is not something any WebRTC stack emits — detectors parse the SDP
+        // for exactly those fields and reported the transport as blocked or
+        // unsupported because none of them were there.
+        #buildSdp(setup) {
+            const ice = this.#ice;
+            const mids = ['0'];
+            const sections = [[
+                'm=application 9 UDP/DTLS/SCTP webrtc-datachannel',
+                'c=IN IP4 0.0.0.0',
+                ...this.#transportLines(setup, '0'),
                 'a=sctp-port:5000',
                 'a=max-message-size:262144',
+            ]];
+            if (this.#recvAudio) {
+                const mid = String(mids.length);
+                mids.push(mid);
+                sections.push(this.#mediaSection('audio', setup, mid, [
+                    { pt: 111, rtpmap: 'opus/48000/2', fmtp: 'minptime=10;useinbandfec=1' },
+                    { pt: 0, rtpmap: 'PCMU/8000' },
+                    { pt: 8, rtpmap: 'PCMA/8000' },
+                ]));
+            }
+            if (this.#recvVideo) {
+                const mid = String(mids.length);
+                mids.push(mid);
+                sections.push(this.#mediaSection('video', setup, mid, [
+                    { pt: 96, rtpmap: 'VP8/90000' },
+                    { pt: 98, rtpmap: 'VP9/90000', fmtp: 'profile-id=0' },
+                    { pt: 102, rtpmap: 'H264/90000', fmtp: 'level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f' },
+                ]));
+            }
+            const lines = [
+                'v=0',
+                `o=- ${ice.sessionId} 2 IN IP4 127.0.0.1`,
+                's=-',
+                't=0 0',
+                'a=group:BUNDLE ' + mids.join(' '),
+                'a=extmap-allow-mixed',
+                'a=msid-semantic: WMS',
+                ...sections.flat(),
             ];
             return lines.join('\r\n') + '\r\n';
         }
         createDataChannel(label, options) {
             const ch = new RTCDataChannel();
-            ch.label = label;
-            this._channels.push(ch);
+            _idl.own(ch).label = String(label);
+            this.#channels.push(ch);
             return ch;
         }
-        createOffer() {
-            return Promise.resolve({ type: "offer", sdp: this._buildSdp('actpass') });
+        createOffer(options) {
+            // Legacy RTCOfferOptions — deprecated in favor of addTransceiver,
+            // but real Chrome still honours them by implicitly adding a
+            // recvonly transceiver, and it's exactly what fingerprint
+            // probes (no camera/mic, just checking capability) send.
+            if (options?.offerToReceiveAudio) this.#recvAudio = true;
+            if (options?.offerToReceiveVideo) this.#recvVideo = true;
+            return Promise.resolve({ type: "offer", sdp: this.#buildSdp('actpass') });
         }
         createAnswer() {
-            return Promise.resolve({ type: "answer", sdp: this._buildSdp('active') });
+            return Promise.resolve({ type: "answer", sdp: this.#buildSdp('active') });
+        }
+        #applySignalingState(desc, isLocal) {
+            const _st = _idl.own(this);
+            // Minimal offer/answer state machine — real Chrome moves
+            // through have-{local,remote}-offer on an offer and back to
+            // stable on the matching answer. Leaving this at the
+            // constructor's "stable" forever (the old behaviour) is a
+            // tell: no real connection sits in "stable" right after
+            // setLocalDescription(offer).
+            if (!desc || !desc.type) return;
+            if (desc.type === 'offer') {
+                _st.signalingState = isLocal ? 'have-local-offer' : 'have-remote-offer';
+            } else if (desc.type === 'answer' || desc.type === 'rollback') {
+                _st.signalingState = 'stable';
+            }
+            try { this.dispatchEvent(new Event('signalingstatechange')); } catch (_) { /* ignore */ }
+            if (this.onsignalingstatechange) this.onsignalingstatechange();
         }
         setLocalDescription(desc) {
-            this.localDescription = desc;
+            const _st = _idl.own(this);
+            _st.localDescription = desc;
+            this.#applySignalingState(desc, true);
             // Real Chrome (since 2019, mDNS-anonymized) emits an mDNS host
             // candidate followed by `null` to signal gathering complete.
             // Returning ONLY `{candidate: null}` is itself a tell — every
@@ -5908,7 +4767,7 @@
             // SDP agree: a host line whose credentials belong to a different
             // session is exactly the kind of internal contradiction a detector
             // looks for.
-            const ice = this._ice;
+            const ice = this.#ice;
             const candidate = `candidate:${ice.foundation} 1 udp 2113937151 ${ice.mdns} `
                 + `${ice.port} typ host generation 0 ufrag ${ice.ufrag} network-cost 999`;
             const iceCandidate = new globalThis.RTCIceCandidate({
@@ -5921,9 +4780,9 @@
                 const withCandidate = desc.sdp
                     + 'a=' + candidate + '\r\n'
                     + 'a=end-of-candidates\r\n';
-                this.localDescription = { type: desc.type, sdp: withCandidate };
+                _st.localDescription = { type: desc.type, sdp: withCandidate };
             }
-            this.iceGatheringState = "gathering";
+            _st.iceGatheringState = "gathering";
             // Both halves: the handler attribute and a dispatched event, because
             // a page may use either and a browser fires both.
             const emit = (value) => {
@@ -5941,7 +4800,7 @@
                 emit(iceCandidate);
                 setTimeout(() => {
                     emit(null);
-                    this.iceGatheringState = "complete";
+                    _st.iceGatheringState = "complete";
                     try {
                         this.dispatchEvent(new Event('icegatheringstatechange'));
                     } catch (_) { /* ignore */ }
@@ -5949,7 +4808,12 @@
             }, 8);
             return Promise.resolve();
         }
-        setRemoteDescription(desc) { this.remoteDescription = desc; return Promise.resolve(); }
+        setRemoteDescription(desc) {
+            const _st = _idl.own(this);
+            _st.remoteDescription = desc;
+            this.#applySignalingState(desc, false);
+            return Promise.resolve();
+        }
         addIceCandidate(c) { return Promise.resolve(); }
         addTrack() { return { track: null }; }
         addStream() {}
@@ -5959,9 +4823,10 @@
         getReceivers() { return []; }
         getTransceivers() { return []; }
         close() {
-            this.signalingState = "closed";
-            this.iceConnectionState = "closed";
-            this.connectionState = "closed";
+            const _st = _idl.own(this);
+            _st.signalingState = "closed";
+            _st.iceConnectionState = "closed";
+            _st.connectionState = "closed";
         }
         // No `addEventListener`/`removeEventListener` overrides here: they used
         // to be empty stubs shadowing the real EventTarget methods, so a listener
@@ -5969,6 +4834,7 @@
         // that watches for `icecandidate` through `addEventListener` — which is
         // the usual form — then saw nothing and reported the transport blocked.
     };
+    _idl.fields(RTCPeerConnection.prototype, ["connectionState", "iceConnectionState", "iceGatheringState", "localDescription", "remoteDescription", "signalingState"]);
     globalThis.RTCPeerConnection.generateCertificate = () => Promise.resolve({});
     globalThis.webkitRTCPeerConnection = globalThis.RTCPeerConnection;
     globalThis.RTCSessionDescription = class RTCSessionDescription { constructor(d) { this.type = d?.type; this.sdp = d?.sdp; } };
@@ -5976,22 +4842,23 @@
     // directly — `event.candidate.foundation` was undefined here.
     globalThis.RTCIceCandidate = class RTCIceCandidate {
         constructor(c) {
-            this.candidate = c?.candidate || "";
-            this.sdpMid = c?.sdpMid ?? null;
-            this.sdpMLineIndex = c?.sdpMLineIndex ?? null;
+            const _st = _idl.own(this);
+            _st.candidate = c?.candidate || "";
+            _st.sdpMid = c?.sdpMid ?? null;
+            _st.sdpMLineIndex = c?.sdpMLineIndex ?? null;
             const m = /^candidate:(\S+) (\d+) (\S+) (\d+) (\S+) (\d+) typ (\S+)/.exec(this.candidate);
-            this.foundation = m ? m[1] : null;
-            this.component = m ? (m[2] === '1' ? 'rtp' : 'rtcp') : null;
-            this.protocol = m ? m[3].toLowerCase() : null;
-            this.priority = m ? Number(m[4]) : null;
-            this.address = m ? m[5] : null;
-            this.port = m ? Number(m[6]) : null;
-            this.type = m ? m[7] : null;
-            this.tcpType = null;
-            this.relatedAddress = null;
-            this.relatedPort = null;
+            _st.foundation = m ? m[1] : null;
+            _st.component = m ? (m[2] === '1' ? 'rtp' : 'rtcp') : null;
+            _st.protocol = m ? m[3].toLowerCase() : null;
+            _st.priority = m ? Number(m[4]) : null;
+            _st.address = m ? m[5] : null;
+            _st.port = m ? Number(m[6]) : null;
+            _st.type = m ? m[7] : null;
+            _st.tcpType = null;
+            _st.relatedAddress = null;
+            _st.relatedPort = null;
             const uf = /\bufrag (\S+)/.exec(this.candidate);
-            this.usernameFragment = uf ? uf[1] : (c?.usernameFragment ?? null);
+            _st.usernameFragment = uf ? uf[1] : (c?.usernameFragment ?? null);
         }
         toJSON() {
             return {
@@ -6002,6 +4869,7 @@
             };
         }
     };
+    _idl.fields(RTCIceCandidate.prototype, ["address", "candidate", "component", "foundation", "port", "priority", "protocol", "relatedAddress", "relatedPort", "sdpMLineIndex", "sdpMid", "tcpType", "type", "usernameFragment"]);
 
     // ================================================================
     // Font enumeration spoofing — return OS-appropriate fonts
@@ -6017,78 +4885,242 @@
         const _fonts = _fontsByOS[_osName] || _fontsByOS["Linux"];
         const _fontSet = new Set(_fonts.map(f => f.toLowerCase()));
 
-        globalThis.FontFace = class FontFace {
-            constructor(family, source) { this.family = family; this.status = "loaded"; }
-            load() { return Promise.resolve(this); }
+        const _fontWeightNum = (w) => {
+            const named = {
+                thin: 100, "extra-light": 200, "ultra-light": 200, light: 300,
+                normal: 400, regular: 400, medium: 500, "semi-bold": 600,
+                "demi-bold": 600, bold: 700, "extra-bold": 800, "ultra-bold": 800,
+                black: 900, heavy: 900,
+            }[String(w).toLowerCase().trim()];
+            if (named) return named;
+            const n = parseInt(w, 10);
+            return Number.isFinite(n) ? n : 400;
+        };
+        const _localFontSrc = /^\s*local\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*))\s*\)\s*$/;
+
+        // FontFace and FontFaceSet, built as real interfaces.
+        //
+        // Both used to be hand-rolled object literals: `document.fonts` was a
+        // plain `{}` whose every member was an own enumerable property, so
+        // `Object.prototype.toString.call(document.fonts)` said
+        // `[object Object]` where Chrome says `[object FontFaceSet]`, and
+        // `Object.keys(document.fonts)` listed 14 names where Chrome lists
+        // none. Shapes below are from a Chrome 148 capture; member order is
+        // creation order, which is what getOwnPropertyNames reports.
+        const _ffState = new WeakMap();
+        const _FF_DEFAULTS = {
+            style: "normal", weight: "normal", stretch: "normal",
+            unicodeRange: "U+0-10FFFF", variant: "normal",
+            featureSettings: "normal", display: "auto",
+            ascentOverride: "normal", descentOverride: "normal",
+            lineGapOverride: "normal", sizeAdjust: "100%",
+            variationSettings: "normal",
         };
 
-        // document.fonts (FontFaceSet) — iterator yields actual FontFace
-        // entries (real Chrome's `for (const f of document.fonts)` yields
-        // FontFace instances for every loaded face). Previously our iterators
-        // returned empty, the canonical headless "no faces ever
-        // loaded" signal that differs from a real browser.
-        if (globalThis.document) {
-            // Materialize FontFace instances once for the system font list.
-            const _fontFaces = _fonts.map(family => {
-                const f = new globalThis.FontFace(family, 'local("' + family + '")');
-                f.status = 'loaded';
-                f.weight = 'normal';
-                f.style = 'normal';
-                f.stretch = 'normal';
-                f.unicodeRange = 'U+0-10FFFF';
-                f.variant = 'normal';
-                f.featureSettings = 'normal';
-                f.display = 'auto';
-                return f;
+        function FontFace(family, source, descriptors) {
+            const st = Object.assign({}, _FF_DEFAULTS, {
+                family: String(family),
+                source,
+                status: "unloaded",
+                loadPromise: null,
             });
-            Object.defineProperty(globalThis.document, 'fonts', {
-                value: {
-                    check(font, text) {
-                        // Parse font family from CSS font shorthand (e.g. "12px Arial", "bold 14px 'Times New Roman'")
-                        // Strip size/weight prefix: everything before the last number+unit
-                        const stripped = font.replace(/^[^"']*?\d+(\.\d+)?(px|pt|em|rem|%|vh|vw)\s*/, '');
-                        const parts = stripped.split(',');
-                        return parts.some(p => {
-                            const name = p.replace(/["']/g, '').trim().toLowerCase();
-                            return name.length > 0 && _fontSet.has(name);
-                        });
-                    },
-                    ready: Promise.resolve(),
-                    status: "loaded",
-                    forEach(cb, thisArg) {
-                        for (const f of _fontFaces) cb.call(thisArg, f, f, this);
-                    },
-                    entries() {
-                        // FontFaceSet.entries yields [face, face] pairs per spec.
-                        const arr = _fontFaces.map(f => [f, f]);
-                        return arr[Symbol.iterator]();
-                    },
-                    keys() { return _fontFaces[Symbol.iterator](); },
-                    values() { return _fontFaces[Symbol.iterator](); },
-                    [Symbol.iterator]() { return _fontFaces[Symbol.iterator](); },
-                    size: _fontFaces.length,
-                    add(face) {
-                        if (face && !_fontFaces.includes(face)) _fontFaces.push(face);
-                        return this;
-                    },
-                    delete(face) {
-                        const i = _fontFaces.indexOf(face);
-                        if (i >= 0) { _fontFaces.splice(i, 1); return true; }
-                        return false;
-                    },
-                    has(face) { return _fontFaces.includes(face); },
-                    clear() { _fontFaces.length = 0; },
-                    addEventListener() {},
-                    removeEventListener() {},
-                },
-                configurable: true,
+            for (const k of Object.keys(_FF_DEFAULTS)) {
+                if (descriptors && descriptors[k] !== undefined) st[k] = String(descriptors[k]);
+            }
+            // `loaded` must be a Promise from construction, and an unsettled
+            // rejection here would surface as an unhandled rejection.
+            st.loaded = new Promise((res, rej) => { st.resolve = res; st.reject = rej; });
+            st.loaded.catch(() => {});
+            _ffState.set(this, st);
+        }
+        Object.defineProperty(FontFace, "length", { value: 2, configurable: true });
+        _maskFunction(FontFace, "FontFace");
+
+        const _ffGet = (obj) => _ffState.get(obj) || {};
+        // Descriptor attributes come before status/loaded/load in Chrome's
+        // prototype, and `variationSettings` sits AFTER `load` — not with its
+        // fellow descriptors.
+        for (const name of ["family", "style", "weight", "stretch", "unicodeRange",
+                            "variant", "featureSettings", "display", "ascentOverride",
+                            "descentOverride", "lineGapOverride", "sizeAdjust"]) {
+            _defProtoGetter(FontFace.prototype,
+                name,
+                function () { return _ffGet(this)[name]; },
+                function (v) { const s = _ffState.get(this); if (s) s[name] = String(v); });
+        }
+        _defProtoGetter(FontFace.prototype, "status", function () { return _ffGet(this).status; });
+        _defProtoGetter(FontFace.prototype, "loaded", function () { return _ffGet(this).loaded; });
+        _defProtoMethod(FontFace.prototype, "load", function load() {
+            const st = _ffState.get(this);
+            if (!st) return Promise.reject(new TypeError("Illegal invocation"));
+            if (st.loadPromise) return st.loadPromise;
+            st.status = "loading";
+            // A `local(name)` source is a presence probe, and real browsers
+            // reject it for a font that is not installed — resolving it
+            // unconditionally makes every probed name come back "installed",
+            // which is itself the tell. `url(...)` sources are not probes.
+            const m = _localFontSrc.exec(String(st.source || ""));
+            if (m) {
+                const localName = (m[1] ?? m[2] ?? m[3] ?? "").trim();
+                const italic = /italic|oblique/i.test(String(st.style));
+                if (!ops.op_font_family_available(localName, _fontWeightNum(st.weight), italic, _osName)) {
+                    st.status = "error";
+                    const err = new DOMException('Failed to load local font: "' + localName + '"', "NetworkError");
+                    st.reject(err);
+                    st.loadPromise = Promise.reject(err);
+                    st.loadPromise.catch(() => {});
+                    return st.loadPromise;
+                }
+            }
+            st.status = "loaded";
+            st.resolve(this);
+            st.loadPromise = Promise.resolve(this);
+            return st.loadPromise;
+        });
+        _defProtoGetter(FontFace.prototype, "variationSettings",
+            function () { return _ffGet(this).variationSettings; },
+            function (v) { const s = _ffState.get(this); if (s) s.variationSettings = String(v); });
+        Object.defineProperty(FontFace.prototype, Symbol.toStringTag, {
+            value: "FontFace", configurable: true,
+        });
+        // `constructor` lands last in Chrome's property order, not first as a
+        // function's own prototype object gives it. Order is creation order,
+        // so it has to be deleted and re-added rather than redefined in place.
+        delete FontFace.prototype.constructor;
+        Object.defineProperty(FontFace.prototype, "constructor", {
+            value: FontFace, writable: true, enumerable: false, configurable: true,
+        });
+        globalThis.FontFace = FontFace;
+
+        // FontFaceSet. Chrome does NOT expose the interface object on window,
+        // and its prototype carries no own `constructor` — so
+        // `document.fonts.constructor.name` reads through to `EventTarget`.
+        const _fontFaceSetProto = Object.create(globalThis.EventTarget.prototype);
+        const _setState = new WeakMap();
+        const _setFaces = (o) => (_setState.get(o) || { faces: [] }).faces;
+
+        for (const ev of ["onloading", "onloadingdone", "onloadingerror"]) {
+            _defProtoGetter(_fontFaceSetProto, ev,
+                function () { const s = _setState.get(this); return (s && s[ev]) || null; },
+                function (v) { const s = _setState.get(this); if (s) s[ev] = v; });
+        }
+        _defProtoGetter(_fontFaceSetProto, "ready", function () {
+            const s = _setState.get(this);
+            return s ? s.ready : Promise.resolve(this);
+        });
+        _defProtoGetter(_fontFaceSetProto, "status", function () { return "loaded"; });
+        _defProtoGetter(_fontFaceSetProto, "size", function () { return _setFaces(this).length; });
+
+        // Chrome's `check` answers "can this be painted now", so an unknown
+        // family is `true` — it falls back to a system font. Only an
+        // unparseable font shorthand is an error. Ours used to return whether
+        // the family was installed, inverting the answer for every web font
+        // the page itself declares and for every bogus name a probe tries.
+        _defProtoMethod(_fontFaceSetProto, "check", function check(font, ...rest) {
+            const text = rest[0];
+            if (!/\d\s*(px|pt|pc|in|cm|mm|q|em|rem|ex|ch|vh|vw|vmin|vmax|%)\s+\S/i.test(String(font))) {
+                throw new DOMException("Failed to execute 'check' on 'FontFaceSet': Could not resolve '" + font + "' as a font.", "SyntaxError");
+            }
+            return true;
+        });
+        _defProtoMethod(_fontFaceSetProto, "load", function load(font, ...rest) {
+            const text = rest[0];
+            try { this.check(font, text); } catch (e) { return Promise.reject(e); }
+            return Promise.resolve(_setFaces(this).slice());
+        });
+        _defProtoMethod(_fontFaceSetProto, "add", function add(face) {
+            const f = _setState.get(this);
+            if (f && !f.faces.includes(face)) f.faces.push(face);
+            return this;
+        });
+        _defProtoMethod(_fontFaceSetProto, "clear", function clear() {
+            const f = _setState.get(this);
+            if (f) f.faces.length = 0;
+        });
+        _defProtoMethod(_fontFaceSetProto, "delete", function (face) {
+            const f = _setState.get(this);
+            if (!f) return false;
+            const i = f.faces.indexOf(face);
+            if (i < 0) return false;
+            f.faces.splice(i, 1);
+            return true;
+        });
+        _defProtoMethod(_fontFaceSetProto, "entries", function entries() {
+            return _setFaces(this).map(f => [f, f])[Symbol.iterator]();
+        });
+        _defProtoMethod(_fontFaceSetProto, "forEach", function forEach(cb, ...rest) {
+            const thisArg = rest[0];
+            for (const f of _setFaces(this)) cb.call(thisArg, f, f, this);
+        });
+        _defProtoMethod(_fontFaceSetProto, "has", function has(face) {
+            return _setFaces(this).includes(face);
+        });
+        _defProtoMethod(_fontFaceSetProto, "keys", function keys() {
+            return _setFaces(this)[Symbol.iterator]();
+        });
+        _defProtoMethod(_fontFaceSetProto, "values", function values() {
+            return _setFaces(this)[Symbol.iterator]();
+        });
+        Object.defineProperty(_fontFaceSetProto, Symbol.toStringTag, {
+            value: "FontFaceSet", configurable: true,
+        });
+        Object.defineProperty(_fontFaceSetProto, Symbol.iterator, {
+            value: _fontFaceSetProto.values, writable: true, configurable: true,
+        });
+
+        if (typeof globalThis.FontFaceSet !== "function") {
+            const FontFaceSet = { FontFaceSet() { throw new TypeError("Illegal constructor"); } }.FontFaceSet;
+            Object.defineProperty(FontFaceSet, "length", { value: 0, configurable: true });
+            Object.defineProperty(FontFaceSet, "prototype", {
+                value: _fontFaceSetProto, writable: false, enumerable: false, configurable: false,
+            });
+            Object.defineProperty(_fontFaceSetProto, "constructor", {
+                value: FontFaceSet, writable: true, enumerable: false, configurable: true,
+            });
+            Object.setPrototypeOf(FontFaceSet, globalThis.EventTarget);
+            _maskFunction(FontFaceSet, "FontFaceSet");
+            Object.defineProperty(globalThis, "FontFaceSet", {
+                value: FontFaceSet, writable: true, enumerable: false, configurable: true,
+            });
+        }
+
+        // The document's own `@font-face` rules — NOT the installed system
+        // fonts, which is what this set used to hold. Chrome reports 0 on a
+        // page that declares none, and one entry per rule on a page that does.
+        const _documentFaceSet = () => {
+            const set = Object.create(_fontFaceSetProto);
+            const faces = [];
+            let declared = [];
+            try { declared = ops.op_dom_font_faces() || []; } catch (_) {}
+            for (const d of declared) {
+                const f = new FontFace(d.family, "", {
+                    style: d.style, weight: d.weight, stretch: d.stretch,
+                    unicodeRange: d.unicode_range, variant: d.variant,
+                    featureSettings: d.feature_settings, display: d.display,
+                    ascentOverride: d.ascent_override, descentOverride: d.descent_override,
+                    lineGapOverride: d.line_gap_override, sizeAdjust: d.size_adjust,
+                    variationSettings: d.variation_settings,
+                });
+                const st = _ffState.get(f);
+                st.status = "loaded";
+                st.resolve(f);
+                faces.push(f);
+            }
+            _setState.set(set, { faces, ready: Promise.resolve(set) });
+            return set;
+        };
+
+        // `document.fonts` is a prototype getter in Chrome, not an own data
+        // property of the document instance.
+        if (globalThis.Document) {
+            const _fontsByDoc = new WeakMap();
+            _defProtoGetter(globalThis.Document.prototype, "fonts", function () {
+                let set = _fontsByDoc.get(this);
+                if (!set) { set = _documentFaceSet(); _fontsByDoc.set(this, set); }
+                return set;
             });
         }
     }
-
-    // Permissions API is defined at the top of this file (search for
-    // _PERMISSION_STATE_MAP). That implementation is the single source of
-    // truth — do not override navigator.permissions.query here.
 
     // ================================================================
     // Apple Pay — macOS-only window.ApplePaySession
@@ -6157,32 +5189,32 @@
 
         // Removed redundant MediaSource definition here; it is defined further down.
 
-        // Patch HTMLMediaElement.canPlayType if document exists.
+        // `canPlayType` belongs on HTMLMediaElement.prototype, where Chrome
+        // keeps it. It used to be installed per element by a patched
+        // `document.createElement`, which left both an own `canPlayType` on
+        // every <video>/<audio> and an own `createElement` on the document —
+        // two own properties no real document has.
+        //
         // The shim must be _maskFunction'd or its raw source leaks via
         // `el.canPlayType + ""`, `el.canPlayType.toString()`, AND
         // cross-realm `iframe.contentWindow.Function.prototype.toString.call(el.canPlayType)`.
-        if (globalThis.document) {
+        {
             const _canPlayTypeShim = function canPlayType(type) {
                 if (_supportedTypes.has(type)) return "probably";
-                const base = type.split(';')[0].trim();
+                const base = String(type).split(';')[0].trim();
                 if (_supportedTypes.has(base)) return "maybe";
                 return "";
             };
             if (typeof _maskFunction === "function") {
                 _maskFunction(_canPlayTypeShim, "canPlayType");
             }
-            const _origCreate = globalThis.document.createElement.bind(globalThis.document);
-            const _patchedCreate = function createElement(tag) {
-                const el = _origCreate(tag);
-                if (tag === 'video' || tag === 'audio') {
-                    el.canPlayType = _canPlayTypeShim;
-                }
-                return el;
-            };
-            if (typeof _maskFunction === "function") {
-                _maskFunction(_patchedCreate, "createElement");
+            const _mediaProto = globalThis.HTMLMediaElement
+                && globalThis.HTMLMediaElement.prototype;
+            if (_mediaProto) {
+                Object.defineProperty(_mediaProto, "canPlayType", {
+                    value: _canPlayTypeShim, writable: true, enumerable: true, configurable: true,
+                });
             }
-            globalThis.document.createElement = _patchedCreate;
         }
 
         // MediaRecorder — Chrome ships this as a real constructor with
@@ -6202,42 +5234,6 @@
     // receiver.
     // ================================================================
 
-    // PressureObserver / PressureRecord — Compute Pressure API
-    // (https://w3c.github.io/compute-pressure/). Chrome 125+. Commonly probed.
-    if (!globalThis.PressureObserver) {
-        class PressureRecord {
-            constructor(source = 'cpu', state = 'nominal') {
-                this.source = source;
-                this.state = state;
-                this.time = performance.now();
-            }
-            toJSON() { return { source: this.source, state: this.state, time: this.time }; }
-        }
-        Object.defineProperty(PressureRecord.prototype, Symbol.toStringTag, {
-            value: 'PressureRecord', configurable: true,
-        });
-        globalThis.PressureRecord = PressureRecord;
-
-        class PressureObserver {
-            constructor(callback, options = {}) {
-                this._callback = callback;
-                this._options = options;
-                this._observing = new Set();
-            }
-            observe(source, _options) {
-                this._observing.add(source);
-                return Promise.resolve();
-            }
-            unobserve(source) { this._observing.delete(source); }
-            disconnect() { this._observing.clear(); }
-            takeRecords() { return []; }
-            static knownSources = ['cpu'];
-        }
-        Object.defineProperty(PressureObserver.prototype, Symbol.toStringTag, {
-            value: 'PressureObserver', configurable: true,
-        });
-        globalThis.PressureObserver = PressureObserver;
-    }
 
     // MediaSourceHandle — wraps MediaSource for transfer to Worker.
     // (https://w3c.github.io/media-source/#mediasourcehandle-interface).
@@ -6284,12 +5280,14 @@
     // interface. Skip the class install AND the navigator binding on iOS.
     if (!_isMobileIOS() && typeof globalThis.UserActivation === 'undefined') {
         class UserActivation {
+            #hasBeenActive;
+            #isActive;
             constructor() {
-                this._hasBeenActive = false;
-                this._isActive = false;
+                this.#hasBeenActive = false;
+                this.#isActive = false;
             }
-            get hasBeenActive() { return this._hasBeenActive; }
-            get isActive() { return this._isActive; }
+            get hasBeenActive() { return this.#hasBeenActive; }
+            get isActive() { return this.#isActive; }
         }
         Object.defineProperty(UserActivation.prototype, Symbol.toStringTag, {
             value: 'UserActivation', configurable: true,
@@ -6360,22 +5358,25 @@
     // browser_oxide-internal script name. Real Chrome's stack frames
     // never show such tags; they show either real URLs or <anonymous>.
     //
-    // Filter strategy: drop any frame whose filename starts with `<`
-    // EXCEPT `<anonymous>` (which V8 legitimately emits for eval).
-    // This catches `<bootstrap>`, `<cleanup>`, `<init_script_N>`,
-    // `<structured_clone>`, `<canvas_bootstrap>`, `<timer_bootstrap>`,
-    // `<fetch_bootstrap>`, `<streams_bootstrap>`, `<worker_bootstrap>`,
-    // and any future bootstrap names without needing per-name additions.
+    // Filter strategy: drop any frame whose filename is angle-bracketed
+    // (`<...>`), `<anonymous>` included. Our bootstraps are compiled with
+    // resourceName "<anonymous>" (see runtime.rs), so their frames are the
+    // ONLY ones whose getFileName() returns the literal "<anonymous>". Real
+    // eval()/Function() frames report a NULL filename (isEval() true) — the
+    // "<anonymous>" they display is synthesised by getEvalOrigin formatting
+    // below, not by getFileName — so they survive this filter untouched.
+    // Dropping "<anonymous>" therefore strips leaked internal DOM-machinery
+    // frames (_onNodeInserted, appendChild, _evalAsScript) that real Chrome —
+    // where those operations are native and invisible — never shows, while
+    // still catching `<bootstrap>`, `<init_script_N>`, `<worker_bootstrap>`,
+    // etc. without per-name additions.
     // ================================================================
     Error.prepareStackTrace = function(err, frames) {
         const filtered = frames.filter(f => {
             const file = f.getFileName() || '';
             if (file.startsWith('ext:') || file.startsWith('deno:')) return false;
             if (file.includes('core/')) return false;
-            // Internal bootstrap script names — all match `<...>` shape.
-            // Preserve V8's legitimate <anonymous> tag for eval/Function-
-            // constructor frames; drop everything else angle-bracketed.
-            if (file.startsWith('<') && file.endsWith('>') && file !== '<anonymous>') {
+            if (file.startsWith('<') && file.endsWith('>')) {
                 return false;
             }
             return true;
@@ -6383,19 +5384,56 @@
         if (filtered.length === 0) {
             return err.toString() + '\n    at <anonymous>:1:1';
         }
-        return err.toString() + '\n' + filtered.map(f => {
-            const fn = f.getFunctionName() || f.getMethodName() || '<anonymous>';
-            const file = f.getFileName() || '<anonymous>';
-            const line = f.getLineNumber() || 0;
-            const col = f.getColumnNumber() || 0;
-            // Format: "    at functionName (filename:line:col)"
-            // or if no filename: "    at functionName (line:col)"
-            // or if no function name: "    at filename:line:col"
-            if (fn === '<anonymous>') {
-                return `    at ${file}:${line}:${col}`;
+        // V8's own CallSite formatting, reproduced. The previous version emitted
+        // `at fn (file:line:col)` and nothing else, so the receiver was always
+        // missing: real Chrome writes `at Talon.updateIfNeeded (…)` and
+        // `at Object._0x3375a3 [as execute] (…)`. Talon ships `new Error().stack`
+        // verbatim in its payload, so that shape is compared directly.
+        const _fileLocation = (f) => {
+            if (f.isNative && f.isNative()) return 'native';
+            let s = (f.getScriptNameOrSourceURL && f.getScriptNameOrSourceURL())
+                || f.getFileName()
+                || (f.isEval && f.isEval() && f.getEvalOrigin && f.getEvalOrigin())
+                || '<anonymous>';
+            const line = f.getLineNumber();
+            if (line !== null && line !== undefined) {
+                s += ':' + line;
+                const col = f.getColumnNumber();
+                if (col) s += ':' + col;
             }
-            return `    at ${fn} (${file}:${line}:${col})`;
-        }).join('\n');
+            return s;
+        };
+        const _frame = (f) => {
+            let out = '';
+            let addSuffix = true;
+            const fn = f.getFunctionName();
+            const isCtor = f.isConstructor && f.isConstructor();
+            const isMethodCall = !((f.isToplevel && f.isToplevel()) || isCtor);
+            if (isMethodCall) {
+                const typeName = f.getTypeName && f.getTypeName();
+                const methodName = f.getMethodName && f.getMethodName();
+                if (fn) {
+                    if (typeName && fn.indexOf(typeName) !== 0) out += typeName + '.';
+                    out += fn;
+                    if (methodName
+                        && fn.lastIndexOf('.' + methodName) !== fn.length - methodName.length - 1) {
+                        out += ' [as ' + methodName + ']';
+                    }
+                } else {
+                    out += (typeName ? typeName + '.' : '') + (methodName || '<anonymous>');
+                }
+            } else if (isCtor) {
+                out += 'new ' + (fn || '<anonymous>');
+            } else if (fn) {
+                out += fn;
+            } else {
+                out += _fileLocation(f);
+                addSuffix = false;
+            }
+            if (addSuffix) out += ' (' + _fileLocation(f) + ')';
+            return '    at ' + out;
+        };
+        return err.toString() + '\n' + filtered.map(_frame).join('\n');
     };
 
     // ================================================================
@@ -6451,7 +5489,8 @@
         _maskFunction(_isTypeSupported, "isTypeSupported");
 
         class SourceBufferList extends EventTarget {
-            constructor() { super(); this.length = 0; }
+            constructor() {
+                super(); const _st = _idl.own(this); _st.length = 0; }
             [Symbol.iterator]() {
                 let i = 0;
                 const self = this;
@@ -6464,6 +5503,7 @@
                 };
             }
         }
+    _idl.fields(SourceBufferList.prototype, ["length"]);
         _maskFunction(SourceBufferList, "SourceBufferList");
 
         // Replace stubs with real (non-throwing) constructors so a script
@@ -6472,10 +5512,11 @@
             class MediaSource extends EventTarget {
                 constructor() {
                     super();
-                    this.readyState = 'closed';
+                    const _st = _idl.own(this);
+                    _st.readyState = 'closed';
                     this.duration = NaN;
-                    this.sourceBuffers = new SourceBufferList();
-                    this.activeSourceBuffers = new SourceBufferList();
+                    _st.sourceBuffers = new SourceBufferList();
+                    _st.activeSourceBuffers = new SourceBufferList();
                 }
                 addSourceBuffer() { throw new DOMException('InvalidStateError'); }
                 removeSourceBuffer() { throw new DOMException('InvalidStateError'); }
@@ -6483,8 +5524,9 @@
                 setLiveSeekableRange() {}
                 clearLiveSeekableRange() {}
                 static isTypeSupported(type) { return _isTypeSupported(type); }
-                static canConstructInDedicatedWorker = false;
+                static get canConstructInDedicatedWorker() { return false; }
             }
+    _idl.fields(MediaSource.prototype, ["activeSourceBuffers", "readyState", "sourceBuffers"]);
             _maskFunction(MediaSource, "MediaSource");
             globalThis.MediaSource = MediaSource;
         })();
@@ -6492,11 +5534,12 @@
             class MediaRecorder extends EventTarget {
                 constructor(stream, options) {
                     super();
-                    this.stream = stream || null;
-                    this.mimeType = (options && options.mimeType) || '';
-                    this.state = 'inactive';
-                    this.audioBitsPerSecond = 0;
-                    this.videoBitsPerSecond = 0;
+                    const _st = _idl.own(this);
+                    _st.stream = stream || null;
+                    _st.mimeType = (options && options.mimeType) || '';
+                    _st.state = 'inactive';
+                    _st.audioBitsPerSecond = 0;
+                    _st.videoBitsPerSecond = 0;
                 }
                 start() {}
                 stop() {}
@@ -6505,6 +5548,7 @@
                 requestData() {}
                 static isTypeSupported(type) { return _isTypeSupported(type); }
             }
+    _idl.fields(MediaRecorder.prototype, ["audioBitsPerSecond", "mimeType", "state", "stream", "videoBitsPerSecond"]);
             _maskFunction(MediaRecorder, "MediaRecorder");
             globalThis.MediaRecorder = MediaRecorder;
         })();
@@ -6582,9 +5626,11 @@
     {
         class InputDeviceCapabilities {
             constructor(init) {
-                this.firesTouchEvents = !!(init && init.firesTouchEvents);
+                const _st = _idl.own(this);
+                _st.firesTouchEvents = !!(init && init.firesTouchEvents);
             }
         }
+    _idl.fields(InputDeviceCapabilities.prototype, ["firesTouchEvents"]);
         Object.defineProperty(InputDeviceCapabilities.prototype, Symbol.toStringTag, {
             value: "InputDeviceCapabilities", configurable: true,
         });
@@ -6614,25 +5660,28 @@
         globalThis.MediaMetadata = MediaMetadata;
 
         class MediaSession {
+            #handlers;
+            #metadata;
+            #playbackState;
             constructor() {
-                this._playbackState = "none";
-                this._metadata = null;
-                this._handlers = new Map();
+                this.#playbackState = "none";
+                this.#metadata = null;
+                this.#handlers = new Map();
             }
-            get playbackState() { return this._playbackState; }
+            get playbackState() { return this.#playbackState; }
             set playbackState(v) {
                 const s = String(v);
-                if (_validStates.has(s)) this._playbackState = s;
+                if (_validStates.has(s)) this.#playbackState = s;
             }
-            get metadata() { return this._metadata; }
+            get metadata() { return this.#metadata; }
             set metadata(v) {
-                this._metadata = v instanceof MediaMetadata ? v : null;
+                this.#metadata = v instanceof MediaMetadata ? v : null;
             }
             setActionHandler(action, handler) {
                 if (handler == null) {
-                    this._handlers.delete(String(action));
+                    this.#handlers.delete(String(action));
                 } else if (typeof handler === "function") {
-                    this._handlers.set(String(action), handler);
+                    this.#handlers.set(String(action), handler);
                 }
             }
             setPositionState(_state) { /* spec accepts {duration, position, playbackRate} */ }
@@ -6665,97 +5714,11 @@
     // {supported: true} for fewer codec families and exact shape match
     // is hard to fake. Pre-v3 firefox passes without this surface.
     // ================================================================
-    if (!/Firefox\/|Gecko\/20100101/.test(_p("user_agent", ""))) {
-        const _supportedDecodingTypes = new Set([
-            "file", "media-source", "webrtc"
-        ]);
-        const _supportedEncodingTypes = new Set([
-            "record", "webrtc"
-        ]);
-        const _normaliseMime = (s) => String(s || "").trim().toLowerCase();
-        // Codec families that real Chrome reports as supported on
-        // desktop. Conservative: only the common families commonly probed
-        // (mp4/h264/h265, vp8/vp9, av1, opus, mp4a).
-        const _supportedFamilies = [
-            "video/mp4", "video/webm", "video/h264", "video/h265", "video/hevc",
-            "video/avc", "video/vp8", "video/vp9", "video/av1", "video/avs3",
-            "audio/mp4", "audio/webm", "audio/aac", "audio/mpeg", "audio/opus",
-            "audio/vorbis", "audio/flac", "audio/wav", "audio/ogg",
-            "application/x-mpegurl"
-        ];
-        function _supportsContentType(ct) {
-            const t = _normaliseMime(ct);
-            if (!t) return false;
-            for (let i = 0; i < _supportedFamilies.length; i++) {
-                if (t.indexOf(_supportedFamilies[i]) === 0) return true;
-            }
-            return false;
-        }
-        function _buildInfo(config, supportedDecodingType) {
-            const cfg = config && typeof config === "object" ? config : {};
-            const type = cfg.type;
-            const audio = cfg.audio && typeof cfg.audio === "object" ? cfg.audio : null;
-            const video = cfg.video && typeof cfg.video === "object" ? cfg.video : null;
-            let supported = supportedDecodingType
-                ? _supportedDecodingTypes.has(type)
-                : _supportedEncodingTypes.has(type);
-            if (supported && audio) supported = _supportsContentType(audio.contentType);
-            if (supported && video) supported = _supportsContentType(video.contentType);
-            return {
-                supported,
-                smooth: supported,
-                powerEfficient: supported,
-                configuration: cfg,
-                // keyStatuses appears in EME-bound decodingInfo; absent
-                // for plain configs — return undefined accessor to match
-                // Chrome.
-            };
-        }
-        class MediaCapabilities {
-            constructor() { /* spec: no constructor args */ }
-            decodingInfo(configuration) {
-                if (configuration == null || typeof configuration !== "object") {
-                    return Promise.reject(new TypeError(
-                        "Failed to execute 'decodingInfo' on 'MediaCapabilities': " +
-                        "1 argument required, but only 0 present."));
-                }
-                if (!_supportedDecodingTypes.has(configuration.type)) {
-                    return Promise.reject(new TypeError(
-                        "Failed to execute 'decodingInfo' on 'MediaCapabilities': " +
-                        "The provided value '" + configuration.type +
-                        "' is not a valid enum value of type MediaDecodingType."));
-                }
-                return Promise.resolve(_buildInfo(configuration, true));
-            }
-            encodingInfo(configuration) {
-                if (configuration == null || typeof configuration !== "object") {
-                    return Promise.reject(new TypeError(
-                        "Failed to execute 'encodingInfo' on 'MediaCapabilities': " +
-                        "1 argument required, but only 0 present."));
-                }
-                if (!_supportedEncodingTypes.has(configuration.type)) {
-                    return Promise.reject(new TypeError(
-                        "Failed to execute 'encodingInfo' on 'MediaCapabilities': " +
-                        "The provided value '" + configuration.type +
-                        "' is not a valid enum value of type MediaEncodingType."));
-                }
-                return Promise.resolve(_buildInfo(configuration, false));
-            }
-        }
-        Object.defineProperty(MediaCapabilities.prototype, Symbol.toStringTag, {
-            value: "MediaCapabilities", configurable: true,
+    if (!/Firefox\/|Gecko\/20100101/.test(_p("user_agent", "")) && typeof globalThis.MediaCapabilities === "function") {
+        const _mc = _svc.make(globalThis.MediaCapabilities);
+        Object.defineProperty(_NavProto, 'mediaCapabilities', {
+            get() { return _mc; }, configurable: true, enumerable: true,
         });
-        globalThis.MediaCapabilities = MediaCapabilities;
-        const _mc = new MediaCapabilities();
-        try {
-            Object.defineProperty(_NavProto, 'mediaCapabilities', {
-                get() { return _mc; }, configurable: true, enumerable: true,
-            });
-        } catch (_) {
-            navigator.mediaCapabilities = _mc;
-        }
-        // Mask methods as native so toString catalogue stays Chrome-shaped.
-        try { _maskAsNative(MediaCapabilities.prototype, 'decodingInfo', 'encodingInfo'); } catch (_) {}
     }
 
     // ================================================================
@@ -6823,97 +5786,13 @@
     // navigator.gpu (WebGPU) — prototype getter so own-descriptor probe
     // returns undefined on the instance (kNoScriptId-safe).
     if (!_NavProto.hasOwnProperty('gpu')) {
-        // FP parity: a real GPUAdapter ALWAYS exposes numeric limits, a feature
-        // set, and adapter info. The previous stub had `limits: {}` (so
-        // `adapter.limits.maxTextureDimension2D === undefined`), an empty
-        // feature set, no `.info`, a bogus `.name` (real GPUAdapter has none),
-        // and a rejecting requestDevice — a strong headless signal that
-        // fingerprint scripts collect as `gpuSupportedLimits` / `gpuAdapterInfo`.
-        // Chrome BUCKETS WebGPU limits for anti-fingerprinting, so these values
-        // are standardized across GPUs; info matches the macOS/Metal profile
-        // (Apple Silicon, consistent with the ANGLE Metal WebGL renderer).
-        const _gpuLimitVals = {
-            maxTextureDimension1D: 16384, maxTextureDimension2D: 16384,
-            maxTextureDimension3D: 2048, maxTextureArrayLayers: 2048,
-            maxBindGroups: 4, maxBindGroupsPlusVertexBuffers: 24,
-            maxBindingsPerBindGroup: 1000,
-            maxDynamicUniformBuffersPerPipelineLayout: 8,
-            maxDynamicStorageBuffersPerPipelineLayout: 8,
-            maxSampledTexturesPerShaderStage: 16, maxSamplersPerShaderStage: 16,
-            maxStorageBuffersPerShaderStage: 10, maxStorageTexturesPerShaderStage: 8,
-            maxUniformBuffersPerShaderStage: 12, maxUniformBufferBindingSize: 65536,
-            maxStorageBufferBindingSize: 134217728,
-            minUniformBufferOffsetAlignment: 256, minStorageBufferOffsetAlignment: 256,
-            maxVertexBuffers: 8, maxBufferSize: 268435456, maxVertexAttributes: 30,
-            maxVertexBufferArrayStride: 2048, maxInterStageShaderComponents: 64,
-            maxInterStageShaderVariables: 16, maxColorAttachments: 8,
-            maxColorAttachmentBytesPerSample: 32, maxComputeWorkgroupStorageSize: 32768,
-            maxComputeInvocationsPerWorkgroup: 1024, maxComputeWorkgroupSizeX: 1024,
-            maxComputeWorkgroupSizeY: 1024, maxComputeWorkgroupSizeZ: 64,
-            maxComputeWorkgroupsPerDimension: 65535,
-        };
-        // Limits live as prototype getters (own-keys stays [] like real Chrome).
-        const _mkLimits = () => {
-            const proto = {};
-            for (const k of Object.keys(_gpuLimitVals)) {
-                const v = _gpuLimitVals[k];
-                Object.defineProperty(proto, k, { get() { return v; }, enumerable: false, configurable: true });
-            }
-            Object.defineProperty(proto, Symbol.toStringTag, { value: "GPUSupportedLimits", configurable: true });
-            return Object.create(proto);
-        };
-        const _mkFeatures = () => {
-            const s = new Set([
-                "depth-clip-control", "depth32float-stencil8", "texture-compression-bc",
-                "texture-compression-etc2", "texture-compression-astc", "timestamp-query",
-                "indirect-first-instance", "shader-f16", "rg11b10ufloat-renderable",
-                "bgra8unorm-storage", "float32-filterable",
-            ]);
-            try { Object.defineProperty(s, Symbol.toStringTag, { value: "GPUSupportedFeatures", configurable: true }); } catch (_) {}
-            return s;
-        };
-        const _mkInfo = () => {
-            const i = { vendor: "apple", architecture: "metal-3", device: "", description: "" };
-            try { Object.defineProperty(i, Symbol.toStringTag, { value: "GPUAdapterInfo", configurable: true }); } catch (_) {}
-            return i;
-        };
-        const _mkDevice = () => ({
-            limits: _mkLimits(), features: _mkFeatures(),
-            queue: { submit() {}, writeBuffer() {}, writeTexture() {}, onSubmittedWorkDone() { return Promise.resolve(); }, label: "" },
-            label: "", lost: new Promise(() => {}),
-            destroy() {}, createBuffer() { return {}; }, createTexture() { return {}; },
-            createShaderModule() { return {}; }, createCommandEncoder() { return {}; },
-            createBindGroup() { return {}; }, createBindGroupLayout() { return {}; },
-            createPipelineLayout() { return {}; }, createRenderPipeline() { return {}; },
-            createComputePipeline() { return {}; }, createSampler() { return {}; },
-            pushErrorScope() {}, popErrorScope() { return Promise.resolve(null); },
-            addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
-        });
-        const _mkAdapter = () => ({
-            features: _mkFeatures(), limits: _mkLimits(), info: _mkInfo(),
-            isFallbackAdapter: false,
-            requestAdapterInfo() { return Promise.resolve(_mkInfo()); },
-            requestDevice() { return Promise.resolve(_mkDevice()); },
-        });
-        const _navGpu = {
-            requestAdapter() { return Promise.resolve(_mkAdapter()); },
-            getPreferredCanvasFormat() { return "bgra8unorm"; },
-            wgslLanguageFeatures: new Set(["readonly_and_readwrite_storage_textures", "packed_4x8_integer_dot_product", "pointer_composite_access"]),
-        };
-        Object.defineProperty(_navGpu, Symbol.toStringTag, { value: "GPU", configurable: true });
+        const _navGpu = _svc.make(globalThis.GPU);
         // WebGPU is [SecureContext] — undefined on data:/http:/about:blank.
         _defNav('gpu', () => _secure() ? _navGpu : undefined);
     }
 
-    // Storage Access API
-    if (globalThis.document) {
-        if (!globalThis.document.hasStorageAccess) {
-            globalThis.document.hasStorageAccess = function() { return Promise.resolve(false); };
-        }
-        if (!globalThis.document.requestStorageAccess) {
-            globalThis.document.requestStorageAccess = function() { return Promise.reject(new DOMException("Not allowed", "NotAllowedError")); };
-        }
-    }
+    // Storage Access API: installed on Document.prototype further down, which
+    // is where Chrome has it — the instance must stay own-property-free.
 
     // CSS.supports()
     if (!globalThis.CSS) globalThis.CSS = {};
@@ -6982,38 +5861,7 @@
     // Some scripts and CSP policies check window.trustedTypes presence.
     // ================================================================
     if (!globalThis.trustedTypes) {
-        const _ttPolicies = new Map();
-        const _TrustedHTML = function TrustedHTML(v) { this._v = v; };
-        _TrustedHTML.prototype.toString = function() { return this._v; };
-        const _TrustedScript = function TrustedScript(v) { this._v = v; };
-        _TrustedScript.prototype.toString = function() { return this._v; };
-        const _TrustedScriptURL = function TrustedScriptURL(v) { this._v = v; };
-        _TrustedScriptURL.prototype.toString = function() { return this._v; };
-        globalThis.trustedTypes = {
-            createPolicy(name, rules) {
-                const p = {
-                    name,
-                    createHTML: (s) => typeof rules.createHTML === 'function' ? new _TrustedHTML(rules.createHTML(s)) : new _TrustedHTML(s),
-                    createScript: (s) => typeof rules.createScript === 'function' ? new _TrustedScript(rules.createScript(s)) : new _TrustedScript(s),
-                    createScriptURL: (s) => typeof rules.createScriptURL === 'function' ? new _TrustedScriptURL(rules.createScriptURL(s)) : new _TrustedScriptURL(s),
-                };
-                _ttPolicies.set(name, p);
-                if (name === 'default') globalThis.trustedTypes.defaultPolicy = p;
-                return p;
-            },
-            isHTML(v) { return v instanceof _TrustedHTML; },
-            isScript(v) { return v instanceof _TrustedScript; },
-            isScriptURL(v) { return v instanceof _TrustedScriptURL; },
-            getAttributeType() { return null; },
-            getPropertyType() { return null; },
-            defaultPolicy: null,
-            emptyHTML: new _TrustedHTML(''),
-            emptyScript: new _TrustedScript(''),
-        };
-        globalThis.TrustedHTML = _TrustedHTML;
-        globalThis.TrustedScript = _TrustedScript;
-        globalThis.TrustedScriptURL = _TrustedScriptURL;
-        _maskAsNative(globalThis.trustedTypes, 'createPolicy', 'isHTML', 'isScript', 'isScriptURL', 'getAttributeType', 'getPropertyType');
+        globalThis.trustedTypes = _svc.make(globalThis.TrustedTypePolicyFactory);
     }
 
     // ================================================================
@@ -7021,24 +5869,7 @@
     // window.scheduler.postTask / scheduler.yield are commonly checked.
     // ================================================================
     if (!globalThis.scheduler) {
-        const _SProto = globalThis.Scheduler && globalThis.Scheduler.prototype;
-        if (_SProto) {
-            globalThis.scheduler = Object.create(_SProto);
-            Object.assign(globalThis.scheduler, {
-                postTask(callback, options) {
-                    const delay = (options && options.delay) || 0;
-                    return new Promise((resolve, reject) => {
-                        setTimeout(() => {
-                            try { resolve(callback()); } catch (e) { reject(e); }
-                        }, delay);
-                    });
-                },
-                yield() {
-                    return new Promise(resolve => setTimeout(resolve, 0));
-                },
-            });
-            _maskAsNative(globalThis.scheduler, 'postTask', 'yield');
-        }
+        globalThis.scheduler = _svc.make(globalThis.Scheduler);
     }
 
     // ================================================================
@@ -7064,26 +5895,28 @@
             if (!init || init.identifier === undefined || !init.target) {
                 throw new TypeError("Failed to construct 'Touch': required members identifier and target");
             }
-            this.identifier = init.identifier;
-            this.target = init.target;
-            this.clientX = init.clientX || 0;
-            this.clientY = init.clientY || 0;
-            this.screenX = init.screenX || 0;
-            this.screenY = init.screenY || 0;
-            this.pageX = init.pageX || 0;
-            this.pageY = init.pageY || 0;
-            this.radiusX = init.radiusX || 0;
-            this.radiusY = init.radiusY || 0;
-            this.rotationAngle = init.rotationAngle || 0;
-            this.force = init.force || 0;
-            this.altitudeAngle = init.altitudeAngle || 0;
-            this.azimuthAngle = init.azimuthAngle || 0;
-            this.touchType = init.touchType || 'direct';
+            const _st = _idl.own(this);
+            _st.identifier = init.identifier;
+            _st.target = init.target;
+            _st.clientX = init.clientX || 0;
+            _st.clientY = init.clientY || 0;
+            _st.screenX = init.screenX || 0;
+            _st.screenY = init.screenY || 0;
+            _st.pageX = init.pageX || 0;
+            _st.pageY = init.pageY || 0;
+            _st.radiusX = init.radiusX || 0;
+            _st.radiusY = init.radiusY || 0;
+            _st.rotationAngle = init.rotationAngle || 0;
+            _st.force = init.force || 0;
+            _st.altitudeAngle = init.altitudeAngle || 0;
+            _st.azimuthAngle = init.azimuthAngle || 0;
+            _st.touchType = init.touchType || 'direct';
         };
         globalThis.Touch.prototype = Object.create(Object.prototype, {
             constructor: { value: globalThis.Touch, configurable: true, writable: true },
             [Symbol.toStringTag]: { value: "Touch", configurable: true },
         });
+        _idl.fields(globalThis.Touch.prototype, ["clientX", "clientY", "force", "identifier", "pageX", "pageY", "radiusX", "radiusY", "rotationAngle", "screenX", "screenY", "target"]);
         _maskAsNative(globalThis.Touch);
     }
     if (!globalThis.TouchEvent) {
@@ -7104,7 +5937,8 @@
         _maskAsNative(globalThis.TouchEvent);
     }
     if (!globalThis.TouchList) {
-        globalThis.TouchList = function TouchList() { this.length = 0; };
+        globalThis.TouchList = function TouchList() { _idl.own(this).length = 0; };
+        _idl.fields(globalThis.TouchList.prototype, ["length"]);
         globalThis.TouchList.prototype.item = function(i) { return this[i] || null; };
         _maskAsNative(globalThis.TouchList);
     }
@@ -7141,29 +5975,8 @@
     // Spec: https://w3c.github.io/ServiceWorker/#cachestorage
     // [SecureContext] — undefined on insecure contexts. Phase 7.
     if (_secure() && typeof globalThis.caches === "undefined") {
-        class CacheStorage {
-            match(_request, _options) { return Promise.resolve(undefined); }
-            has(_cacheName) { return Promise.resolve(false); }
-            open(_cacheName) {
-                return Promise.resolve({
-                    match() { return Promise.resolve(undefined); },
-                    matchAll() { return Promise.resolve([]); },
-                    add() { return Promise.reject(new TypeError("Cache.add not supported")); },
-                    addAll() { return Promise.reject(new TypeError("Cache.addAll not supported")); },
-                    put() { return Promise.reject(new TypeError("Cache.put not supported")); },
-                    delete() { return Promise.resolve(false); },
-                    keys() { return Promise.resolve([]); },
-                });
-            }
-            delete(_cacheName) { return Promise.resolve(false); }
-            keys() { return Promise.resolve([]); }
-        }
-        Object.defineProperty(CacheStorage.prototype, Symbol.toStringTag, {
-            value: "CacheStorage", configurable: true,
-        });
-        globalThis.CacheStorage = CacheStorage;
         Object.defineProperty(globalThis, "caches", {
-            value: new CacheStorage(), configurable: true, enumerable: true, writable: false,
+            value: _svc.make(globalThis.CacheStorage), configurable: true, enumerable: true, writable: false,
         });
     }
 
@@ -7220,16 +6033,21 @@
     // keydown, mouseleave, mouseenter, drop, beforeinput, pointerenter,
     // dragend. Phase 7.
     if (globalThis.performance && typeof globalThis.performance.eventCounts === "undefined") {
+        let _EventCounts_get_inner;
         class EventCounts {
-            constructor() { this._inner = new Map(); }
-            get size() { return this._inner.size; }
-            get(name) { return this._inner.get(String(name)); }
-            has(name) { return this._inner.has(String(name)); }
-            entries() { return this._inner.entries(); }
-            keys() { return this._inner.keys(); }
-            values() { return this._inner.values(); }
-            forEach(cb, thisArg) { this._inner.forEach(cb, thisArg); }
-            [Symbol.iterator]() { return this._inner[Symbol.iterator](); }
+            static {
+                _EventCounts_get_inner = (o) => o.#inner;
+            }
+            #inner;
+            constructor() { this.#inner = new Map(); }
+            get size() { return this.#inner.size; }
+            get(name) { return this.#inner.get(String(name)); }
+            has(name) { return this.#inner.has(String(name)); }
+            entries() { return this.#inner.entries(); }
+            keys() { return this.#inner.keys(); }
+            values() { return this.#inner.values(); }
+            forEach(cb, thisArg) { this.#inner.forEach(cb, thisArg); }
+            [Symbol.iterator]() { return this.#inner[Symbol.iterator](); }
         }
         Object.defineProperty(EventCounts.prototype, Symbol.toStringTag, {
             value: "EventCounts", configurable: true,
@@ -7247,7 +6065,7 @@
             "mousemove", "mouseout", "mouseover", "keyup",
             "keypress", "compositionstart", "compositionupdate", "compositionend",
         ]) {
-            _ec._inner.set(k, 0);
+            _EventCounts_get_inner(_ec).set(k, 0);
         }
         // Mount on Performance.prototype, not the instance — real Chrome
         // exposes eventCounts as a prototype getter so
@@ -7274,22 +6092,23 @@
         class Notification extends EventTarget {
             constructor(title, options) {
                 super();
+                const _st = _idl.own(this);
                 if (arguments.length === 0) {
                     throw new TypeError("Failed to construct 'Notification': 1 argument required, but only 0 present.");
                 }
-                this.title = String(title);
-                this.dir = (options && options.dir) || "auto";
-                this.lang = (options && options.lang) || "";
-                this.body = (options && options.body) || "";
-                this.tag = (options && options.tag) || "";
-                this.icon = (options && options.icon) || "";
-                this.image = (options && options.image) || "";
-                this.badge = (options && options.badge) || "";
-                this.data = (options && options.data) ?? null;
-                this.silent = (options && options.silent) ?? null;
-                this.requireInteraction = !!(options && options.requireInteraction);
-                this.actions = (options && options.actions) || [];
-                this.timestamp = Date.now();
+                _st.title = String(title);
+                _st.dir = (options && options.dir) || "auto";
+                _st.lang = (options && options.lang) || "";
+                _st.body = (options && options.body) || "";
+                _st.tag = (options && options.tag) || "";
+                _st.icon = (options && options.icon) || "";
+                _st.image = (options && options.image) || "";
+                _st.badge = (options && options.badge) || "";
+                _st.data = (options && options.data) ?? null;
+                _st.silent = (options && options.silent) ?? null;
+                _st.requireInteraction = !!(options && options.requireInteraction);
+                _st.actions = (options && options.actions) || [];
+                _st.timestamp = Date.now();
                 this.onclick = null;
                 this.onerror = null;
                 this.onclose = null;
@@ -7297,6 +6116,7 @@
             }
             close() {}
         }
+    _idl.fields(Notification.prototype, ["title", "dir", "lang", "body", "tag", "icon", "badge", "data", "silent", "requireInteraction", "actions", "timestamp"]);
         Object.defineProperty(Notification.prototype, Symbol.toStringTag, {
             value: "Notification", configurable: true,
         });
@@ -7307,7 +6127,7 @@
             get: () => _secure() ? "default" : "denied", configurable: true,
         });
         Object.defineProperty(Notification, "maxActions", {
-            value: 2, configurable: true,
+            get: () => 2, configurable: true, enumerable: true,
         });
         Notification.requestPermission = ({
             requestPermission(deprecatedCallback) {
@@ -7357,13 +6177,15 @@
         class IdleDetector extends EventTarget {
             constructor() {
                 super();
-                this.userState = null;
-                this.screenState = null;
+                const _st = _idl.own(this);
+                _st.userState = null;
+                _st.screenState = null;
                 this.onchange = null;
             }
             start(_options) { return Promise.reject(new DOMException("Not allowed", "NotAllowedError")); }
             abort() {}
         }
+    _idl.fields(IdleDetector.prototype, ["screenState", "userState"]);
         Object.defineProperty(IdleDetector.prototype, Symbol.toStringTag, {
             value: "IdleDetector", configurable: true,
         });
@@ -7427,10 +6249,10 @@
         class DevicePosture extends EventTarget {
             constructor() {
                 super();
-                this._type = "continuous"; // Desktop default
+                _idl.own(this)._type = "continuous"; // Desktop default
                 this.onchange = null;
             }
-            get type() { return this._type; }
+            get type() { return _idl.own(this)._type; }
         }
         Object.defineProperty(DevicePosture.prototype, Symbol.toStringTag, {
             value: "DevicePosture", configurable: true,
@@ -7480,6 +6302,7 @@
     if (globalThis.Document && typeof globalThis.Document.prototype.startViewTransition === "undefined") {
         class ViewTransition {
             constructor(updateCallback) {
+                const _st = _idl.own(this);
                 // The view-transition lifecycle: ready Promise resolves
                 // when the snapshot is ready; finished resolves after
                 // the transition completes. updateCallbackDone resolves
@@ -7489,14 +6312,15 @@
                     try { cbResult = Promise.resolve(updateCallback()); }
                     catch (e) { cbResult = Promise.reject(e); }
                 }
-                this.updateCallbackDone = cbResult;
+                _st.updateCallbackDone = cbResult;
                 // No real animation in headless — resolve immediately.
-                this.ready = cbResult.then(() => {});
-                this.finished = cbResult.then(() => {});
-                this.types = new Set();
+                _st.ready = cbResult.then(() => {});
+                _st.finished = cbResult.then(() => {});
+                _st.types = new Set();
             }
             skipTransition() {}
         }
+    _idl.fields(ViewTransition.prototype, ["finished", "ready", "types", "updateCallbackDone"]);
         Object.defineProperty(ViewTransition.prototype, Symbol.toStringTag, {
             value: "ViewTransition", configurable: true,
         });
@@ -7534,24 +6358,17 @@
     // (12) Document.prototype.hasPrivateToken / hasRedemptionRecord (Trust Tokens API)
     // Chrome 130+ ad-fraud prevention APIs. Absence differs from real Chrome.
     if (globalThis.Document && typeof globalThis.Document.prototype.hasPrivateToken === "undefined") {
-        const _hasPrivateToken = function hasPrivateToken() { 
-            return Promise.reject(new DOMException("The Trust Token API is not supported.", "NotSupportedError"));
-        };
-        const _hasRedemptionRecord = function hasRedemptionRecord() {
-            return Promise.reject(new DOMException("The Trust Token API is not supported.", "NotSupportedError"));
-        };
-        if (typeof _maskFunction === "function") {
-            _maskFunction(_hasPrivateToken, "hasPrivateToken");
-            _maskFunction(_hasRedemptionRecord, "hasRedemptionRecord");
-        }
-        Object.defineProperty(globalThis.Document.prototype, "hasPrivateToken", {
-            value: _hasPrivateToken, configurable: true, writable: true,
-        });
-        Object.defineProperty(globalThis.Document.prototype, "hasRedemptionRecord", {
-            value: _hasRedemptionRecord, configurable: true, writable: true,
-        });
+        // Both resolve `false` for an issuer with nothing stored — measured
+        // against Chrome 151, which answers in under a millisecond. Rejecting
+        // with NotSupportedError was wrong three ways at once: no real Chrome
+        // reports the API as unsupported, callers chain `.then` without a
+        // `.catch` (hCaptcha's does, and a rejection derails the request it
+        // gates), and our rejection took ~290 ms where Chrome takes none.
+        _defProtoMethod(globalThis.Document.prototype, "hasPrivateToken",
+            function hasPrivateToken(issuer) { return Promise.resolve(false); });
+        _defProtoMethod(globalThis.Document.prototype, "hasRedemptionRecord",
+            function hasRedemptionRecord(issuer) { return Promise.resolve(false); });
     }
-
     // (13) PaymentRequest — Payment Request API (W3C Recommendation, Sept 2022).
     // Spec: https://www.w3.org/TR/payment-request/
     // [SecureContext] — undefined on insecure contexts. cleanup_bootstrap.js
@@ -7705,35 +6522,6 @@
     //   (snapshot bootstraps with is_secure_context=true) and then
     //   stripped per-page in cleanup_bootstrap.js when the actual page
     //   URL is insecure.
-    // (Phase J) High-ROI Parity Gaps: VirtualKeyboard, DevicePosture, WindowControlsOverlay
-    {
-        class VirtualKeyboard extends EventTarget {
-            constructor() { super(); }
-            get boundingRect() { return { x: 0, y: 0, width: 0, height: 0 }; } // Avoid DOMRect dependency
-            get overlaysContent() { return false; }
-            show() {}
-            hide() {}
-        }
-        Object.defineProperty(VirtualKeyboard.prototype, Symbol.toStringTag, {
-            value: "VirtualKeyboard", configurable: true,
-        });
-        globalThis.VirtualKeyboard = VirtualKeyboard;
-        const _vk = new VirtualKeyboard();
-        _defNav('virtualKeyboard', () => _vk);
-    }
-
-    {
-        class DevicePosture extends EventTarget {
-            constructor() { super(); }
-            get type() { return "continuous"; }
-        }
-        Object.defineProperty(DevicePosture.prototype, Symbol.toStringTag, {
-            value: "DevicePosture", configurable: true,
-        });
-        globalThis.DevicePosture = DevicePosture;
-        const _dp = new DevicePosture();
-        _defNav('devicePosture', () => _dp);
-    }
 
     {
         class WindowControlsOverlay extends EventTarget {
@@ -7813,8 +6601,6 @@
         define('navigation', globalThis.Navigation ? Object.create(globalThis.Navigation.prototype) : {});
         define('documentPictureInPicture', globalThis.DocumentPictureInPicture
             ? Object.create(globalThis.DocumentPictureInPicture.prototype) : {});
-        define('sharedStorage', globalThis.SharedStorage
-            ? Object.create(globalThis.SharedStorage.prototype) : {});
     })();
 
     globalThis.clientInformation = globalThis.navigator;
@@ -7900,6 +6686,7 @@
     // and assignment still lands in the same slot.
     (() => {
         const INSTANCE_ATTRS = [
+            'document', 'location',
             'self', 'name', 'customElements', 'history', 'navigation', 'locationbar',
             'menubar', 'personalbar', 'scrollbars', 'statusbar', 'toolbar', 'status',
             'closed', 'frames', 'length', 'opener', 'frameElement', 'navigator',
@@ -7909,10 +6696,21 @@
             'clientInformation', 'screenLeft', 'screenTop', 'styleMedia',
             'isSecureContext', 'crossOriginIsolated', 'scheduler', 'performance',
             'trustedTypes', 'crypto', 'indexedDB', 'localStorage', 'sessionStorage',
-            'caches', 'cookieStore', 'documentPictureInPicture', 'sharedStorage',
+            'caches', 'cookieStore', 'documentPictureInPicture',
             'originAgentCluster', 'viewport', 'credentialless', 'fence', 'launchQueue',
             'speechSynthesis', 'crashReport',
         ];
+        // Readonly-without-[Replaceable] attributes have no setter at all in
+        // Chrome; giving every one a setter was its own descriptor mismatch.
+        const GETTER_ONLY = new Set([
+            'window', 'document', 'top', 'customElements', 'history', 'closed',
+            'frameElement', 'navigator', 'styleMedia', 'isSecureContext',
+            'crossOriginIsolated', 'trustedTypes', 'crypto', 'indexedDB',
+            'localStorage', 'sessionStorage', 'caches', 'cookieStore',
+            'documentPictureInPicture', 'originAgentCluster',
+            'credentialless', 'fence', 'launchQueue', 'speechSynthesis',
+            'crashReport',
+        ]);
         const slots = Object.create(null);
         const convert = (name) => {
             let d;
@@ -7920,10 +6718,12 @@
             if (!d || d.get || d.set || !d.configurable) return;
             slots[name] = d.value;
             const get = ({ [name]() { return slots[name]; } })[name];
-            const set = ({ [name](v) { slots[name] = v; } })[name];
+            const set = GETTER_ONLY.has(name)
+                ? undefined
+                : ({ [name](v) { slots[name] = v; } })[name];
             if (typeof globalThis._maskFunction === 'function') {
                 globalThis._maskFunction(get, 'get ' + name);
-                globalThis._maskFunction(set, 'set ' + name);
+                if (set) globalThis._maskFunction(set, 'set ' + name);
             }
             try {
                 Object.defineProperty(globalThis, name, {

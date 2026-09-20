@@ -138,7 +138,9 @@ fn touches_stylesheet(state: &DomState, id: NodeId) -> bool {
 
 fn refresh_stylesheets(state: &mut DomState) {
     let entries = crate::stylesheet_collector::find_stylesheets(&state.dom);
-    state.stylesheets = crate::stylesheet_collector::resolve_inline_only(&entries);
+    let mut sheets = crate::stylesheet_collector::resolve_inline_only(&entries);
+    sheets.extend(state.external_stylesheets.iter().cloned());
+    state.stylesheets = sheets;
     state.update_cached_rules();
 }
 
@@ -151,6 +153,14 @@ fn refresh_stylesheets(state: &mut DomState) {
 #[smi]
 pub fn op_dom_document_node() -> i32 {
     NodeId::DOCUMENT.to_raw() as i32
+}
+
+/// True when the parsed document had no doctype. `document.compatMode` used to
+/// answer "CSS1Compat" unconditionally, which contradicts the served markup on
+/// any doctype-less page — something a detector can check for free.
+#[op2(fast)]
+pub fn op_dom_is_quirks_mode(state: &mut OpState) -> bool {
+    state.borrow::<DomState>().dom.quirks()
 }
 
 #[op2]
@@ -1374,6 +1384,97 @@ pub struct CSSRuleJson {
     pub rule_type: u8,
 }
 
+/// One `@font-face` rule, flattened to the descriptors `FontFace` exposes.
+#[derive(serde::Serialize)]
+pub struct FontFaceJson {
+    pub family: String,
+    pub style: String,
+    pub weight: String,
+    pub stretch: String,
+    pub unicode_range: String,
+    pub variant: String,
+    pub feature_settings: String,
+    pub display: String,
+    pub ascent_override: String,
+    pub descent_override: String,
+    pub line_gap_override: String,
+    pub size_adjust: String,
+    pub variation_settings: String,
+}
+
+/// Walk a rule list, flattening every `@font-face` into `out`.
+///
+/// Recursive because a `@font-face` nested in `@media`/`@supports` is still a
+/// face the document declares.
+fn collect_font_faces(rules: &[crate::css_parser::ast::Rule], out: &mut Vec<FontFaceJson>) {
+    use crate::css_parser::ast::{Block, Rule};
+    for rule in rules {
+        let Rule::At(at) = rule else { continue };
+        match &at.block {
+            Some(Block::RuleList(inner)) => collect_font_faces(inner, out),
+            Some(Block::DeclarationBlock {
+                declarations,
+                rules: inner,
+            }) => {
+                if at.name.eq_ignore_ascii_case("font-face") {
+                    let desc = |name: &str, fallback: &str| -> String {
+                        declarations
+                            .iter()
+                            .rev()
+                            .find(|d| d.name.eq_ignore_ascii_case(name))
+                            .map(|d| {
+                                crate::js_runtime::utils::tokens_to_string(&d.value)
+                                    .trim()
+                                    .trim_matches(['"', '\''])
+                                    .to_string()
+                            })
+                            .filter(|v| !v.is_empty())
+                            .unwrap_or_else(|| fallback.to_string())
+                    };
+                    // A face with no family is not addressable and Chrome drops it.
+                    let family = desc("font-family", "");
+                    if !family.is_empty() {
+                        out.push(FontFaceJson {
+                            family,
+                            style: desc("font-style", "normal"),
+                            weight: desc("font-weight", "normal"),
+                            stretch: desc("font-stretch", "normal"),
+                            unicode_range: desc("unicode-range", "U+0-10FFFF"),
+                            variant: desc("font-variant", "normal"),
+                            feature_settings: desc("font-feature-settings", "normal"),
+                            display: desc("font-display", "auto"),
+                            ascent_override: desc("ascent-override", "normal"),
+                            descent_override: desc("descent-override", "normal"),
+                            line_gap_override: desc("line-gap-override", "normal"),
+                            size_adjust: desc("size-adjust", "100%"),
+                            variation_settings: desc("font-variation-settings", "normal"),
+                        });
+                    }
+                }
+                collect_font_faces(inner, out);
+            }
+            None => {}
+        }
+    }
+}
+
+/// Every `@font-face` the document's stylesheets declare, in document order.
+///
+/// Backs `document.fonts`, whose contents in a real browser are the document's
+/// own faces — NOT the installed system fonts. `op_dom_get_stylesheet_rules`
+/// cannot serve this: it emits qualified rules only and drops every at-rule.
+#[op2]
+#[serde]
+pub fn op_dom_font_faces(state: &mut OpState) -> Vec<FontFaceJson> {
+    let state = state.borrow::<DomState>();
+    let mut out = Vec::new();
+    for sheet in &state.stylesheets {
+        let (parsed, _errors) = crate::css_parser::parse_stylesheet(sheet);
+        collect_font_faces(&parsed.rules, &mut out);
+    }
+    out
+}
+
 /// Get parsed rules for a stylesheet by index.
 #[op2]
 #[serde]
@@ -1709,6 +1810,45 @@ pub fn op_set_child_realm_prop<'s>(
     v8::undefined(cs).into()
 }
 
+/// Run a dynamically inserted classic script under its own URL.
+///
+/// The JS side used to reach for `(0, eval)(code)`, which V8 attributes to
+/// `eval (<anonymous>:…)`. Talon ships `new Error().stack` verbatim in its XAL
+/// payload, so its own SDK showed up there as anonymous eval where a real
+/// Chrome names the file — a difference visible in one string compare.
+/// Compiling with a `ScriptOrigin` gives the frames the script's URL, exactly
+/// as the document's own scripts already get from `execute_script_with_name`.
+///
+/// Exceptions propagate to the caller, as they do out of `eval`.
+#[op2(nofast, reentrant)]
+pub fn op_run_classic_script<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    #[string] code: String,
+    #[string] url: String,
+) {
+    let Some(src) = v8::String::new(scope, &code) else {
+        return;
+    };
+    let origin = v8::String::new(scope, &url).map(|name| {
+        v8::ScriptOrigin::new(
+            scope,
+            name.into(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            false,
+            false,
+            false,
+            None,
+        )
+    });
+    if let Some(script) = v8::Script::compile(scope, src, origin.as_ref()) {
+        script.run(scope);
+    }
+}
+
 /// Execute a JavaScript string inside a child realm's context.
 ///
 /// Compiles and runs `code` in the child context scope. Returns the result
@@ -1772,6 +1912,7 @@ deno_core::extension!(
     dom_extension,
     ops = [
         op_dom_document_node,
+        op_dom_is_quirks_mode,
         op_dom_get_tag_name,
         op_dom_get_node_type,
         op_dom_get_text_content,
@@ -1820,6 +1961,7 @@ deno_core::extension!(
         op_iframe_take_parent_messages,
         op_dom_get_stylesheet_count,
         op_dom_get_stylesheet_rules,
+        op_dom_font_faces,
         op_dom_attach_shadow,
         op_dom_get_shadow_root,
         op_dom_get_base_url,
@@ -1831,5 +1973,6 @@ deno_core::extension!(
         op_create_child_realm,
         op_set_child_realm_prop,
         op_eval_in_child_realm,
+        op_run_classic_script,
     ],
 );

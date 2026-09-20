@@ -19,10 +19,8 @@
 
 use crate::js_runtime::state::DomState;
 use deno_core::op2;
+use deno_core::v8;
 use deno_core::OpState;
-use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
-use rand_distr::{Distribution, Exp, LogNormal};
 use std::time::Instant;
 
 /// Per-runtime state for the humanized clock.
@@ -38,12 +36,7 @@ pub struct PerfState {
     /// detectable skew between `performance.timeOrigin + performance.now()`
     /// and `Date.now()`.
     origin_unix_ms: f64,
-    rng: StdRng,
-    log_normal: LogNormal<f64>,
-    spike_exp: Exp<f64>,
     /// Last returned value in µs — enforces monotonicity per HRT spec.
-    /// Without this, adjacent calls can go backward when the clock barely
-    /// advances and the second call samples lower jitter.
     last_us: f64,
 }
 
@@ -51,7 +44,9 @@ impl PerfState {
     pub fn new() -> Self {
         Self::with_seed(0xCAFEF00DDEADBEEF)
     }
-    pub fn with_seed(seed: u64) -> Self {
+    /// `seed` is kept for call-site compatibility; the clock no longer draws
+    /// random numbers — Chrome's readings are deterministic grid points.
+    pub fn with_seed(_seed: u64) -> Self {
         let origin_unix_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64() * 1000.0)
@@ -59,31 +54,27 @@ impl PerfState {
         Self {
             origin: Instant::now(),
             origin_unix_ms,
-            rng: StdRng::seed_from_u64(seed),
-            // μ=ln(8 µs) ≈ 2.079
-            log_normal: LogNormal::new(2.079_441_541_679_835, 0.4).expect("valid lognormal"),
-            // Exp(1/200 µs) — mean 200 µs heavy-tail
-            spike_exp: Exp::new(1.0 / 200.0).expect("valid exp"),
             last_us: 0.0,
         }
     }
 
-    /// Returns elapsed ms since origin with Chrome-130-shaped jitter.
-    /// Monotonicity enforced per HRT spec: result is clamped to be >=
-    /// the previous return value, so the per-call jitter cannot create
-    /// a backward step.
+    /// Elapsed ms since origin, shaped the way Chrome reports it.
+    ///
+    /// Measured against Chrome 151: every reading sits on the 100 µs grid,
+    /// carrying only a ~5e-8 ms residual from double arithmetic — the long
+    /// tails in values like `383007.7999999523` are that, not noise.
+    ///
+    /// This used to add a log-normal jitter of up to 35 µs plus rare spikes on
+    /// top of the quantum, putting readings 5–12 µs off the grid — five orders
+    /// of magnitude coarser than Chrome's residual, and checkable with one
+    /// modulo. Event timestamps derive from this clock, so every
+    /// `event.timeStamp` Talon collected carried the signature.
+    ///
+    /// Monotonicity is kept per the HRT spec: the result never steps backward.
     pub fn now_ms(&mut self) -> f64 {
         let raw_us = self.origin.elapsed().as_nanos() as f64 / 1000.0;
         let q = (raw_us / 100.0).floor() * 100.0;
-        let jitter = self.log_normal.sample(&mut self.rng).clamp(0.0, 35.0);
-        let spike = if self.rng.random_bool(1.0 / 1024.0) {
-            self.spike_exp.sample(&mut self.rng).min(1500.0)
-        } else {
-            0.0
-        };
-        let candidate = q + jitter + spike;
-        // Monotonic clamp — Chrome's quantizer never goes backward.
-        let value = candidate.max(self.last_us);
+        let value = q.max(self.last_us);
         self.last_us = value;
         value / 1000.0
     }
@@ -138,8 +129,8 @@ pub fn op_perf_get_resource_timings(state: &mut OpState) -> Vec<JsResourceTiming
     state
         .resource_timings
         .iter()
-        .map(|t| JsResourceTiming {
-            name: "https://example.com/placeholder".to_string(),
+        .map(|(url, decoded_size, t)| JsResourceTiming {
+            name: url.clone(),
             entry_type: "resource".to_string(),
             start_time: t.request_start_ms,
             duration: t.response_end_ms - t.request_start_ms,
@@ -152,11 +143,35 @@ pub fn op_perf_get_resource_timings(state: &mut OpState) -> Vec<JsResourceTiming
             request_start: t.request_start_ms,
             response_start: t.response_start_ms,
             response_end: t.response_end_ms,
+            // The compressed on-wire byte count isn't tracked separately
+            // from the decoded body (the HTTP client decompresses
+            // in-place) — `transfer_size`/`encoded_body_size` stay at 0
+            // rather than guess a compression ratio. `decoded_body_size`
+            // is real: the actual decoded response body length.
             transfer_size: 0,
             encoded_body_size: 0,
-            decoded_body_size: 0,
+            decoded_body_size: *decoded_size,
         })
         .collect()
+}
+
+/// V8's real heap totals, for `performance.memory`.
+///
+/// Measured against Chrome 151: the values are byte-precise (never a round
+/// multiple), stable across rapid reads, and grow as the page allocates. The
+/// previous implementation returned a value bucketed to 100 KB on the belief
+/// that Chrome quantizes it — Chrome does not, so every reading we produced was
+/// divisible by 100000, which no real Chrome ever reports.
+///
+/// Returns `[total, used]`; the caller pairs them with the profile's limit.
+#[op2]
+#[serde]
+pub fn op_perf_heap_stats(scope: &mut v8::PinScope) -> (f64, f64) {
+    let stats = scope.get_heap_statistics();
+    (
+        stats.total_heap_size() as f64,
+        stats.used_heap_size() as f64,
+    )
 }
 
 deno_core::extension!(
@@ -165,6 +180,7 @@ deno_core::extension!(
         op_perf_now_humanized,
         op_perf_get_resource_timings,
         op_perf_time_origin_ms,
+        op_perf_heap_stats,
     ],
 );
 
@@ -173,62 +189,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn distribution_has_distinct_jitter_values() {
+    fn readings_sit_on_chromes_hundred_microsecond_grid() {
+        // Measured on Chrome 153: 500 hot calls return ONE value, exactly on
+        // the 100 µs grid (`performance.now() * 1000 % 100 === 0`, span 0 µs).
+        // This test used to demand >10 distinct values on the belief that a
+        // real browser jitters around the quantum — it does not, and adding
+        // that jitter is what made every `event.timeStamp` we produced
+        // off-grid. What has to hold is the grid itself plus monotonicity.
         let mut s = PerfState::with_seed(7);
-        // The monotonicity clamp + a tight hot loop on a fast CPU means many
-        // adjacent calls clamp to last_us (the underlying clock advances by
-        // far less than the inter-call gap). A real browser's hot-loop diff
-        // *cardinality* is well above 1; anything above ~5 distinct values
-        // is realistic versus the software-clock `set(diffs).size === 1`
-        // signature. We assert >10 here for headroom.
-        let mut samples: Vec<f64> = (0..500).map(|_| s.now_ms()).collect();
-        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        samples.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
-        assert!(
-            samples.len() > 10,
-            "expected >10 distinct values, got {}",
-            samples.len()
-        );
-    }
-
-    #[test]
-    fn jitter_is_bounded_and_non_negative() {
-        let mut s = PerfState::with_seed(0xDEADBEEF);
-        for _ in 0..10_000 {
-            let v = s.log_normal.sample(&mut s.rng).clamp(0.0, 35.0);
-            assert!((0.0..=35.0).contains(&v));
-        }
-    }
-
-    #[test]
-    fn deterministic_across_runs_with_same_seed() {
-        let mut a = PerfState::with_seed(123);
-        let mut b = PerfState::with_seed(123);
-        let ja: Vec<f64> = (0..100).map(|_| a.log_normal.sample(&mut a.rng)).collect();
-        let jb: Vec<f64> = (0..100).map(|_| b.log_normal.sample(&mut b.rng)).collect();
-        assert_eq!(ja, jb);
-    }
-
-    #[test]
-    fn occasional_heavy_tail_spikes() {
-        // Over 100k samples we should see at least one >250 µs jitter event
-        // (the Bernoulli(1/1024) Exp tail). Absence indicates the spike path
-        // never fires.
-        let mut s = PerfState::with_seed(0xBEEF);
-        let mut max_jitter_us = 0.0_f64;
-        for _ in 0..100_000 {
-            let j = s.log_normal.sample(&mut s.rng).clamp(0.0, 35.0);
-            let spike = if s.rng.random_bool(1.0 / 1024.0) {
-                s.spike_exp.sample(&mut s.rng).min(1500.0)
-            } else {
-                0.0
-            };
-            max_jitter_us = max_jitter_us.max(j + spike);
+        let samples: Vec<f64> = (0..500).map(|_| s.now_ms()).collect();
+        for v in &samples {
+            let us = v * 1000.0;
+            assert!(
+                (us / 100.0 - (us / 100.0).round()).abs() < 1e-6,
+                "reading off the 100 µs grid: {v}"
+            );
         }
         assert!(
-            max_jitter_us > 250.0,
-            "expected at least one spike >250 µs, got max {} µs",
-            max_jitter_us
+            samples.windows(2).all(|w| w[1] >= w[0]),
+            "readings must never step backward"
         );
     }
 }

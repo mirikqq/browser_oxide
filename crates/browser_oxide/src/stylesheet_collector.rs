@@ -12,6 +12,65 @@ pub enum StylesheetEntry {
 
 /// Find all stylesheets in the DOM: `<style>` blocks and `<link rel="stylesheet">` tags.
 /// Returns entries in document order. Mirrors the `script_runner::find_scripts` pattern.
+/// A `<link>` the page asks the browser to fetch ahead of use.
+///
+/// Chrome fetches every one of these during navigation, and a server sees the
+/// result directly: on Epic's login page it pulls six `woff2` faces through
+/// `rel=preload as=font`. We fetched none, so the CDN saw a client that took
+/// the JS and CSS and never once asked for a font — a difference that needs no
+/// fingerprinting to spot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreloadEntry {
+    pub href: String,
+    /// `as` attribute (`font`, `script`, `style`, `image`, …), lowercased.
+    /// `modulepreload` reports `script`.
+    pub kind: String,
+}
+
+/// Collect `<link rel=preload|modulepreload|stylesheet>` targets.
+pub fn find_preloads(dom: &Dom) -> Vec<PreloadEntry> {
+    let mut out = Vec::new();
+    collect_preloads(dom, NodeId::DOCUMENT, &mut out);
+    out
+}
+
+fn collect_preloads(dom: &Dom, node_id: NodeId, out: &mut Vec<PreloadEntry>) {
+    for child_id in dom.children(node_id) {
+        if let Some(node) = dom.get(child_id) {
+            if let NodeData::Element(elem) = &node.data {
+                if elem.name.local.eq_ignore_ascii_case("link") {
+                    let attr = |n: &str| {
+                        elem.attrs
+                            .iter()
+                            .find(|a| a.name.local.eq_ignore_ascii_case(n))
+                            .map(|a| a.value.trim().to_ascii_lowercase())
+                    };
+                    let rel = attr("rel").unwrap_or_default();
+                    let href = elem
+                        .attrs
+                        .iter()
+                        .find(|a| a.name.local.eq_ignore_ascii_case("href"))
+                        .map(|a| a.value.trim().to_string())
+                        .unwrap_or_default();
+                    if href.is_empty() {
+                        continue;
+                    }
+                    let kind = match rel.as_str() {
+                        "modulepreload" => Some("script".to_string()),
+                        "stylesheet" => Some("style".to_string()),
+                        "preload" => attr("as"),
+                        _ => None,
+                    };
+                    if let Some(kind) = kind {
+                        out.push(PreloadEntry { href, kind });
+                    }
+                }
+            }
+        }
+        collect_preloads(dom, child_id, out);
+    }
+}
+
 pub fn find_stylesheets(dom: &Dom) -> Vec<StylesheetEntry> {
     let mut entries = Vec::new();
     collect_stylesheets(dom, NodeId::DOCUMENT, &mut entries);

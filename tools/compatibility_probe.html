@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>BrowserOxide local compatibility probe</title>
+<h1>Local Web API behavior</h1>
+<pre id="output">Running…</pre>
+<script>
+(async () => {
+  const results = [];
+  async function check(name, expected, fn) {
+    try {
+      const actual = await fn();
+      results.push({ name, expected, actual, pass: JSON.stringify(actual) === JSON.stringify(expected) });
+    } catch (error) {
+      results.push({ name, expected, error: String(error), pass: false });
+    }
+  }
+  await check('moving an existing DOM node', [0, 1, true], () => {
+    const a = document.createElement('div'), b = document.createElement('div');
+    const child = document.createElement('span');
+    a.appendChild(child);
+    b.appendChild(child);
+    return [a.childNodes.length, b.childNodes.length, child.parentNode === b];
+  });
+  await check('DocumentFragment is emptied on insertion', [0, 2, 'ab'], () => {
+    const fragment = document.createDocumentFragment(), parent = document.createElement('div');
+    fragment.appendChild(document.createTextNode('a'));
+    fragment.appendChild(document.createTextNode('b'));
+    parent.appendChild(fragment);
+    return [fragment.childNodes.length, parent.childNodes.length, parent.textContent];
+  });
+  await check('live collection versus static selector result', [2, 1], () => {
+    const parent = document.createElement('div');
+    parent.appendChild(document.createElement('span'));
+    const live = parent.children, snapshot = parent.querySelectorAll('span');
+    parent.appendChild(document.createElement('span'));
+    return [live.length, snapshot.length];
+  });
+  await check('live collections update after removal and attribute changes', [true, true, 2, 1, 1, true, true, 0, 0], () => {
+    const parent = document.createElement('div'), child = document.createElement('span');
+    const nodes = parent.childNodes, children = parent.children;
+    const tagged = parent.getElementsByTagName('span'), classified = parent.getElementsByClassName('selected');
+    parent.appendChild(document.createTextNode('text'));
+    parent.appendChild(child);
+    child.setAttribute('class', 'selected');
+    const before = [nodes === parent.childNodes, children === parent.children, nodes.length, tagged.length, classified.length, nodes.item(1) === child, [...children][0] === child];
+    child.removeAttribute('class');
+    parent.removeChild(child);
+    return [...before, classified.length, tagged.length];
+  });
+  await check('event cancellation', [false, true], () => {
+    const target = new EventTarget(), event = new Event('probe', { cancelable: true });
+    target.addEventListener('probe', e => e.preventDefault());
+    return [target.dispatchEvent(event), event.defaultPrevented];
+  });
+  await check('once and aborted event listeners', [1, 0], () => {
+    const target = new EventTarget(), controller = new AbortController();
+    let once = 0, aborted = 0;
+    target.addEventListener('probe', () => once++, { once: true });
+    target.addEventListener('probe', () => aborted++, { signal: controller.signal });
+    controller.abort();
+    target.dispatchEvent(new Event('probe'));
+    target.dispatchEvent(new Event('probe'));
+    return [once, aborted];
+  });
+  await check('listener removal during dispatch and recursive once', ['first', 'first', 'once'], () => {
+    const target = new EventTarget(), controller = new AbortController(), log = [];
+    const skipped = () => log.push('removed');
+    target.addEventListener('probe', () => { log.push('first'); controller.abort(); });
+    target.addEventListener('probe', skipped, { signal: controller.signal });
+    target.dispatchEvent(new Event('probe'));
+    target.addEventListener('probe', skipped, { signal: controller.signal });
+    target.dispatchEvent(new Event('probe'));
+    target.addEventListener('recursive', () => {
+      log.push('once');
+      if (log.length < 6) target.dispatchEvent(new Event('recursive'));
+    }, { once: true });
+    target.dispatchEvent(new Event('recursive'));
+    return log;
+  });
+  await check('MutationObserver records attribute old values', [null, 'one'], async () => {
+    const element = document.createElement('div'), oldValues = [];
+    const observer = new MutationObserver(records => oldValues.push(...records.map(r => r.oldValue)));
+    observer.observe(element, { attributes: true, attributeOldValue: true });
+    element.setAttribute('data-probe', 'one');
+    element.setAttribute('data-probe', 'two');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    observer.disconnect();
+    return oldValues;
+  });
+  await check('MutationObserver filters, subtree and removal', [2, 'data-probe', 'one', 'two', 0], () => {
+    const parent = document.createElement('div'), child = document.createElement('span');
+    parent.appendChild(child);
+    child.setAttribute('data-probe', 'one');
+    const observer = new MutationObserver(() => {});
+    observer.observe(parent, { subtree: true, attributeOldValue: true, attributeFilter: ['data-probe'] });
+    observer.observe(child, { attributes: true });
+    child.setAttribute('data-probe', 'two');
+    child.removeAttribute('data-probe');
+    child.removeAttribute('data-probe');
+    const records = observer.takeRecords();
+    observer.disconnect();
+    observer.observe(parent, { subtree: true, attributeFilter: ['data-probe'] });
+    child.setAttribute('other', 'ignored');
+    const ignored = observer.takeRecords().length;
+    observer.disconnect();
+    return [records.length, records[0].attributeName, records[0].oldValue, records[1].oldValue, ignored];
+  });
+  await check('MutationObserver omits old values unless requested', [null, true], () => {
+    const node = document.createElement('div'), observer = new MutationObserver(() => {});
+    node.setAttribute('title', 'old');
+    observer.observe(node, { attributes: true });
+    node.setAttribute('title', 'new');
+    const oldValue = observer.takeRecords()[0].oldValue;
+    observer.disconnect();
+    let invalid = false;
+    try { observer.observe(node, { attributes: false, attributeOldValue: true }); }
+    catch (error) { invalid = error instanceof TypeError; }
+    return [oldValue, invalid];
+  });
+  await check('form reset restores the default value', ['initial', 'initial'], () => {
+    const form = document.createElement('form'), input = document.createElement('input');
+    input.setAttribute('value', 'initial');
+    form.appendChild(input);
+    document.body.appendChild(form);
+    try {
+      input.value = 'edited';
+      form.reset();
+      return [input.value, input.getAttribute('value')];
+    } finally { form.remove(); }
+  });
+  await check('URL and searchParams stay synchronized', ['?q=a+b&x=1', 'two', false], () => {
+    const url = new URL('https://example.test/path?q=a%20b');
+    const params = url.searchParams;
+    params.set('x', '1');
+    const query = url.search;
+    url.search = '?q=two';
+    return [query, params.get('q'), params.has('x')];
+  });
+  await check('URL setters preserve a live searchParams object', ['https://example.test/c?a=1&z=two+words', true, 'https://other.test:8080/x?fresh=1#done', '1', false], () => {
+    const url = new URL('../c?z=two%20words&z=three&a=1', 'https://example.test/a/b');
+    const params = url.searchParams;
+    params.delete('z', 'three');
+    params.sort();
+    const sorted = url.href;
+    url.href = 'http://other.test:8080/x?fresh=1';
+    url.protocol = 'https:';
+    url.hash = 'done';
+    return [sorted, params === url.searchParams, url.href, params.get('fresh'), params.has('z')];
+  });
+  await check('URLSearchParams encoding, duplicate keys and iterator isolation', ['a+b', '�%ZZ', 'q=a%2Bb&bad=%EF%BF%BD%25ZZ&x=3', false], () => {
+    const params = new URLSearchParams('?q=a%2Bb&bad=%FF%ZZ&x=1&x=2');
+    const pair = params.entries().next().value;
+    pair[1] = 'changed';
+    params.set('x', '3');
+    return [params.get('q'), params.get('bad'), params.toString(), params.has('x', '2')];
+  });
+  await check('CSS content-box geometry', ['40px', 54], () => {
+    const element = document.createElement('div');
+    element.style.cssText = 'position:absolute;box-sizing:content-box;width:40px;height:10px;padding:5px;border:2px solid black';
+    document.body.appendChild(element);
+    try { return [getComputedStyle(element).width, element.getBoundingClientRect().width]; }
+    finally { element.remove(); }
+  });
+  await check('Canvas 2D draws and reads a pixel', [255, 0, 0, 255], () => {
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = 2;
+    const context = canvas.getContext('2d');
+    context.fillStyle = '#ff0000';
+    context.fillRect(0, 0, 2, 2);
+    return Array.from(context.getImageData(0, 0, 1, 1).data);
+  });
+  await check('Promise microtask precedes timer task', ['sync', 'microtask', 'timer'], async () => {
+    const order = ['sync'];
+    Promise.resolve().then(() => order.push('microtask'));
+    await new Promise(resolve => setTimeout(() => { order.push('timer'); resolve(); }, 0));
+    return order;
+  });
+  globalThis.compatReport = { results, passed: results.filter(r => r.pass).length, total: results.length };
+  document.getElementById('output').textContent = JSON.stringify(globalThis.compatReport, null, 2);
+})();
+</script>
+</html>

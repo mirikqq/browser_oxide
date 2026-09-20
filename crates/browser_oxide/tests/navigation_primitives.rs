@@ -28,7 +28,7 @@ fn read_pending_navigation(page: &mut Page) -> (String, String) {
         .evaluate(
             "(function(){\
                 const ns = (function(){\
-                    const s = Object.getOwnPropertySymbols(globalThis);\
+                    const s = Object.getOwnPropertySymbols(globalThis,1);\
                     for (let i = 0; i < s.length; i++) {\
                         const v = globalThis[s[i]];\
                         if (v && v.__bo) return v;\
@@ -144,7 +144,7 @@ async fn meta_refresh_sets_pending_navigation() {
                     const target = ((match[2] || '').trim()).replace(/^['"]|['"]$/g, '') || location.href;
                     setTimeout(() => {
                         const ns = (function(){
-                            const s = Object.getOwnPropertySymbols(globalThis);
+                            const s = Object.getOwnPropertySymbols(globalThis,1);
                             for (let i = 0; i < s.length; i++) {
                                 const v = globalThis[s[i]];
                                 if (v && v.__bo) return v;

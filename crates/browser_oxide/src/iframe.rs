@@ -31,7 +31,7 @@ const INSTALL_PARENT_BRIDGE: &str = r#"
     // The engine's symbol-keyed namespace, not `Deno.core.ops`: this runs after
     // cleanup_bootstrap has removed `Deno`, so the ops lookup would be null and
     // every postMessage from this frame would silently vanish.
-    var ns = (function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})();
+    var ns = (function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})();
     var frames = (ns && ns.frames) || null;
     var bridge = {
         postMessage: function (data, targetOrigin) {
@@ -125,7 +125,7 @@ impl ChildIframe {
 /// wrong coordinate space.
 const FRAME_GEOMETRY_JS: &str = r#"(function(){
   try {
-    var syms = Object.getOwnPropertySymbols(globalThis);
+    var syms = Object.getOwnPropertySymbols(globalThis,1);
     for (var i = 0; i < syms.length; i++) {
       var v = globalThis[syms[i]];
       if (v && v.__bo) { v.frame = { x: __X__, y: __Y__, w: __W__, h: __H__ }; return 'ок'; }
@@ -197,11 +197,15 @@ impl ChildIframe {
                         .and_then(|base| base.join(&src).ok())
                         .map(|url| url.to_string());
                     match full {
-                        Some(full) => {
-                            Box::pin(Self::from_url(info.node_id, &full, client, Some(profile)))
-                                .await
-                                .ok()
-                        }
+                        Some(full) => Box::pin(Self::from_url(
+                            info.node_id,
+                            &full,
+                            &base_url,
+                            client,
+                            Some(profile),
+                        ))
+                        .await
+                        .ok(),
                         None => None,
                     }
                 } else {
@@ -263,7 +267,7 @@ impl ChildIframe {
     }
 
     pub fn pump_descendant_messages(&mut self) -> (usize, usize) {
-        const NS: &str = "(function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()";
+        const NS: &str = "(function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()";
         let outbound: Vec<String> = self
             .event_loop
             .execute_script(&format!("JSON.stringify({NS}.frames.takeChildMessages())"))
@@ -378,9 +382,14 @@ impl ChildIframe {
     }
 
     /// Create a child iframe by fetching src URL via HTTP client.
+    ///
+    /// `parent_url` is the embedding document's URL; it decides the request's
+    /// `sec-fetch-site` and `Referer`, which a framed widget's server reads to
+    /// tell an embedded frame from a typed-in address.
     pub async fn from_url(
         node_id: NodeId,
         url: &str,
+        parent_url: &str,
         client: &crate::net::HttpClient,
         stealth_profile: Option<&crate::stealth::StealthProfile>,
     ) -> Result<Self, deno_core::error::AnyError> {
@@ -406,10 +415,14 @@ impl ChildIframe {
             }
         }
 
-        let resp = client
-            .get(url)
-            .await
-            .map_err(|e| deno_core::error::AnyError::msg(format!("iframe fetch error: {}", e)))?;
+        let resp = match stealth_profile {
+            Some(profile) => {
+                let hdrs = crate::net::headers::nav_headers_iframe(profile, url, parent_url);
+                client.get_with_exact_headers(url, &hdrs).await
+            }
+            None => client.get(url).await,
+        }
+        .map_err(|e| deno_core::error::AnyError::msg(format!("iframe fetch error: {}", e)))?;
 
         if !resp.ok() {
             return Err(deno_core::error::AnyError::msg(format!(
@@ -457,7 +470,14 @@ impl ChildIframe {
                     } else {
                         continue;
                     };
-                    if let Ok(resp) = client.get(&full_url).await {
+                    let hdrs = crate::net::headers::nav_headers_subresource(
+                        client.profile(),
+                        &full_url,
+                        url,
+                        "style",
+                        false,
+                    );
+                    if let Ok(resp) = client.get_with_exact_headers(&full_url, &hdrs).await {
                         if resp.ok() {
                             let text = resp.text();
                             if !text.trim_start().starts_with("<!") {
@@ -516,7 +536,14 @@ impl ChildIframe {
                 } else {
                     continue;
                 };
-                match client.get(&full_url).await {
+                let hdrs = crate::net::headers::nav_headers_subresource(
+                    client.profile(),
+                    &full_url,
+                    url,
+                    "script",
+                    false,
+                );
+                match client.get_with_exact_headers(&full_url, &hdrs).await {
                     Ok(resp) if resp.ok() => {
                         let text = resp.text();
                         if text.trim_start().starts_with("<!") {
@@ -560,13 +587,13 @@ impl ChildIframe {
         // Same spec order as the page path: `interactive` before
         // DOMContentLoaded, `complete` before `load`, both from a task so the
         // handlers run inside the event loop rather than during setup.
-        const NS: &str = "(function(){try{var s=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()";
+        const NS: &str = "(function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()";
         event_loop
             .execute_script(&format!(
                 "setTimeout(function(){{\
                    var b=(({NS}||{{}}).host||{{}}).bo;\
                    if(b)b.__documentReadyState='interactive';\
-                   (function(){{var ns=null;try{{var y=Object.getOwnPropertySymbols(globalThis);for(var i=0;i<y.length;i++){{var v=globalThis[y[i]];if(v&&v.__bo){{ns=v;break;}}}}}}catch(e){{}}try{{if(ns&&ns.images)ns.images.scan();}}catch(e){{}}}})();\
+                   (function(){{var ns=null;try{{var y=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<y.length;i++){{var v=globalThis[y[i]];if(v&&v.__bo){{ns=v;break;}}}}}}catch(e){{}}try{{if(ns&&ns.images)ns.images.scan();}}catch(e){{}}}})();\
                    document.dispatchEvent(new Event('DOMContentLoaded',{{bubbles:true}}));\
                    globalThis.dispatchEvent(new Event('DOMContentLoaded',{{bubbles:true}}));\
                    if(b)b.__documentReadyState='complete';\

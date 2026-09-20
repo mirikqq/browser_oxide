@@ -16,7 +16,7 @@
     // namespaces would mean two symbols on the global where Chrome has none.
     const _boNs = (function () {
         try {
-            const syms = Object.getOwnPropertySymbols(globalThis);
+            const syms = Object.getOwnPropertySymbols(globalThis, 1);
             for (let i = 0; i < syms.length; i++) {
                 const v = globalThis[syms[i]];
                 if (v && v.__bo) return v;
@@ -30,10 +30,30 @@
         } catch (_) { /* ignore */ }
         return ns;
     })();
+    const _idl = (_boNs && _boNs.idl) || {
+        own: (obj) => obj,
+        read: () => undefined,
+        fields: () => {},
+    };
 
     // `_ADOPT` separates the two callers: the page constructs a new node, while
     // `_wrapNodeWithType` adopts one that already exists in the arena.
     const _ADOPT = Symbol("adopt");
+
+    const _viewportW = () => (globalThis.innerWidth | 0) || 1440;
+    const _viewportH = () => (globalThis.innerHeight | 0) || 789;
+    const _templateContentFor = (el) => {
+        try {
+            if (!(el instanceof HTMLTemplateElement)) return null;
+            return el.content;
+        } catch (_e) { return null; }
+    };
+    const _isDocumentElement = (el) => {
+        try {
+            const doc = globalThis.document;
+            return !!doc && doc.documentElement === el;
+        } catch (_e) { return false; }
+    };
 
     const _nodeIds = new WeakMap();
     const _nodeCache = new Map();
@@ -143,45 +163,6 @@
         } finally {
             _onNodeInsertedDepth--;
         }
-    }
-
-    class DOMPointReadOnly {
-        constructor(x = 0, y = 0, z = 0, w = 1) {
-            this.x = x; this.y = y; this.z = z; this.w = w;
-        }
-        static fromPoint(p) { return new DOMPointReadOnly(p.x, p.y, p.z, p.w); }
-        toJSON() { return { x: this.x, y: this.y, z: this.z, w: this.w }; }
-    }
-    globalThis.DOMPointReadOnly = DOMPointReadOnly;
-
-    class DOMPoint extends DOMPointReadOnly {
-        constructor(x = 0, y = 0, z = 0, w = 1) { super(x, y, z, w); }
-    }
-    globalThis.DOMPoint = DOMPoint;
-
-    class DOMRectReadOnly {
-        constructor(x = 0, y = 0, width = 0, height = 0) {
-            this.x = x; this.y = y; this.width = width; this.height = height;
-        }
-        get top() { return this.y; }
-        get left() { return this.x; }
-        get right() { return this.x + this.width; }
-        get bottom() { return this.y + this.height; }
-        toJSON() { return { x: this.x, y: this.y, width: this.width, height: this.height, top: this.top, left: this.left, right: this.right, bottom: this.bottom }; }
-    }
-    globalThis.DOMRectReadOnly = DOMRectReadOnly;
-
-    class DOMRect extends DOMRectReadOnly {
-        constructor(x = 0, y = 0, width = 0, height = 0) { super(x, y, width, height); }
-        static fromRect(r) { return new DOMRect(r.x, r.y, r.width, r.height); }
-    }
-    globalThis.DOMRect = DOMRect;
-
-    if (typeof _maskFunction === 'function') {
-        _maskFunction(DOMPointReadOnly, 'DOMPointReadOnly');
-        _maskFunction(DOMPoint, 'DOMPoint');
-        _maskFunction(DOMRectReadOnly, 'DOMRectReadOnly');
-        _maskFunction(DOMRect, 'DOMRect');
     }
 
     // Scripts that came out of an HTML-parsing API — `innerHTML`, `outerHTML`,
@@ -329,7 +310,7 @@
     function _boState() {
         if (globalThis._browser_oxide) return globalThis._browser_oxide;
         try {
-            const syms = Object.getOwnPropertySymbols(globalThis);
+            const syms = Object.getOwnPropertySymbols(globalThis, 1);
             for (let i = 0; i < syms.length; i++) {
                 const v = globalThis[syms[i]];
                 if (v && v.__bo && v.host) return v.host.bo;
@@ -555,6 +536,24 @@
 
     class NodeList {
         constructor(data, isTyped = false) {
+            if (typeof data === 'function') {
+                // ponytail: re-query on access; cache by DOM revision if large live lists become hot.
+                const snapshot = () => new NodeList(data(), isTyped);
+                return new Proxy(Object.create(NodeList.prototype), {
+                    get(target, key, receiver) {
+                        if (key === 'length') return data().length / (isTyped ? 2 : 1);
+                        if (key === '_ids' || (typeof key === 'string' && /^(0|[1-9]\d*)$/.test(key))) {
+                            return snapshot()[key];
+                        }
+                        return Reflect.get(target, key, receiver);
+                    },
+                    has(target, key) { return key in target || key in snapshot(); },
+                    ownKeys(target) { return [...new Set([...Reflect.ownKeys(snapshot()), ...Reflect.ownKeys(target)])]; },
+                    getOwnPropertyDescriptor(target, key) {
+                        return Reflect.getOwnPropertyDescriptor(target, key) || Reflect.getOwnPropertyDescriptor(snapshot(), key);
+                    },
+                });
+            }
             if (isTyped) {
                 this._ids = [];
                 for (let i = 0; i < data.length; i += 2) {
@@ -571,11 +570,9 @@
             }
         }
         get length() { return this._ids.length; }
-        item(index) { return index < this._ids.length ? _wrapNode(this._ids[index]) : null; }
+        item(index) { return this[Number(index) >>> 0] ?? null; }
         forEach(cb, thisArg) {
-            for (let i = 0; i < this._ids.length; i++) {
-                cb.call(thisArg, this[i], i, this);
-            }
+            Array.prototype.forEach.call(this, cb, thisArg);
         }
         entries() {
             const self = this;
@@ -601,6 +598,16 @@
         }
     }
 
+    let _liveChildLists = new WeakMap();
+    function _childList(node, elementsOnly) {
+        let lists = _liveChildLists.get(node);
+        if (!lists) { lists = []; _liveChildLists.set(node, lists); }
+        const index = Number(elementsOnly);
+        return lists[index] ||= new NodeList(() => elementsOnly
+            ? ops.op_dom_get_child_elements_with_types(_getNodeId(node))
+            : ops.op_dom_get_children_with_types(_getNodeId(node)), true);
+    }
+
     class DOMTokenList {
         #nodeId;
         constructor(nodeId) { this.#nodeId = nodeId; }
@@ -615,6 +622,7 @@
             return attr ? attr.split(/\s+/).includes(cls) : false;
         }
         get value() { return ops.op_dom_get_attribute(this.#nodeId, "class") || ""; }
+        set value(v) { ops.op_dom_set_attribute(this.#nodeId, "class", String(v)); }
         get length() { return this.value.split(/\s+/).filter(Boolean).length; }
         toString() { return this.value; }
         item(index) {
@@ -733,7 +741,7 @@
             const p = this.parentNode;
             return p && p.nodeType === 1 ? p : null;
         }
-        get childNodes() { return new NodeList(ops.op_dom_get_children_with_types(_getNodeId(this)), true); }
+        get childNodes() { return _childList(this, false); }
         get firstChild() { return _wrapNode(ops.op_dom_get_first_child(_getNodeId(this))); }
         get lastChild() { return _wrapNode(ops.op_dom_get_last_child(_getNodeId(this))); }
         get nextSibling() { return _wrapNode(ops.op_dom_get_next_sibling(_getNodeId(this))); }
@@ -974,24 +982,27 @@
     // node-shaped value, Next.js pages died mid-hydration with
     // `e.removeAttributeNode is not a function` and rendered nothing at all.
     class Attr {
+        #name;
+        #owner;
+        #value;
         constructor(name, value, ownerElement) {
-            this._name = String(name);
-            this._value = value == null ? "" : String(value);
-            this._owner = ownerElement || null;
+            this.#name = String(name);
+            this.#value = value == null ? "" : String(value);
+            this.#owner = ownerElement || null;
         }
-        get name() { return this._name; }
-        get localName() { return this._name; }
-        get nodeName() { return this._name; }
-        get value() { return this._value; }
+        get name() { return this.#name; }
+        get localName() { return this.#name; }
+        get nodeName() { return this.#name; }
+        get value() { return this.#value; }
         set value(v) {
-            this._value = v == null ? "" : String(v);
-            if (this._owner) this._owner.setAttribute(this._name, this._value);
+            this.#value = v == null ? "" : String(v);
+            if (this.#owner) this.#owner.setAttribute(this.#name, this.#value);
         }
-        get nodeValue() { return this._value; }
+        get nodeValue() { return this.#value; }
         set nodeValue(v) { this.value = v; }
-        get textContent() { return this._value; }
+        get textContent() { return this.#value; }
         set textContent(v) { this.value = v; }
-        get ownerElement() { return this._owner; }
+        get ownerElement() { return this.#owner; }
         get specified() { return true; }
         get prefix() { return null; }
         get namespaceURI() { return null; }
@@ -1035,6 +1046,8 @@
     };
 
     class Element extends Node {
+        #shadowRoot;
+        #style;
         get tagName() { return ops.op_dom_get_tag_name(_getNodeId(this)).toUpperCase(); }
         get localName() { return ops.op_dom_get_tag_name(_getNodeId(this)); }
         get id() { return ops.op_dom_get_attribute(_getNodeId(this), "id") || ""; }
@@ -1078,14 +1091,47 @@
         get referrerPolicy() { return this.getAttribute("referrerpolicy") || ""; }
         set referrerPolicy(val) { this.setAttribute("referrerpolicy", String(val)); }
         get classList() { return new DOMTokenList(_getNodeId(this)); }
-        get innerHTML() { return ops.op_dom_get_inner_html(_getNodeId(this)); }
+        set classList(v) { this.setAttribute("class", String(v)); }
+        get innerHTML() {
+            // A <template>'s markup is its content fragment, not its children;
+            // Chrome keeps that in Element's getter, not a template override.
+            const frag = _templateContentFor(this);
+            if (frag) {
+                let out = "";
+                for (let c = frag.firstChild; c; c = c.nextSibling) {
+                    out += c.nodeType === 1 ? c.outerHTML : (c.textContent || "");
+                }
+                return out;
+            }
+            return ops.op_dom_get_inner_html(_getNodeId(this));
+        }
         set innerHTML(val) {
+            const frag = _templateContentFor(this);
+            if (frag) {
+                while (frag.firstChild) frag.removeChild(frag.firstChild);
+                const holder = _document.createElement("div");
+                holder.innerHTML = String(val);
+                while (holder.firstChild) frag.appendChild(holder.firstChild);
+                return;
+            }
             ops.op_dom_set_inner_html(_getNodeId(this), String(val));
             _markScriptsAlreadyStarted(this);
         }
         get outerHTML() { return ops.op_dom_get_outer_html(_getNodeId(this)); }
+        set outerHTML(val) {
+            const parent = this.parentNode;
+            if (!parent) {
+                throw new DOMException(
+                    "This element has no parent node.", "NoModificationAllowedError");
+            }
+            const holder = _document.createElement("div");
+            holder.innerHTML = String(val);
+            const next = this.nextSibling;
+            parent.removeChild(this);
+            while (holder.firstChild) parent.insertBefore(holder.firstChild, next);
+        }
         get children() {
-            return new NodeList(ops.op_dom_get_child_elements_with_types(_getNodeId(this)), true);
+            return _childList(this, true);
         }
         get firstElementChild() {
             const els = ops.op_dom_get_child_elements(_getNodeId(this));
@@ -1153,11 +1199,30 @@
             return null;
         }
         getElementsByTagName(tag) {
-            return new NodeList(ops.op_dom_get_elements_by_tag_name(_getNodeId(this), tag));
+            tag = String(tag);
+            return new NodeList(() => ops.op_dom_get_elements_by_tag_name(_getNodeId(this), tag));
         }
         getElementsByClassName(cls) {
-            return new NodeList(ops.op_dom_get_elements_by_class_name(_getNodeId(this), cls));
+            cls = String(cls);
+            return new NodeList(() => ops.op_dom_get_elements_by_class_name(_getNodeId(this), cls));
         }
+        // The namespaced forms. This engine keeps one flat attribute map, as
+        // an HTML document does — every element in an HTML document is in the
+        // HTML namespace and SVG content reached through `createElementNS`
+        // carries its qualified names verbatim — so each of these delegates to
+        // the plain form rather than returning undefined.
+        getAttributeNS(_ns, name) { return this.getAttribute(name); }
+        setAttributeNS(_ns, name, value) { return this.setAttribute(name, value); }
+        removeAttributeNS(_ns, name) { return this.removeAttribute(name); }
+        hasAttributeNS(_ns, name) { return this.hasAttribute(name); }
+        getElementsByTagNameNS(_ns, tag) { return this.getElementsByTagName(tag); }
+        getAttributeNames() {
+            const attrs = this.attributes;
+            const out = [];
+            for (let i = 0; i < attrs.length; i++) out.push(attrs[i].name);
+            return out;
+        }
+        hasAttributes() { return this.attributes.length > 0; }
         // Layout APIs (wired to taffy via layout_ext ops)
         getBoundingClientRect() {
             const r = ops.op_layout_get_bounding_rect(_getNodeId(this));
@@ -1168,8 +1233,12 @@
         get offsetHeight() { return ops.op_layout_get_offset_height(_getNodeId(this)); }
         get offsetTop() { return ops.op_layout_get_offset_top(_getNodeId(this)); }
         get offsetLeft() { return ops.op_layout_get_offset_left(_getNodeId(this)); }
-        get clientWidth() { return this.offsetWidth; }
-        get clientHeight() { return this.offsetHeight; }
+        get clientWidth() {
+            return _isDocumentElement(this) ? _viewportW() : this.offsetWidth;
+        }
+        get clientHeight() {
+            return _isDocumentElement(this) ? _viewportH() : this.offsetHeight;
+        }
         get scrollWidth() { return this.offsetWidth; }
         get scrollHeight() { return this.offsetHeight; }
         get scrollTop() {
@@ -1486,9 +1555,10 @@
         }
         // element.style — CSSStyleDeclaration proxy
         get style() {
-            if (!this._style) this._style = _createStyleProxy(_getNodeId(this));
-            return this._style;
+            if (!this.#style) this.#style = _createStyleProxy(_getNodeId(this));
+            return this.#style;
         }
+        set style(v) { this.style.cssText = String(v); }
         // Interaction stubs
         click() {
             const ev = new Event("click", { bubbles: true, cancelable: true });
@@ -1551,10 +1621,10 @@
                     set(html) { ops.op_dom_set_inner_html(shadowId, html); },
                 },
             });
-            if (mode === "open") this._shadowRoot = shadowRoot;
+            if (mode === "open") this.#shadowRoot = shadowRoot;
             return shadowRoot;
         }
-        get shadowRoot() { return this._shadowRoot || null; }
+        get shadowRoot() { return this.#shadowRoot || null; }
     }
 
     // Full DOM prototype chain:
@@ -1641,6 +1711,12 @@
             .join("")
             .replace(/[ \t]*\n[ \t]*/g, "\n")
             .replace(/^\s+|\s+$/g, "");
+    }
+
+    class SVGElement extends Element {
+        constructor() {
+            throw new TypeError("Failed to construct 'SVGElement': Illegal constructor");
+        }
     }
 
     class HTMLElement extends Element {
@@ -1748,6 +1824,7 @@
             if (attr) return parseInt(attr, 10);
             return _imgStateOf(this).w;
         },
+        set(v) { this.setAttribute("width", String(v >>> 0)); },
         enumerable: true, configurable: true
     });
     Object.defineProperty(HTMLImageElement.prototype, "height", {
@@ -1756,6 +1833,7 @@
             if (attr) return parseInt(attr, 10);
             return _imgStateOf(this).h;
         },
+        set(v) { this.setAttribute("height", String(v >>> 0)); },
         enumerable: true, configurable: true
     });
     // ── Image loading ────────────────────────────────────────────────────
@@ -1783,10 +1861,12 @@
     // `drawImage(img, …)` needs the decoded pixels, which live in the canvas
     // state under this id. Exposed on the prototype rather than as an own
     // property so `Object.getOwnPropertyNames(img)` keeps Chrome's shape.
-    Object.defineProperty(HTMLImageElement.prototype, '_decodedImageId', {
-        get() { return _imgStateOf(this).id; },
-        enumerable: false, configurable: true,
-    });
+    if (_boNs) {
+        _boNs.decodedImageId = (el) => {
+            if (!(el instanceof HTMLImageElement)) return -1;
+            return _imgStateOf(el).id;
+        };
+    }
 
     const _startImgLoad = (el, rawSrc) => {
         const st = _imgStateOf(el);
@@ -1822,7 +1902,7 @@
             return;
         }
         try {
-            ops.op_img_load(url).then((r) => {
+            ops.op_img_load(url, (globalThis.location && globalThis.location.href) || '').then((r) => {
                 const ok = !!(r && r.ok);
                 const rec = {
                     ok, w: (r && r.width) | 0, h: (r && r.height) | 0,
@@ -2178,7 +2258,7 @@
         enumerable: true, configurable: true
     });
     HTMLCanvasElement.prototype.toDataURL = function(type, quality) {
-        if (!this._canvasId) {
+        if (!_idl.own(this)._canvasId) {
             let osName = "Linux", canvasSeed = 0n;
             try {
                 if (ops.op_has_stealth_profile && ops.op_has_stealth_profile()) {
@@ -2186,9 +2266,9 @@
                     canvasSeed = BigInt(ops.op_get_profile_value("canvas_seed") || "0");
                 }
             } catch (_e) { /* fall back to defaults */ }
-            this._canvasId = ops.op_canvas_create(this.width, this.height, osName, canvasSeed);
+            _idl.own(this)._canvasId = ops.op_canvas_create(this.width, this.height, osName, canvasSeed);
         }
-        return ops.op_canvas_to_data_url(this._canvasId);
+        return ops.op_canvas_to_data_url(_idl.own(this)._canvasId);
     };
     class HTMLScriptElement extends HTMLElement {}
     class HTMLStyleElement extends HTMLElement {}
@@ -2210,6 +2290,27 @@
         enumerable: true, configurable: true,
     });
     class HTMLLinkElement extends HTMLElement {}
+    // `href` is a URL-valued reflected attribute here too — per spec
+    // `<link>` does NOT implement HTMLHyperlinkElementUtils (no
+    // `.origin`/`.protocol`/`.pathname`/etc, unlike `<a>`/`<area>` above),
+    // but `.href` itself still resolves to an absolute URL, not the raw
+    // attribute. Left as the raw attribute string, every stylesheet
+    // `<link>`'s `.href` disagreed with the absolute URL the engine
+    // actually fetched it from — a resource a page's own script sees at
+    // one URL while the network layer fetched it from another is exactly
+    // the kind of self-inconsistency a fingerprint probe cross-checks
+    // (and it duplicated `performance.getEntriesByType('resource')`
+    // entries: the DOM scan's relative name next to the real fetch's
+    // absolute one for what is the same stylesheet).
+    Object.defineProperty(HTMLLinkElement.prototype, 'href', {
+        get() {
+            const u = _hyperlinkURL(this);
+            return u ? u.href : (this.getAttribute('href') || '');
+        },
+        set(v) { this.setAttribute('href', String(v)); },
+        enumerable: true,
+        configurable: true,
+    });
     class HTMLMetaElement extends HTMLElement {}
     class HTMLTableElement extends HTMLElement {}
     class HTMLIFrameElement extends HTMLElement {}
@@ -2280,21 +2381,6 @@
                 while (this.firstChild) frag.appendChild(this.firstChild);
             }
             return frag;
-        }
-        get innerHTML() {
-            const frag = this.content;
-            let out = "";
-            for (let c = frag.firstChild; c; c = c.nextSibling) {
-                out += c.nodeType === 1 ? c.outerHTML : (c.textContent || "");
-            }
-            return out;
-        }
-        set innerHTML(html) {
-            const frag = this.content;
-            while (frag.firstChild) frag.removeChild(frag.firstChild);
-            const holder = _document.createElement("div");
-            holder.innerHTML = String(html);
-            while (holder.firstChild) frag.appendChild(holder.firstChild);
         }
     }
     class HTMLPreElement extends HTMLElement {}
@@ -2390,7 +2476,18 @@
         const mine = el || null;
         _setCurrentScript(mine);
         try {
-            (0, eval)(code);
+            // Compiled under the script's own URL rather than `(0, eval)`, which
+            // V8 attributes to `eval (<anonymous>:…)`. Talon puts a raw
+            // `new Error().stack` in the payload it sends, so an anonymous frame
+            // where a real Chrome names the file is directly visible to it.
+            // Inline dynamic scripts carry the document URL, as they do in Chrome.
+            const _src = (mine && mine.src) || '';
+            const _name = _src || (typeof location !== 'undefined' ? location.href : '');
+            if (_name && ops.op_run_classic_script) {
+                ops.op_run_classic_script(code, _name);
+            } else {
+                (0, eval)(code);
+            }
         } finally {
             // Restored synchronously: HTML performs the microtask checkpoint
             // only when the JS stack is empty, and a script inserted from
@@ -2409,10 +2506,27 @@
         "polyline", "text", "tspan", "use", "image", "symbol", "foreignobject",
     ]);
 
+    const _SVG_IFACE = {
+        svg: "SVGSVGElement", g: "SVGGElement", rect: "SVGRectElement",
+        circle: "SVGCircleElement", ellipse: "SVGEllipseElement", line: "SVGLineElement",
+        path: "SVGPathElement", polygon: "SVGPolygonElement", polyline: "SVGPolylineElement",
+        text: "SVGTextElement", tspan: "SVGTSpanElement", use: "SVGUseElement",
+        image: "SVGImageElement", symbol: "SVGSymbolElement",
+        foreignobject: "SVGForeignObjectElement",
+    };
+    const _svgProtoFor = (tag) => {
+        const c = globalThis[_SVG_IFACE[tag]];
+        return (c && c.prototype && SVGElement.prototype.isPrototypeOf(c.prototype))
+            ? c.prototype
+            : SVGElement.prototype;
+    };
+
     function _retargetElementProto(el) {
         try {
             const tag = ops.op_dom_get_tag_name(_getNodeId(el)).toLowerCase();
-            const proto = _tagToProto[tag] || HTMLElement.prototype;
+            const proto = _SVG_TAGS.has(tag)
+                ? _svgProtoFor(tag)
+                : (_tagToProto[tag] || HTMLElement.prototype);
             Object.setPrototypeOf(el, proto);
             if (_SVG_TAGS.has(tag)) _installSvgGeometry(el, tag);
         } catch {}
@@ -2468,18 +2582,19 @@
     function _setCurrentScript(el) { _currentScript = el; }
 
     class HTMLAllCollection {
+        #doc;
         constructor(doc) {
-            this._doc = doc;
+            this.#doc = doc;
         }
-        get length() { return this._doc.querySelectorAll("*").length; }
-        item(i) { return this._doc.querySelectorAll("*")[i] || null; }
+        get length() { return this.#doc.querySelectorAll("*").length; }
+        item(i) { return this.#doc.querySelectorAll("*")[i] || null; }
         namedItem(n) {
-            return this._doc.getElementById(n) || 
-                   this._doc.querySelector(`[name="${CSS.escape(n)}"]`) || 
+            return this.#doc.getElementById(n) || 
+                   this.#doc.querySelector(`[name="${CSS.escape(n)}"]`) || 
                    null;
         }
         [Symbol.iterator]() {
-            const nodes = this._doc.querySelectorAll("*");
+            const nodes = this.#doc.querySelectorAll("*");
             let i = 0;
             return {
                 next() {
@@ -2503,14 +2618,12 @@
             // Capture initial base URL from ops or a global hint
             globalThis.__browser_oxide._baseUrl = ops.op_dom_get_base_url && ops.op_dom_get_base_url();
 
-            const all = new HTMLAllCollection(this);
-            // Hide 'all' from enumeration but keep it truthy
-            Object.defineProperty(this, 'all', {
-                get() { return all; },
-                enumerable: false,
-                configurable: true
-            });
+            _idl.own(this).all = new HTMLAllCollection(this);
         }
+        // Chrome keeps `all` on Document.prototype (non-enumerable getter); it
+        // used to be defined per instance here, which is an own property no
+        // real document carries.
+        get all() { return _idl.read(this, "all", undefined); }
         get scripts() { return this.getElementsByTagName("script"); }
         get currentScript() { return _currentScript; }
         get visibilityState() { return "visible"; }
@@ -2518,6 +2631,7 @@
         get webkitVisibilityState() { return "visible"; }
         get webkitHidden() { return false; }
         get fullscreenEnabled() { return true; }
+        set fullscreenEnabled(_v) {}
         get webkitFullscreenEnabled() { return true; }
         get webkitIsFullScreen() { return false; }
 
@@ -2527,6 +2641,19 @@
         }
         get head() { return this.querySelector("head"); }
         get body() { return this.querySelector("body"); }
+        set body(val) {
+            const current = this.querySelector("body");
+            if (!val || val.nodeType !== 1
+                || (val.tagName !== "BODY" && val.tagName !== "FRAMESET")) {
+                throw new DOMException(
+                    "Failed to set the 'body' property on 'Document': The new body element is of type '"
+                    + (val && val.tagName ? val.tagName : String(val))
+                    + "'. It must be either a 'BODY' or 'FRAMESET' element.",
+                    "HierarchyRequestError");
+            }
+            if (current) current.parentNode.replaceChild(val, current);
+            else this.documentElement.appendChild(val);
+        }
         get title() {
             const el = this.querySelector("title");
             return el ? el.textContent : "";
@@ -2540,10 +2667,12 @@
             return nodeId !== null ? _wrapNode(nodeId) : null;
         }
         getElementsByTagName(tag) {
-            return new NodeList(ops.op_dom_get_elements_by_tag_name(ops.op_dom_document_node(), tag));
+            tag = String(tag);
+            return new NodeList(() => ops.op_dom_get_elements_by_tag_name(ops.op_dom_document_node(), tag));
         }
         getElementsByClassName(cls) {
-            return new NodeList(ops.op_dom_get_elements_by_class_name(ops.op_dom_document_node(), cls));
+            cls = String(cls);
+            return new NodeList(() => ops.op_dom_get_elements_by_class_name(ops.op_dom_document_node(), cls));
         }
         // React reads `document.getElementsByName` while restoring form state
         // during hydration; without it every Next.js page died with
@@ -2552,7 +2681,7 @@
         getElementsByName(name) {
             const sel = `[name="${String(name).replace(/(["\\])/g, "\\$1")}"]`;
             return new NodeList(
-                ops.op_dom_query_selector_all(ops.op_dom_document_node(), sel),
+                () => ops.op_dom_query_selector_all(ops.op_dom_document_node(), sel),
             );
         }
         querySelector(sel) {
@@ -2721,7 +2850,7 @@
         // point still approximates the topmost element with body (falling back
         // to documentElement) — but the viewport-bounds null result, which is
         // the detectable behaviour, is now spec-correct.
-        _pointInViewport(x, y) {
+        #pointInViewport(x, y) {
             x = +x; y = +y;
             const w = globalThis.innerWidth || 0;
             const h = globalThis.innerHeight || 0;
@@ -2735,8 +2864,8 @@
         /// click, an overlay checking whether it is covered, a widget routing a
         /// gesture — got the same wrong answer every time. Layout gives real
         /// boxes now, so the question can be answered from them.
-        _hitStack(x, y) {
-            if (!this._pointInViewport(x, y)) return [];
+        #hitStack(x, y) {
+            if (!this.#pointInViewport(x, y)) return [];
             x = +x; y = +y;
             const hits = [];
             let all;
@@ -2775,13 +2904,13 @@
             return hits.map((h) => h.el);
         }
         elementFromPoint(x, y) {
-            if (!this._pointInViewport(x, y)) return null;
-            const stack = this._hitStack(x, y);
+            if (!this.#pointInViewport(x, y)) return null;
+            const stack = this.#hitStack(x, y);
             return stack.length ? stack[0] : (this.body || this.documentElement || null);
         }
         elementsFromPoint(x, y) {
-            if (!this._pointInViewport(x, y)) return [];
-            const stack = this._hitStack(x, y);
+            if (!this.#pointInViewport(x, y)) return [];
+            const stack = this.#hitStack(x, y);
             if (stack.length) return stack;
             return this.body ? [this.body] : [];
         }
@@ -2793,8 +2922,7 @@
         get URL() { return globalThis.location?.href || "about:blank"; }
         get documentURI() { return this.URL; }
         get domain() { return globalThis.location?.hostname || ""; }
-        get location() { return globalThis.location; }
-        set location(val) { if (globalThis.location) globalThis.location.href = val; }
+        set domain(_v) {}
         get referrer() { return ""; }
         get hidden() { return false; }
         get visibilityState() { return "visible"; }
@@ -2849,7 +2977,14 @@
         get characterSet() { return "windows-1252"; }
         get charset() { return "windows-1252"; }
         get contentType() { return "text/html"; }
-        get compatMode() { return "CSS1Compat"; }
+        get compatMode() {
+            // "BackCompat" whenever the document was parsed without a doctype.
+            try {
+                return ops.op_dom_is_quirks_mode() ? "BackCompat" : "CSS1Compat";
+            } catch (_e) {
+                return "CSS1Compat";
+            }
+        }
         // document.implementation — the DOMImplementation API. fpCollect and
         // several bot tests call createHTMLDocument() to verify the surface.
         get implementation() {
@@ -2909,6 +3044,7 @@
             return sheets;
         }
         get fullscreenElement() { return null; }
+        set fullscreenElement(_v) {}
         get pointerLockElement() { return null; }
         exitFullscreen() { return Promise.resolve(); }
         exitPointerLock() {}
@@ -2916,27 +3052,33 @@
 
     // --- CSSOM ---
     class CSSStyleSheet {
+        #index;
+        #owner;
+        #disabled = false;
+        #mediaText = "";
         // Two flavours: index-based (document.styleSheets) and owner-based
         // (styleElement.sheet). Only the owner-based one can be mutated, because the
         // rule text lives in that element — see the `sheet` getter above.
         constructor(indexOrOwner) {
             if (indexOrOwner && typeof indexOrOwner === "object") {
-                this._owner = indexOrOwner;
-                this._index = -1;
+                this.#owner = indexOrOwner;
+                this.#index = -1;
             } else {
-                this._owner = null;
-                this._index = indexOrOwner;
+                this.#owner = null;
+                this.#index = indexOrOwner;
             }
         }
         get type() { return "text/css"; }
-        get disabled() { return false; }
-        get ownerNode() { return this._owner; }
+        get disabled() { return this.#disabled; }
+        set disabled(v) { this.#disabled = !!v; }
+        get ownerNode() { return this.#owner; }
         get parentStyleSheet() { return null; }
         get title() { return null; }
-        get media() { return { length: 0, mediaText: "" }; }
+        get media() { return { length: 0, mediaText: this.#mediaText }; }
+        set media(v) { this.#mediaText = String(v); }
         /// Rule texts of an owner-backed sheet, split on top-level `}`.
-        _ownerRuleTexts() {
-            const text = (this._owner && this._owner.textContent) || "";
+        #ownerRuleTexts() {
+            const text = (this.#owner && this.#owner.textContent) || "";
             const out = [];
             let depth = 0, start = 0;
             for (let i = 0; i < text.length; i++) {
@@ -2953,14 +3095,14 @@
             return out;
         }
         get cssRules() {
-            if (this._owner) {
-                return this._ownerRuleTexts().map((t) => new CSSStyleRule({
+            if (this.#owner) {
+                return this.#ownerRuleTexts().map((t) => new CSSStyleRule({
                     selector_text: t.slice(0, t.indexOf("{")).trim(),
                     css_text: t,
                     rule_type: t.startsWith("@") ? 4 : 1,
                 }));
             }
-            const raw = ops.op_dom_get_stylesheet_rules(this._index);
+            const raw = ops.op_dom_get_stylesheet_rules(this.#index);
             return raw.map(r => new CSSStyleRule(r));
         }
         get rules() { return this.cssRules; }
@@ -2969,8 +3111,8 @@
         // are written back into the owner <style> element's text, which is the same
         // source the Rust cascade re-reads.
         insertRule(rule, index) {
-            if (!this._owner) return 0;
-            const texts = this._ownerRuleTexts();
+            if (!this.#owner) return 0;
+            const texts = this.#ownerRuleTexts();
             const at = index === undefined ? texts.length : Number(index);
             if (at < 0 || at > texts.length) {
                 throw new DOMException(
@@ -2978,12 +3120,12 @@
                     "IndexSizeError");
             }
             texts.splice(at, 0, String(rule));
-            this._owner.textContent = texts.join("\n");
+            this.#owner.textContent = texts.join("\n");
             return at;
         }
         deleteRule(index) {
-            if (!this._owner) return;
-            const texts = this._ownerRuleTexts();
+            if (!this.#owner) return;
+            const texts = this.#ownerRuleTexts();
             const at = Number(index);
             if (at < 0 || at >= texts.length) {
                 throw new DOMException(
@@ -2991,9 +3133,9 @@
                     "IndexSizeError");
             }
             texts.splice(at, 1);
-            this._owner.textContent = texts.join("\n");
+            this.#owner.textContent = texts.join("\n");
         }
-        replaceSync(text) { if (this._owner) this._owner.textContent = String(text); }
+        replaceSync(text) { if (this.#owner) this.#owner.textContent = String(text); }
         replace(text) { this.replaceSync(text); return Promise.resolve(this); }
     }
     globalThis.CSSStyleSheet = CSSStyleSheet;
@@ -3025,22 +3167,28 @@
 
     // --- Range (minimal) ---
     class Range {
+        #selected;
         constructor() {
-            this.startContainer = null; this.startOffset = 0;
-            this.endContainer = null; this.endOffset = 0;
-            this.collapsed = true; this.commonAncestorContainer = null;
+            const _st = _idl.own(this);
+            _st.startContainer = null; _st.startOffset = 0;
+            _st.endContainer = null; _st.endOffset = 0;
+            _st.collapsed = true; _st.commonAncestorContainer = null;
         }
-        setStart(node, offset) { this.startContainer = node; this.startOffset = offset; this.collapsed = false; }
-        setEnd(node, offset) { this.endContainer = node; this.endOffset = offset; }
-        collapse(toStart) { this.collapsed = true; }
+        setStart(node, offset) {
+            const _st = _idl.own(this); _st.startContainer = node; _st.startOffset = offset; _st.collapsed = false; }
+        setEnd(node, offset) {
+            const _st = _idl.own(this); _st.endContainer = node; _st.endOffset = offset; }
+        collapse(toStart) {
+            const _st = _idl.own(this); _st.collapsed = true; }
         cloneRange() {
             const copy = new Range();
-            copy.startContainer = this.startContainer;
-            copy.startOffset = this.startOffset;
-            copy.endContainer = this.endContainer;
-            copy.endOffset = this.endOffset;
-            copy.collapsed = this.collapsed;
-            copy._selected = this._selected;
+            const _copySt = _idl.own(copy);
+            _copySt.startContainer = this.startContainer;
+            _copySt.startOffset = this.startOffset;
+            _copySt.endContainer = this.endContainer;
+            _copySt.endOffset = this.endOffset;
+            _copySt.collapsed = this.collapsed;
+            copy.#selected = this.#selected;
             return copy;
         }
         // Selecting a node is how the geometry of a range is normally set up —
@@ -3049,25 +3197,27 @@
         // whole idiom threw. With it, the rects come from the selected node,
         // which is what a browser reports for a range that spans exactly one.
         selectNode(node) {
-            this._selected = node;
-            this.startContainer = node && node.parentNode;
-            this.endContainer = this.startContainer;
-            this.commonAncestorContainer = this.startContainer;
-            this.collapsed = false;
+            const _st = _idl.own(this);
+            this.#selected = node;
+            _st.startContainer = node && node.parentNode;
+            _st.endContainer = this.startContainer;
+            _st.commonAncestorContainer = this.startContainer;
+            _st.collapsed = false;
         }
         selectNodeContents(node) {
-            this._selected = node;
-            this.startContainer = node;
-            this.endContainer = node;
-            this.commonAncestorContainer = node;
-            this.collapsed = false;
+            const _st = _idl.own(this);
+            this.#selected = node;
+            _st.startContainer = node;
+            _st.endContainer = node;
+            _st.commonAncestorContainer = node;
+            _st.collapsed = false;
         }
         getBoundingClientRect() {
-            const n = this._selected;
+            const n = this.#selected;
             return n && n.getBoundingClientRect ? n.getBoundingClientRect() : new DOMRect();
         }
         getClientRects() {
-            const n = this._selected;
+            const n = this.#selected;
             return n && n.getClientRects ? n.getClientRects() : [];
         }
         createContextualFragment(html) {
@@ -3079,6 +3229,7 @@
         }
         toString() { return ""; }
     }
+    _idl.fields(Range.prototype, ["commonAncestorContainer"]);
 
     // --- Selection (minimal) ---
     class Selection {
@@ -3098,7 +3249,30 @@
     const _selection = new Selection();
 
     // Create the global document
+    class HTMLDocument extends Document {
+        constructor() {
+            throw new TypeError("Failed to construct 'HTMLDocument': Illegal constructor");
+        }
+    }
     const _document = new Document(ops.op_dom_document_node());
+    // [LegacyUnforgeable]: `location` is an own, non-configurable accessor of the
+    // document in Chrome, not a member of Document.prototype.
+    {
+        const get = Object.getOwnPropertyDescriptor({
+            get location() { return globalThis.location; },
+        }, 'location').get;
+        const set = Object.getOwnPropertyDescriptor({
+            set location(val) { if (globalThis.location) globalThis.location.href = val; },
+        }, 'location').set;
+        if (_maskRuntime) {
+            _maskRuntime(get, 'get location');
+            _maskRuntime(set, 'set location');
+        }
+        Object.defineProperty(_document, 'location', {
+            get, set, enumerable: true, configurable: false,
+        });
+    }
+    Object.setPrototypeOf(_document, HTMLDocument.prototype);
     _nodeCache.set(ops.op_dom_document_node(), new WeakRef(_document));
 
     // Set globals
@@ -3155,8 +3329,9 @@
     _tag(Text, "Text");
     _tag(Comment, "Comment");
     _tag(DocumentFragment, "DocumentFragment");
-    // Chrome exposes document as HTMLDocument (which extends Document).
-    _tag(Document, "HTMLDocument");
+    _tag(Document, "Document");
+    _tag(HTMLDocument, "HTMLDocument");
+    _tag(SVGElement, "SVGElement");
     _tag(NodeList, "NodeList");
     _tag(DOMTokenList, "DOMTokenList");
 
@@ -3166,18 +3341,12 @@
     // (e.g. 1914 × 28638 on some sites) which differs from real Chrome.
     // Real Chrome returns innerWidth × innerHeight (1440 × 789 on a typical
     // macOS 1440x900 viewport).
-    {
-        const _viewportW = () => (globalThis.innerWidth | 0) || 1440;
-        const _viewportH = () => (globalThis.innerHeight | 0) || 789;
-        Object.defineProperty(HTMLHtmlElement.prototype, 'clientWidth',  { get() { return _viewportW(); }, configurable: true });
-        Object.defineProperty(HTMLHtmlElement.prototype, 'clientHeight', { get() { return _viewportH(); }, configurable: true });
-        // documentElement.scrollWidth/Height are still full content size,
-        // so leave the inherited offset-based getters in place for those.
-    }
+    // documentElement.scrollWidth/Height are still full content size,
+    // so the inherited offset-based getters stay in place for those.
 
     globalThis.document = _document;
     globalThis.Document = Document;
-    globalThis.HTMLDocument = Document;
+    globalThis.HTMLDocument = HTMLDocument;
     globalThis.Node = Node;
     globalThis.Element = Element;
     globalThis.Attr = Attr;
@@ -3403,34 +3572,35 @@
     // Constraint validation. Input masking and multi-step sign-in forms — the
     // Epic login among them — gate on `checkValidity()` before advancing.
     class ValidityState {
-        constructor(el) { this._el = el; }
+        #el;
+        constructor(el) { this.#el = el; }
         get valueMissing() {
-            return !!this._el.required && String(this._el.value || '') === '';
+            return !!this.#el.required && String(this.#el.value || '') === '';
         }
         get tooLong() {
-            const m = this._el.maxLength;
-            return m >= 0 && String(this._el.value || '').length > m;
+            const m = this.#el.maxLength;
+            return m >= 0 && String(this.#el.value || '').length > m;
         }
         get tooShort() {
-            const m = this._el.minLength;
-            const v = String(this._el.value || '');
+            const m = this.#el.minLength;
+            const v = String(this.#el.value || '');
             return m >= 0 && v.length > 0 && v.length < m;
         }
         get typeMismatch() {
-            const t = String(this._el.type || '').toLowerCase();
-            const v = String(this._el.value || '');
+            const t = String(this.#el.type || '').toLowerCase();
+            const v = String(this.#el.value || '');
             if (!v) return false;
             if (t === 'email') return !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
             if (t === 'url') { try { new URL(v); return false; } catch (_) { return true; } }
             return false;
         }
         get patternMismatch() {
-            const p = this._el.pattern;
-            const v = String(this._el.value || '');
+            const p = this.#el.pattern;
+            const v = String(this.#el.value || '');
             if (!p || !v) return false;
             try { return !new RegExp(`^(?:${p})$`).test(v); } catch (_) { return false; }
         }
-        get customError() { return !!this._el._customValidity; }
+        get customError() { return !!this.#el._customValidity; }
         get badInput() { return false; }
         get rangeOverflow() { return false; }
         get rangeUnderflow() { return false; }
@@ -3671,15 +3841,13 @@
     globalThis.HTMLTemplateElement = HTMLTemplateElement;
     globalThis.HTMLPreElement = HTMLPreElement;
     globalThis.HTMLQuoteElement = HTMLQuoteElement;
-    globalThis.SVGElement = Element;
+    globalThis.SVGElement = SVGElement;
     globalThis.Text = Text;
     globalThis.Comment = Comment;
     globalThis.DocumentFragment = DocumentFragment;
     globalThis.Document = Document;
     globalThis.NodeList = NodeList;
     globalThis.DOMTokenList = DOMTokenList;
-    globalThis.DOMRect = DOMRect;
-    globalThis.DOMRectReadOnly = DOMRect;
     globalThis.Range = Range;
     globalThis.Selection = Selection;
     globalThis.getSelection = function() { return _selection; };
@@ -3716,51 +3884,73 @@
 
     class MutationRecord {
         constructor(type, target) {
-            this.type = type;
-            this.target = target;
-            this.addedNodes = [];
-            this.removedNodes = [];
-            this.attributeName = null;
-            this.oldValue = null;
-            this.previousSibling = null;
-            this.nextSibling = null;
+            const _st = _idl.own(this);
+            _st.type = type;
+            _st.target = target;
+            _st.addedNodes = [];
+            _st.removedNodes = [];
+            _st.attributeName = null;
+            _st.oldValue = null;
+            _st.previousSibling = null;
+            _st.nextSibling = null;
         }
     }
+    _idl.fields(MutationRecord.prototype, ["addedNodes", "attributeName", "nextSibling", "oldValue", "previousSibling", "removedNodes", "target", "type"]);
 
+    let _MutationObserver_get_active, _MutationObserver_get_targets, _MutationObserver_call_notify;
     class MutationObserver {
+        static {
+            _MutationObserver_get_active = (o) => o.#active;
+            _MutationObserver_get_targets = (o) => o.#targets;
+            _MutationObserver_call_notify = (o, ...a) => o.#notify(...a);
+        }
+        #active;
+        #callback;
+        #records;
+        #targets;
         constructor(callback) {
-            this._callback = callback;
-            this._records = [];
-            this._active = false;
-            this._targets = new Map(); // nodeId → options
+            this.#callback = callback;
+            this.#records = [];
+            this.#active = false;
+            this.#targets = new Map(); // nodeId → options
         }
         observe(target, options = {}) {
             const nodeId = _getNodeId(target);
-            this._targets.set(nodeId, { target, options });
-            this._active = true;
-            _moObservers.push(this);
+            options = { ...options };
+            if (options.attributes === undefined &&
+                ('attributeOldValue' in options || 'attributeFilter' in options)) options.attributes = true;
+            if (options.characterData === undefined && 'characterDataOldValue' in options) options.characterData = true;
+            if (!(options.childList || options.attributes || options.characterData) ||
+                (!options.attributes && (options.attributeOldValue || options.attributeFilter)) ||
+                (!options.characterData && options.characterDataOldValue)) {
+                throw new TypeError('Invalid MutationObserver options');
+            }
+            this.#targets.set(nodeId, { target, options });
+            if (!this.#active) _moObservers.push(this);
+            this.#active = true;
         }
         disconnect() {
-            this._active = false;
-            this._targets.clear();
+            this.#active = false;
+            this.#targets.clear();
+            this.#records = [];
             const idx = _moObservers.indexOf(this);
             if (idx !== -1) _moObservers.splice(idx, 1);
         }
         takeRecords() {
-            const r = this._records.slice();
-            this._records = [];
+            const r = this.#records.slice();
+            this.#records = [];
             return r;
         }
-        _notify(record) {
-            if (!this._active) return;
-            this._records.push(record);
+        #notify(record) {
+            if (!this.#active) return;
+            this.#records.push(record);
             // Schedule microtask to deliver
-            if (this._records.length === 1) {
+            if (this.#records.length === 1) {
                 Promise.resolve().then(() => {
-                    if (!this._active) return;
-                    const batch = this._records.slice();
-                    this._records = [];
-                    if (batch.length > 0) this._callback(batch, this);
+                    if (!this.#active) return;
+                    const batch = this.#records.slice();
+                    this.#records = [];
+                    if (batch.length > 0) this.#callback(batch, this);
                 });
             }
         }
@@ -3769,37 +3959,26 @@
     // Notify matching observers of a mutation
     function _notifyMO(type, targetNodeId, init) {
         for (const obs of _moObservers) {
-            if (!obs._active) continue;
-            // Check if this observer watches this target (or subtree ancestor)
-            let matched = obs._targets.has(targetNodeId);
-            if (!matched) {
-                // Check subtree: walk ancestors
-                for (const [watchedId, { options }] of obs._targets) {
-                    if (options.subtree) {
-                        // Walk up from targetNodeId to see if watchedId is ancestor
-                        let nid = targetNodeId;
-                        while (nid !== -1 && nid !== null) {
-                            if (nid === watchedId) { matched = true; break; }
-                            nid = ops.op_dom_get_parent(nid);
-                        }
-                    }
-                    if (matched) break;
-                }
+            if (!_MutationObserver_get_active(obs)) continue;
+            let matched = false, oldValue = null;
+            for (let nid = targetNodeId; nid !== -1 && nid !== null; nid = ops.op_dom_get_parent(nid)) {
+                const opts = _MutationObserver_get_targets(obs).get(nid)?.options;
+                if (!opts || (nid !== targetNodeId && !opts.subtree) || !opts[type]) continue;
+                if (type === 'attributes' && opts.attributeFilter &&
+                    !opts.attributeFilter.includes(init.attributeName)) continue;
+                matched = true;
+                if ((type === 'attributes' && opts.attributeOldValue) ||
+                    (type === 'characterData' && opts.characterDataOldValue)) oldValue = init.oldValue ?? null;
             }
             if (!matched) continue;
 
-            // Check options match
-            const opts = obs._targets.get(targetNodeId)?.options ||
-                         [...obs._targets.values()].find(v => v.options.subtree)?.options || {};
-            if (type === "childList" && !opts.childList) continue;
-            if (type === "attributes" && !opts.attributes) continue;
-            if (type === "characterData" && !opts.characterData) continue;
-
             const record = new MutationRecord(type, init.target || null);
-            if (init.addedNodes) record.addedNodes = init.addedNodes;
-            if (init.removedNodes) record.removedNodes = init.removedNodes;
-            if (init.attributeName) record.attributeName = init.attributeName;
-            obs._notify(record);
+            const _rec = _idl.own(record);
+            if (init.addedNodes) _rec.addedNodes = init.addedNodes;
+            if (init.removedNodes) _rec.removedNodes = init.removedNodes;
+            if (init.attributeName) _rec.attributeName = init.attributeName;
+            _rec.oldValue = oldValue;
+            _MutationObserver_call_notify(obs, record);
         }
     }
 
@@ -3888,7 +4067,7 @@
         const oldVal = this.getAttribute(name);
         _origSetAttribute.call(this, name, value);
         if (_moObservers.length > 0) {
-            _notifyMO("attributes", _getNodeId(this), { target: this, attributeName: name });
+            _notifyMO("attributes", _getNodeId(this), { target: this, attributeName: name, oldValue: oldVal });
         }
         // Custom element attributeChangedCallback
         if (this._ceUpgraded && typeof this.attributeChangedCallback === "function") {
@@ -3903,8 +4082,8 @@
     Element.prototype.removeAttribute = function(name) {
         const oldVal = this.getAttribute(name);
         _origRemoveAttribute.call(this, name);
-        if (_moObservers.length > 0) {
-            _notifyMO("attributes", _getNodeId(this), { target: this, attributeName: name });
+        if (_moObservers.length > 0 && oldVal !== null) {
+            _notifyMO("attributes", _getNodeId(this), { target: this, attributeName: name, oldValue: oldVal });
         }
         // Custom element attributeChangedCallback
         if (this._ceUpgraded && typeof this.attributeChangedCallback === "function") {
@@ -5314,6 +5493,7 @@
     Object.defineProperty(globalThis, '__resetDomRegistries', {
         value: function __resetDomRegistries() {
             _nodeCache.clear();
+            _liveChildLists = new WeakMap();
             _scrollState.clear();
             _syncFetchInFlight.clear();
             // Observers registered by the previous page's scripts. Pages
@@ -5341,7 +5521,7 @@
     // `cleanup_bootstrap.js` has removed `Deno` and a `Deno.core.ops` lookup yields
     // null. That failure is silent: `postMessage` becomes a no-op and a widget
     // waiting on its embedder simply hangs forever. Non-enumerable, same discipline
-    // as `__bo_input_api` and `__bo_mark_trusted`.
+    // as the input bridge and the trusted-event minter.
     try {
         Object.defineProperty(_boNs, "frames", {
             value: {

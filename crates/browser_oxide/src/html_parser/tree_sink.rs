@@ -246,6 +246,10 @@ impl TreeSink for DomTreeSink {
         unsafe {
             *self.quirks_mode.get() = mode;
         }
+        // Only full quirks changes `document.compatMode` and the layout of
+        // `<html>`/`<body>`; "limited quirks" (almost standards) reports
+        // CSS1Compat and lays out like standards mode.
+        self.dom_mut().set_quirks(mode == QuirksMode::Quirks);
     }
 
     fn append_before_sibling(&self, sibling: &NodeId, child: NodeOrText<NodeId>) {

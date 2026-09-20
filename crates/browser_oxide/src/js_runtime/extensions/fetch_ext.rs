@@ -24,9 +24,16 @@ pub fn reset_sync_fetch_count() {
     SYNC_FETCH_COUNT.with(|c| c.set(0));
 }
 
-pub fn record_resource_timing(state: &mut OpState, timings: crate::net::TimingStats) {
+pub fn record_resource_timing(
+    state: &mut OpState,
+    url: String,
+    decoded_size: u64,
+    timings: crate::net::TimingStats,
+) {
     if let Some(dom_state) = state.try_borrow_mut::<DomState>() {
-        dom_state.resource_timings.push(timings);
+        dom_state
+            .resource_timings
+            .push((url, decoded_size, timings));
     }
 }
 
@@ -361,19 +368,45 @@ pub async fn op_fetch(
     // that black-holes requests it dislikes) don't hold the V8 event loop
     // open indefinitely.
     let fetch_timeout = std::time::Duration::from_secs(30);
-    let resp_result = tokio::time::timeout(fetch_timeout, async {
-        match method_upper.as_str() {
-            "POST" | "PUT" | "PATCH" => {
-                client
-                    .fetch_post_bytes(&url, &body_bytes, &extra_headers, origin.as_deref())
-                    .await
+    // Run the transfer on the network runtime rather than the one V8 is
+    // on. Both share a thread here, so a long synchronous script freezes
+    // every in-flight socket for as long as it runs — measured: a fetch
+    // issued just before a 4 s busy-loop made no progress at all during
+    // it. Long enough (hCaptcha's `hsw.js` proof-of-work) and the
+    // connection passes the OS timeout and dies with a raw
+    // `Operation timed out (os error 60)`, which a real browser never
+    // produces: its network stack has its own threads.
+    //
+    // The awaited result still lands back on the V8 thread, so the JS
+    // promise resolves only when script execution yields — as it does in
+    // a browser. What changes is that the connection stays alive and the
+    // 30 s budget below now runs on a timer that is actually being polled.
+    let owned_client = client.clone();
+    let owned_url = url.clone();
+    let owned_headers = extra_headers.clone();
+    let owned_origin = origin.clone();
+    let owned_method = method_upper.clone();
+    let resp_result = crate::net::background::spawn_net(async move {
+        tokio::time::timeout(fetch_timeout, async {
+            match owned_method.as_str() {
+                "POST" | "PUT" | "PATCH" => {
+                    owned_client
+                        .fetch_post_bytes(
+                            &owned_url,
+                            &body_bytes,
+                            &owned_headers,
+                            owned_origin.as_deref(),
+                        )
+                        .await
+                }
+                _ => {
+                    owned_client
+                        .fetch_get(&owned_url, &owned_headers, owned_origin.as_deref())
+                        .await
+                }
             }
-            _ => {
-                client
-                    .fetch_get(&url, &extra_headers, origin.as_deref())
-                    .await
-            }
-        }
+        })
+        .await
     })
     .await;
     let resp = match resp_result {
@@ -557,7 +590,7 @@ pub fn op_net_fetch_sync(#[string] url: String, #[string] referer: String) -> St
     // sidesteps the deadlock. We DO read the profile from FETCH_CLIENT
     // so cookies + stealth settings are consistent.
     let main_client = FETCH_CLIENT.with(|c| c.borrow().clone());
-    let (_profile, client_res) = match main_client.as_ref() {
+    let (profile, client_res) = match main_client.as_ref() {
         Some(main) => (
             main.profile().clone(),
             crate::net::HttpClient::new_with_shared_state(
@@ -578,18 +611,12 @@ pub fn op_net_fetch_sync(#[string] url: String, #[string] referer: String) -> St
         Err(_) => return String::new(),
     };
 
-    // 2. Build browser-native headers for a script fetch
-    let mut extra_headers = vec![
-        ("referer".to_string(), referer.clone()),
-        ("sec-fetch-dest".to_string(), "script".to_string()),
-        ("sec-fetch-mode".to_string(), "no-cors".to_string()),
-        ("sec-fetch-site".to_string(), "same-origin".to_string()),
-    ];
-    if let Ok(parsed) = Url::parse(&referer) {
-        if let Some(origin) = parsed.origin().ascii_serialization().into() {
-            extra_headers.push(("origin".to_string(), origin));
-        }
-    }
+    // 2. Build browser-native headers for a classic script fetch.
+    // `sec-fetch-site` was hardcoded `same-origin` here, so a cross-site
+    // script — a captcha vendor's, say — announced itself as first-party;
+    // and the `Origin` this pushed is never sent on a no-cors load.
+    let extra_headers =
+        crate::net::headers::nav_headers_subresource(&profile, &url, &referer, "script", false);
 
     let url_clone = url.clone();
     let result = std::thread::spawn(move || {
@@ -606,7 +633,7 @@ pub fn op_net_fetch_sync(#[string] url: String, #[string] referer: String) -> St
         rt.block_on(async move {
             match tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                client.get_with_headers(&url_clone, &extra_headers),
+                client.get_with_exact_headers(&url_clone, &extra_headers),
             )
             .await
             {
@@ -838,6 +865,7 @@ pub struct ImgLoadResult {
 pub async fn op_img_load(
     state: std::rc::Rc<std::cell::RefCell<OpState>>,
     #[string] url: String,
+    #[string] referer: String,
 ) -> ImgLoadResult {
     let fail = ImgLoadResult {
         ok: false,
@@ -904,7 +932,18 @@ pub async fn op_img_load(
     // on its images waits forever — measured on hCaptcha's tile grid, where a
     // few tiles sat on their loading placeholder permanently.
     const IMG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-    let fetched = tokio::time::timeout(IMG_TIMEOUT, client.get(&url)).await;
+    // An `<img>` is a subresource, not a navigation: `client.get` would put
+    // `upgrade-insecure-requests`, `sec-fetch-user: ?1` and
+    // `sec-fetch-dest: document` on a picture request.
+    let hdrs = crate::net::headers::nav_headers_subresource(
+        client.profile(),
+        &url,
+        &referer,
+        "image",
+        false,
+    );
+    let fetched =
+        tokio::time::timeout(IMG_TIMEOUT, client.get_follow_exact_headers(&url, &hdrs, 5)).await;
     let Ok(Ok(resp)) = fetched else {
         return fail;
     };
@@ -935,6 +974,91 @@ fn percent_decode_bytes(s: &str) -> Vec<u8> {
     out
 }
 
+fn url_components(url: &Url) -> serde_json::Value {
+    use url::quirks as q;
+    serde_json::json!({
+        "href": q::href(url), "origin": q::origin(url),
+        "protocol": q::protocol(url), "username": q::username(url),
+        "password": q::password(url), "host": q::host(url),
+        "hostname": q::hostname(url), "port": q::port(url),
+        "pathname": q::pathname(url), "search": q::search(url), "hash": q::hash(url),
+    })
+}
+
+#[op2]
+#[serde]
+pub fn op_url_parse(
+    #[string] input: String,
+    #[string] base: Option<String>,
+) -> Result<serde_json::Value, deno_error::JsErrorBox> {
+    let invalid = |e: url::ParseError| deno_error::JsErrorBox::type_error(e.to_string());
+    let base = base
+        .as_deref()
+        .map(Url::parse)
+        .transpose()
+        .map_err(invalid)?;
+    let url = Url::options()
+        .base_url(base.as_ref())
+        .parse(&input)
+        .map_err(invalid)?;
+    Ok(url_components(&url))
+}
+
+#[op2]
+#[serde]
+pub fn op_url_set(
+    #[string] href: String,
+    #[string] component: String,
+    #[string] value: String,
+) -> Result<serde_json::Value, deno_error::JsErrorBox> {
+    use url::quirks as q;
+    let mut url =
+        Url::parse(&href).map_err(|e| deno_error::JsErrorBox::type_error(e.to_string()))?;
+    match component.as_str() {
+        "href" => q::set_href(&mut url, &value)
+            .map_err(|e| deno_error::JsErrorBox::type_error(e.to_string()))?,
+        "protocol" => {
+            let _ = q::set_protocol(&mut url, &value);
+        }
+        "username" => {
+            let _ = q::set_username(&mut url, &value);
+        }
+        "password" => {
+            let _ = q::set_password(&mut url, &value);
+        }
+        "host" => {
+            let _ = q::set_host(&mut url, &value);
+        }
+        "hostname" => {
+            let _ = q::set_hostname(&mut url, &value);
+        }
+        "port" => {
+            let _ = q::set_port(&mut url, &value);
+        }
+        "pathname" => q::set_pathname(&mut url, &value),
+        "search" => q::set_search(&mut url, &value),
+        "hash" => q::set_hash(&mut url, &value),
+        _ => return Err(deno_error::JsErrorBox::type_error("Unknown URL component")),
+    }
+    Ok(url_components(&url))
+}
+
+#[op2]
+#[serde]
+pub fn op_url_search_params_parse(#[string] query: String) -> Vec<(String, String)> {
+    url::form_urlencoded::parse(query.as_bytes())
+        .into_owned()
+        .collect()
+}
+
+#[op2]
+#[string]
+pub fn op_url_search_params_serialize(#[serde] pairs: Vec<(String, String)>) -> String {
+    url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs)
+        .finish()
+}
+
 deno_core::extension!(
     fetch_extension,
     ops = [
@@ -945,6 +1069,10 @@ deno_core::extension!(
         op_net_fetch_sync,
         op_net_xhr_sync,
         op_drain_csp_violations,
-        op_img_load
+        op_img_load,
+        op_url_parse,
+        op_url_set,
+        op_url_search_params_parse,
+        op_url_search_params_serialize,
     ],
 );

@@ -133,29 +133,116 @@ const COUNTRY_LOCALES: &[(&str, &str, &[&str], &str)] = &[
     ("HK", "zh-HK", &["zh-HK", "zh", "en"], "Asia/Hong_Kong"),
 ];
 
-/// Point a profile's locale at a country, leaving everything else alone.
+/// What the lookup could tell us about the address the traffic leaves from.
 ///
-/// Returns `false` for a country we have no entry for — better to keep the
-/// sampled locale than to invent a mapping, since a wrong-but-confident pairing
-/// is exactly the inconsistency this exists to avoid.
-pub fn apply_country(profile: &mut StealthProfile, country: &str) -> bool {
-    let cc = country.trim().to_ascii_uppercase();
-    let Some((_, lang, langs, tz)) = COUNTRY_LOCALES.iter().find(|(c, ..)| *c == cc) else {
+/// Country is the only field every provider returns; the rest are present when
+/// the provider gives them. The city-level fields matter because a country is
+/// not a timezone: an exit in Los Angeles and one in New York share `US`, and
+/// resolving both to the country's main population centre puts a
+/// coast-and-a-half between the address a site geolocates and the clock the
+/// browser reports.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Egress {
+    pub country: String,
+    pub city: Option<String>,
+    pub region: Option<String>,
+    /// IANA zone as the provider resolved it for this address.
+    pub timezone: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+}
+
+/// Align a profile with the address its traffic leaves from.
+///
+/// Returns `false` only when there is nothing usable — no provider timezone and
+/// no table entry for the country. Better to keep the sampled locale than to
+/// invent a mapping, since a wrong-but-confident pairing is exactly the
+/// inconsistency this exists to avoid.
+pub fn apply_egress(profile: &mut StealthProfile, egress: &Egress) -> bool {
+    let cc = egress.country.trim().to_ascii_uppercase();
+    let entry = COUNTRY_LOCALES.iter().find(|(c, ..)| *c == cc);
+
+    // The provider resolved the zone for this exact address; the table only
+    // knows the country's main population centre. Prefer the address.
+    let tz = egress
+        .timezone
+        .as_deref()
+        .filter(|t| t.contains('/'))
+        .map(str::to_string)
+        .or_else(|| entry.map(|(_, _, _, tz)| (*tz).to_string()));
+    let Some(tz) = tz else {
         return false;
     };
-    // Timezone follows the exit address — that pairing *is* checked. The
-    // language does not: English reads as ordinary from anywhere, and a
-    // localised captcha is unreadable to whoever is driving. Set
-    // `BROWSER_OXIDE_MATCH_LANG=1` to take the country's language too.
-    profile.timezone = (*tz).to_string();
-    if std::env::var_os("BROWSER_OXIDE_MATCH_LANG").is_some() {
-        profile.language = (*lang).to_string();
-        profile.languages = langs.iter().map(|s| (*s).to_string()).collect();
-    } else {
-        profile.language = "en-US".to_string();
-        profile.languages = vec!["en-US".to_string(), "en".to_string()];
+    profile.timezone = tz;
+
+    // Coordinates ride along so the geolocation surface agrees with the clock
+    // and the address, for whatever reads it.
+    profile.latitude = egress.latitude;
+    profile.longitude = egress.longitude;
+
+    // The language does not follow the address: English reads as ordinary from
+    // anywhere, and a localised captcha is unreadable to whoever is driving.
+    // Set `BROWSER_OXIDE_MATCH_LANG=1` to take the country's language too.
+    match (
+        std::env::var_os("BROWSER_OXIDE_MATCH_LANG").is_some(),
+        entry,
+    ) {
+        (true, Some((_, lang, langs, _))) => {
+            profile.language = (*lang).to_string();
+            profile.languages = langs.iter().map(|s| (*s).to_string()).collect();
+        }
+        _ => {
+            profile.language = "en-US".to_string();
+            profile.languages = vec!["en-US".to_string(), "en".to_string()];
+        }
     }
     true
+}
+
+/// Whether an egress lookup is worth making for this profile.
+///
+/// Pure so the network-avoidance policy is testable without a socket. The
+/// lookup only earns its round trip when the traffic leaves through a proxy
+/// (the exit IP then differs from the host) or the caller forces it; a
+/// direct-connect run — which is every offline test — makes no network call.
+fn wants_egress(has_proxy: bool, forced: bool, disabled: bool, already_aligned: bool) -> bool {
+    !disabled && !already_aligned && (has_proxy || forced)
+}
+
+/// Align `profile` to its exit address, gated so it never fires on the offline
+/// test path.
+///
+/// Runs [`detect_egress`] + [`apply_egress`] only when it makes sense to: a
+/// proxy is configured (`profile.proxy` or the `BROWSER_OXIDE_PROXY` env
+/// override) or `BROWSER_OXIDE_ALIGN_EGRESS=1` forces it. Skips a profile that
+/// is already aligned (`latitude` set) and honours `BROWSER_OXIDE_NO_EGRESS=1`.
+/// Best-effort: a failed lookup leaves the sampled locale untouched.
+///
+/// Public so PagePool embedders can align a profile once before handing it to
+/// the pool — the warm-reuse path bakes the timezone into the live isolate at
+/// construction, too early to align per-navigate.
+pub async fn align_to_egress(profile: &mut StealthProfile) -> bool {
+    let has_proxy = profile.proxy.is_some() || std::env::var_os("BROWSER_OXIDE_PROXY").is_some();
+    let forced = std::env::var_os("BROWSER_OXIDE_ALIGN_EGRESS").is_some();
+    let disabled = std::env::var_os("BROWSER_OXIDE_NO_EGRESS").is_some();
+    if !wants_egress(has_proxy, forced, disabled, profile.latitude.is_some()) {
+        return false;
+    }
+    match detect_egress(profile).await {
+        Some(egress) => apply_egress(profile, &egress),
+        None => false,
+    }
+}
+
+/// Back-compat shim for callers that only have a country code.
+pub fn apply_country(profile: &mut StealthProfile, country: &str) -> bool {
+    apply_egress(
+        profile,
+        &Egress {
+            country: country.to_string(),
+            ..Egress::default()
+        },
+    )
 }
 
 /// Countries this module can align a profile to.
@@ -173,7 +260,7 @@ pub fn known_countries() -> impl Iterator<Item = &'static str> {
 /// unrecognised body. The caller keeps its sampled locale in that case, which
 /// is the honest fallback: a guess here would reintroduce the very mismatch the
 /// lookup exists to prevent.
-pub async fn detect_country(profile: &StealthProfile) -> Option<String> {
+pub async fn detect_egress(profile: &StealthProfile) -> Option<Egress> {
     let client = HttpClient::shared(profile).ok()?;
     // Two independent providers: one being down or blocked must not silently
     // leave every profile mis-localised.
@@ -192,38 +279,64 @@ pub async fn detect_country(profile: &StealthProfile) -> Option<String> {
         if !resp.ok() {
             continue;
         }
-        if let Some(cc) = parse_country(&resp.text()) {
-            return Some(cc);
+        if let Some(egress) = parse_egress(&resp.text()) {
+            return Some(egress);
         }
     }
     None
 }
 
-/// Pull a two-letter country out of a JSON body without a JSON dependency.
+/// Country-only convenience for callers that do not need the rest.
+pub async fn detect_country(profile: &StealthProfile) -> Option<String> {
+    detect_egress(profile).await.map(|e| e.country)
+}
+
+/// Read what the provider will tell us about the exit address.
 ///
-/// The three providers spell the field differently (`country`,
-/// `country_code`), so both keys are accepted; the value is only taken when it
-/// is exactly two ASCII letters, which rejects a full country name arriving
-/// under the same key.
-fn parse_country(body: &str) -> Option<String> {
-    for key in ["\"country_code\"", "\"country\""] {
-        let mut from = 0usize;
-        while let Some(hit) = body[from..].find(key) {
-            let after = from + hit + key.len();
-            let tail = body[after..].trim_start();
-            if let Some(rest) = tail.strip_prefix(':') {
-                let rest = rest.trim_start();
-                if let Some(rest) = rest.strip_prefix('"') {
-                    let value: String = rest.chars().take_while(|c| *c != '"').collect();
-                    if value.len() == 2 && value.chars().all(|c| c.is_ascii_alphabetic()) {
-                        return Some(value.to_ascii_uppercase());
-                    }
-                }
-            }
-            from = after;
-        }
-    }
-    None
+/// The three providers spell things differently — ipinfo packs the coordinates
+/// into one `"loc": "lat,lon"` string while ipapi.co splits them into
+/// `latitude`/`longitude`, and the country arrives as either `country` or
+/// `country_code`. A country is only accepted as exactly two ASCII letters,
+/// which rejects a full country name arriving under the same key.
+///
+/// `None` when there is no country: the rest is optional detail, but without a
+/// country there is nothing to align to.
+fn parse_egress(body: &str) -> Option<Egress> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+
+    let country = ["country_code", "country"]
+        .iter()
+        .filter_map(|k| v.get(*k).and_then(|x| x.as_str()))
+        .find(|s| s.len() == 2 && s.chars().all(|c| c.is_ascii_alphabetic()))?
+        .to_ascii_uppercase();
+
+    let text = |k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+    };
+    // A provider may send a number or a numeric string for the same field.
+    let num = |k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_f64().or_else(|| x.as_str()?.parse().ok()))
+    };
+
+    let (loc_lat, loc_lon) = v
+        .get("loc")
+        .and_then(|x| x.as_str())
+        .and_then(|s| s.split_once(','))
+        .map(|(a, b)| (a.trim().parse().ok(), b.trim().parse().ok()))
+        .unwrap_or((None, None));
+
+    Some(Egress {
+        country,
+        city: text("city"),
+        region: text("region"),
+        timezone: text("timezone"),
+        latitude: num("latitude").or(loc_lat),
+        longitude: num("longitude").or(loc_lon),
+    })
 }
 
 #[cfg(test)]
@@ -231,31 +344,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn country_is_read_from_either_field_name() {
-        assert_eq!(
-            parse_country(r#"{"ip":"1.2.3.4","country":"SE","city":"Stockholm"}"#).as_deref(),
-            Some("SE")
-        );
-        assert_eq!(
-            parse_country(r#"{"country_code":"fr","country_name":"France"}"#).as_deref(),
-            Some("FR")
-        );
-        // A full name under `country` must not be mistaken for a code.
-        assert_eq!(parse_country(r#"{"country":"Sweden"}"#), None);
-        assert_eq!(parse_country("не json"), None);
+    fn egress_only_fires_when_it_earns_the_round_trip() {
+        // The property that keeps the offline test suite network-free:
+        // no proxy and no force flag ⇒ never look up.
+        assert!(!wants_egress(false, false, false, false));
+        // A proxy, or an explicit force, makes it worthwhile.
+        assert!(wants_egress(true, false, false, false));
+        assert!(wants_egress(false, true, false, false));
+        // Disable and already-aligned both veto, whatever else is set.
+        assert!(!wants_egress(true, true, true, false));
+        assert!(!wants_egress(true, true, false, true));
     }
 
     #[test]
-    fn country_sets_the_timezone_and_leaves_the_language_english() {
+    fn egress_is_read_from_either_field_name() {
+        let e = parse_egress(r#"{"ip":"1.2.3.4","country":"SE","city":"Stockholm"}"#).unwrap();
+        assert_eq!(e.country, "SE");
+        assert_eq!(e.city.as_deref(), Some("Stockholm"));
+        assert_eq!(
+            parse_egress(r#"{"country_code":"fr","country_name":"France"}"#)
+                .unwrap()
+                .country,
+            "FR"
+        );
+        // A full name under `country` must not be mistaken for a code.
+        assert!(parse_egress(r#"{"country":"Sweden"}"#).is_none());
+        assert!(parse_egress("не json").is_none());
+    }
+
+    #[test]
+    fn coordinates_come_from_either_shape() {
+        // ipinfo packs them into one string.
+        let e = parse_egress(r#"{"country":"SE","loc":"59.3294,18.0687"}"#).unwrap();
+        assert_eq!(e.latitude, Some(59.3294));
+        assert_eq!(e.longitude, Some(18.0687));
+        // ipapi.co splits them, and may send them as numbers.
+        let e =
+            parse_egress(r#"{"country_code":"US","latitude":34.05,"longitude":-118.24}"#).unwrap();
+        assert_eq!(e.latitude, Some(34.05));
+        assert_eq!(e.longitude, Some(-118.24));
+    }
+
+    #[test]
+    fn provider_timezone_beats_the_country_table() {
+        // The bug this backs: every US exit used to report the table's
+        // `America/New_York`, so an address a site geolocates to Los Angeles
+        // came with an East-coast clock.
+        let mut p = crate::stealth::presets::chrome_148_macos();
+        assert!(apply_egress(
+            &mut p,
+            &Egress {
+                country: "US".into(),
+                timezone: Some("America/Los_Angeles".into()),
+                latitude: Some(34.05),
+                longitude: Some(-118.24),
+                ..Egress::default()
+            }
+        ));
+        assert_eq!(p.timezone, "America/Los_Angeles");
+        assert_eq!(p.latitude, Some(34.05));
+    }
+
+    #[test]
+    fn country_table_is_the_fallback_and_language_stays_english() {
         let mut p = crate::stealth::presets::chrome_148_macos();
         assert!(apply_country(&mut p, "se"));
-        // The timezone follows the exit address — that pairing is checked.
+        // No provider zone: the table's entry stands in.
         assert_eq!(p.timezone, "Europe/Stockholm");
-        // The language does not: a localised UI is unreadable to whoever drives
-        // the browser, and English is ordinary from any address.
+        // The language does not follow the address — English is ordinary
+        // from anywhere, and a localised captcha is unreadable to the driver.
         assert_eq!(p.language, "en-US");
-        assert!(p.languages.iter().any(|l| l == "en-US"));
-        // Unknown country leaves the profile untouched.
+        // Unknown country with no provider zone leaves the profile untouched.
         let before = p.timezone.clone();
         assert!(!apply_country(&mut p, "XX"));
         assert_eq!(p.timezone, before);

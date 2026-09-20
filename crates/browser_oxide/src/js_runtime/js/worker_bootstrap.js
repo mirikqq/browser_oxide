@@ -69,36 +69,35 @@
         }
     } catch (_) { /* ignore */ }
 
-    // --- WorkerLocation ---
-    // Real Chrome workers expose `self.location` as a WorkerLocation
-    // object reporting the script's URL. Some workers read
-    // `self.location.origin` to verify they were loaded from an
-    // expected URL; absence can silently break their flow.
-    if (!self.location) {
+    const _svc = (() => {
         try {
-            const _workerUrl = (ops && typeof ops.op_worker_self_url === 'function')
-                ? ops.op_worker_self_url()
-                : '';
-            if (_workerUrl) {
-                const _u = new URL(_workerUrl);
-                self.location = Object.create(null);
-                self.location.href = _u.href;
-                self.location.origin = _u.origin;
-                self.location.protocol = _u.protocol;
-                self.location.host = _u.host;
-                self.location.hostname = _u.hostname;
-                self.location.port = _u.port;
-                self.location.pathname = _u.pathname;
-                self.location.search = _u.search;
-                self.location.hash = _u.hash;
-                self.location.toString = function () { return _u.href; };
-                Object.defineProperty(self.location, Symbol.toStringTag, {
-                    value: 'WorkerLocation', configurable: true,
-                });
+            const syms = Object.getOwnPropertySymbols(globalThis, 1);
+            for (let i = 0; i < syms.length; i++) {
+                const v = globalThis[syms[i]];
+                if (v && v.__bo && v.services) return v.services;
             }
-        } catch (_e) {
-            // URL parse failure (rare) — leave location undefined.
+        } catch (_) {}
+        return null;
+    })();
+
+    if (_svc) {
+        const WL = _svc.iface("WorkerLocation");
+        let _url = null;
+        try {
+            const raw = (ops && typeof ops.op_worker_self_url === "function") ? ops.op_worker_self_url() : "";
+            if (raw) _url = new URL(raw);
+        } catch (_) {}
+        const _part = (k) => (_url ? _url[k] : "");
+        for (const k of ["origin", "protocol", "host", "hostname", "port", "pathname", "search", "hash", "href"]) {
+            _svc.acc(WL.prototype, k, () => _part(k));
         }
+        _svc.fn(WL.prototype, "toString", 0, () => _part("href"));
+        _svc.layout(WL.prototype, ["origin", "protocol", "host", "hostname", "port", "pathname", "search", "hash",
+            "href", "toString", "constructor"]);
+        const _location = _svc.make(WL);
+        Object.defineProperty(self, "location", {
+            get: () => _location, enumerable: true, configurable: true,
+        });
     }
 
     // --- Intl Sync (matches window_bootstrap) ---
@@ -122,125 +121,82 @@
         }
     }
 
-    // --- WorkerNavigator (matches StealthProfile) ---
-    if (!self.navigator) {
-        // navigator.userAgentData — must be present in Worker realm AND
-        // return values consistent with the main thread. Some scripts
-        // spawn a Worker that reads `navigator.userAgentData?.mobile`.
-        // Main returns false, worker previously returned "NA" — a
-        // cross-realm contradiction. Now both return false.
-        const _osName = _p("os_name", "Windows");
-        const _browserMajor = _p("browser_version", "147.0.7727.117").split(".")[0];
-        const _browserFull = _p("browser_version", "147.0.7727.117");
-        const _brands = [
-            { brand: "Google Chrome", version: _browserMajor },
-            { brand: "Not.A/Brand", version: "8" },
-            { brand: "Chromium", version: _browserMajor },
-        ];
-        const _fullVersionList = [
-            { brand: "Google Chrome", version: _browserFull },
-            { brand: "Not.A/Brand", version: "8.0.0.0" },
-            { brand: "Chromium", version: _browserFull },
-        ];
-        class WorkerNavigatorUAData {
-            get brands() { return _brands.slice(); }
-            get mobile() { return false; }
-            get platform() { return _osName; }
-            getHighEntropyValues(hints) {
-                if (!Array.isArray(hints)) {
-                    return Promise.reject(new TypeError(
-                        "Failed to execute 'getHighEntropyValues' on 'NavigatorUAData': The provided value cannot be converted to a sequence."
-                    ));
-                }
-                const out = { brands: _brands.slice(), mobile: false, platform: _osName };
-                for (const h of hints) {
-                    switch (h) {
-                        case "architecture": out.architecture = _p("cpu_architecture", "x86"); break;
-                        case "bitness": out.bitness = _p("cpu_bitness", "64"); break;
-                        case "model": out.model = _p("ua_model", ""); break;
-                        case "platformVersion": out.platformVersion = _p("platform_version", ""); break;
-                        case "uaFullVersion": out.uaFullVersion = _browserFull; break;
-                        case "fullVersionList": out.fullVersionList = _fullVersionList.slice(); break;
-                        case "wow64": out.wow64 = _p("ua_wow64", "false") === "true"; break;
-                        case "formFactors": out.formFactors = ["Desktop"]; break;
-                        default: /* ignore unknown hints — Chrome silently drops */ break;
-                    }
-                }
-                return Promise.resolve(out);
+    if (_svc) {
+        const WN = _svc.iface("WorkerNavigator");
+        const _secure = (() => {
+            try { return !!ops.op_is_secure_context(); } catch (_) { return false; }
+        })();
+        let _languages = null;
+        const _singletons = { __proto__: null };
+        const _single = (name) => {
+            if (!(name in _singletons)) {
+                _singletons[name] = typeof self[name] === "function" ? _svc.make(self[name]) : undefined;
             }
-            toJSON() { return { brands: _brands.slice(), mobile: false, platform: _osName }; }
+            return _singletons[name];
+        };
+        const _firefox = _isFirefox();
+        const _skip = new Set(_firefox
+            ? ["connection", "hid", "serial", "usb", "deviceMemory", "userAgentData", "storageBuckets", "gpu"]
+            : (_secure ? [] : ["hid", "serial", "usb", "deviceMemory", "userAgentData", "locks", "storage", "gpu", "storageBuckets"]));
+        const _members = [
+            ["hardwareConcurrency", () => _pInt("hardware_concurrency", 8)],
+            ["appCodeName", () => "Mozilla"],
+            ["appName", () => "Netscape"],
+            ["appVersion", () => _p("app_version", "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36")],
+            ["platform", () => _p("platform", "Win32")],
+            ["product", () => "Gecko"],
+            ["userAgent", () => _p("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36")],
+            ["language", () => _p("language", "en-US")],
+            ["languages", () => (_languages ||= Object.freeze(_pJson("languages", ["en-US", "en"])))],
+            ["onLine", () => true],
+            ["connection", () => _single("NetworkInformation")],
+            ["constructor", null],
+            ["hid", () => _single("HID")],
+            ["mediaCapabilities", () => _single("MediaCapabilities")],
+            ["permissions", () => _single("Permissions")],
+            ["serial", () => _single("Serial")],
+            ["usb", () => _single("USB")],
+            ["deviceMemory", () => Math.min(_pInt("device_memory", 8), 8)],
+            ["userAgentData", () => _single("NavigatorUAData")],
+            ["locks", () => _single("LockManager")],
+            ["storage", () => _single("StorageManager")],
+            ["gpu", () => _single("GPU")],
+            ["storageBuckets", () => _single("StorageBucketManager")],
+        ];
+        const _order = [];
+        for (const [name, get] of _members) {
+            if (_skip.has(name)) continue;
+            if (get) _svc.acc(WN.prototype, name, get);
+            _order.push(name);
         }
-        Object.defineProperty(WorkerNavigatorUAData.prototype, Symbol.toStringTag, {
-            value: "NavigatorUAData", configurable: true,
+        if (_firefox) {
+            _svc.acc(WN.prototype, "oscpu", () => {
+                const m = _p("user_agent", "").match(/\(([^)]*)\)/);
+                return m ? m[1].replace(/;?\s*rv:[0-9.]+\s*/, "").replace(/^Macintosh;\s*/, "").trim() : "";
+            });
+            _svc.acc(WN.prototype, "buildID", () => "20181001000000");
+            _order.push("oscpu", "buildID");
+        }
+        _svc.layout(WN.prototype, _order);
+        const _navigator = _svc.make(WN);
+        Object.defineProperty(self, "navigator", {
+            get: () => _navigator, enumerable: true, configurable: true,
         });
-
-        const workerNavigator = {
-            userAgent: _p("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"),
-            appVersion: _p("app_version", "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"),
-            language: _p("language", "en-US"),
-            languages: _pJson("languages", ["en-US", "en"]),
-            platform: _p("platform", "Win32"),
-            onLine: true,
-            cookieEnabled: true,
-            hardwareConcurrency: _pInt("hardware_concurrency", 8),
-            deviceMemory: _pInt("device_memory", 8),
-            appName: "Netscape",
-            product: "Gecko",
-            productSub: _p("product_sub", "20030107"),
-            vendor: _p("vendor", "Google Inc."),
-            vendorSub: _p("vendor_sub", ""),
-            doNotTrack: null,
-            pdfViewerEnabled: _p("pdf_viewer_enabled", "true") === "true",
-            webdriver: false,
-            userAgentData: new WorkerNavigatorUAData(),
-        };
-        if (_isFirefox()) {
-            // Gecko: no userAgentData/deviceMemory (Chrome-only); vendor is "";
-            // productSub is "20100101"; oscpu + buildID are Gecko-only.
-            delete workerNavigator.userAgentData;
-            delete workerNavigator.deviceMemory;
-            workerNavigator.vendor = "";
-            workerNavigator.productSub = "20100101";
-            const _ffUa = _p("user_agent", "");
-            const _ffM = _ffUa.match(/\(([^)]*)\)/);
-            workerNavigator.oscpu = _ffM
-                ? _ffM[1].replace(/;?\s*rv:[0-9.]+\s*/, "").replace(/^Macintosh;\s*/, "").trim()
-                : "";
-            workerNavigator.buildID = "20181001000000";
-        }
-        Object.defineProperty(workerNavigator, Symbol.toStringTag, { value: "WorkerNavigator", configurable: true });
-        self.navigator = workerNavigator;
     }
 
-    // --- performance.now() humanization (matches window_bootstrap) ---
-    if (!globalThis.performance) {
-        globalThis.performance = {
-            now() { return ops.op_perf_now_humanized(); },
-        };
-    } else {
-        globalThis.performance.now = () => ops.op_perf_now_humanized();
-    }
-
-    // --- performance.memory jitter (matches window_bootstrap) ---
-    if (globalThis.performance) {
-        Object.defineProperty(globalThis.performance, 'memory', {
-            get() {
-                const jsHeapSizeLimit = 4294705152;
-                const base = 10485760; // 10 MB
-                const jitter = ((Date.now() * 0x9e3779b9) >>> 0) % 5000000;
-                const totalJSHeapSize = base + jitter;
-                const usedJSHeapSize = Math.floor(totalJSHeapSize * 0.85);
-                return { jsHeapSizeLimit, totalJSHeapSize, usedJSHeapSize };
-            },
-            configurable: true,
-            enumerable: true
+    if (_svc && typeof globalThis.Performance === "function") {
+        const _performance = _svc.make(globalThis.Performance);
+        Object.defineProperty(self, "performance", {
+            get: () => _performance, enumerable: true, configurable: true,
         });
     }
 
     // --- postMessage: send a message to the parent thread ---
-    self.postMessage = function (message, transfer) {
-        // Validate transferables (same shape as main thread).
-        const transferList = Array.isArray(transfer) ? transfer : [];
+    self.postMessage = ({ postMessage(message) {
+        const transfer = arguments[1];
+        const transferList = Array.isArray(transfer)
+            ? transfer
+            : (transfer && Array.isArray(transfer.transfer) ? transfer.transfer : []);
         for (const t of transferList) {
             if (
                 t !== null &&
@@ -270,7 +226,7 @@
             payload = JSON.stringify({ data: null });
         }
         ops.op_worker_self_post(payload);
-    };
+    } }).postMessage;
 
     // --- close: terminate this worker ---
     // Terminating a worker from inside is rare; the parent handles cleanup.
@@ -278,13 +234,13 @@
     // holding `pending_intervals > 0` forever (06_ENGINE_CORRECTNESS #8) — a
     // closed DedicatedWorkerGlobalScope must not keep a live 5 ms poll.
     let _pumpId = 0;
-    self.close = function () {
+    self.close = ({ close() {
         if (_pumpId) {
             try { clearInterval(_pumpId); } catch (_e) {}
             _pumpId = 0;
         }
         // parent.terminate() still drives real shutdown via AtomicBool.
-    };
+    } }).close;
 
     // --- Poll loop: drain parent→worker messages and fire message events ---
     function drainOnce() {
@@ -322,7 +278,7 @@
     _pumpId = setInterval(drainOnce, 5);
 
     // --- importScripts: classic-worker synchronous script loader ---
-    self.importScripts = function importScripts(...urls) {
+    self.importScripts = ({ importScripts(...urls) {
         for (const raw of urls) {
             const url = String(raw);
             let source;
@@ -347,7 +303,7 @@
             }
             (0, eval)(source);
         }
-    };
+    } }).importScripts;
 
     // MediaSource + MediaRecorder.isTypeSupported in Worker realm.
     // Some scripts read .isTypeSupported in a Worker context; without

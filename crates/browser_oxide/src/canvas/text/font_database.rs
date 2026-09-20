@@ -7,10 +7,9 @@
 //! are set up so a site asking for Arial gets plausible Liberation
 //! Sans metrics rather than the DejaVu Sans fallback.
 //!
-//! The database is built from in-binary font data only — NEVER from
-//! the host's system fonts — so output is reproducible across
-//! machines and matches the StealthProfile's nominal Chrome-on-X
-//! behaviour rather than the developer's laptop.
+//! The bundled set is the fallback substitute used when `system_fonts`
+//! (real host font directories, for a claimed profile OS that matches
+//! the actual host) doesn't have the requested face.
 
 use fontdb::{Database, Family, Query, Stretch, Style, Weight, ID};
 use std::sync::OnceLock;
@@ -165,20 +164,39 @@ impl FontDatabase {
     }
 
     /// Return the raw face bytes + face index for a given face ID.
-    /// Returns `None` for faces backed by a file source (we only ever
-    /// load binary sources, so this is effectively infallible, but the
-    /// `fontdb::Source` enum forces us to handle both).
+    ///
+    /// Every face here is a binary source: `fontdb` is built without its `fs`
+    /// feature, so `Source` has no `File` variant to handle. That is enforced
+    /// at the type level on purpose — font bytes never come from the host.
     pub fn face_data(&self, id: ID) -> Option<(&[u8], u32)> {
         let face = self.inner.face(id)?;
-        // `init_bundled` only loads binary sources, so `face.source`
-        // is always `Binary`. The destructure is still necessary to
-        // extract the Arc'd bytes.
         let fontdb::Source::Binary(data) = &face.source;
         // `data` is an `Arc<dyn AsRef<[u8]> + Send + Sync>`. The Arc's
         // contents are immutable for the process lifetime, so the
         // slice is safe to hand out with the database's lifetime.
         let slice: &[u8] = (**data).as_ref();
         Some((slice, face.index))
+    }
+
+    /// Whether `family` literally names one of the bundled faces (by its
+    /// own family name — "Liberation Sans", "DejaVu Sans", ...), with
+    /// none of `query`/`query_chain`'s web-safe-name aliasing. Backs
+    /// local font *presence* checks (`FontFace.load()`), which must not
+    /// count the Arial→Liberation-Sans-style rendering substitution as a
+    /// hit — a probe for "Segoe UI" on a macOS profile needs `false` even
+    /// though `query("Segoe UI", ..., "macOS")` happily finds a
+    /// Liberation Sans substitute for rendering purposes.
+    pub fn has_bundled_family(&self, family: &str, weight: u16, italic: bool) -> bool {
+        let style = if italic { Style::Italic } else { Style::Normal };
+        let families = [Family::Name(family)];
+        self.inner
+            .query(&Query {
+                families: &families,
+                weight: Weight(weight),
+                stretch: Stretch::Normal,
+                style,
+            })
+            .is_some()
     }
 }
 

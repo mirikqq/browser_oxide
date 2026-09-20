@@ -1,0 +1,80 @@
+<!DOCTYPE html><meta charset=utf-8><title>values</title><pre id=out></pre>
+<div id=host><p>t</p></div>
+<script>
+const SVGNS = 'http://www.w3.org/2000/svg';
+const TAGS = 'a abbr address area article aside audio b base bdi bdo blockquote body br button canvas caption cite code col colgroup data datalist dd del details dfn dialog div dl dt em embed fieldset figcaption figure footer form h1 head header hgroup hr html i iframe img input ins kbd label legend li link main map mark menu meta meter nav noscript object ol optgroup option output p param picture pre progress q rp rt ruby s samp script search section select slot small source span strong style sub summary sup table tbody td template textarea tfoot th thead time title tr track u ul var video wbr marquee frame frameset dir font fencedframe selectedcontent'.split(' ');
+const SVGTAGS = 'a animate animateMotion animateTransform circle clipPath defs desc ellipse feBlend feColorMatrix feComponentTransfer feComposite feConvolveMatrix feDiffuseLighting feDisplacementMap feDistantLight feDropShadow feFlood feFuncA feFuncB feFuncG feFuncR feGaussianBlur feImage feMerge feMergeNode feMorphology feOffset fePointLight feSpecularLighting feSpotLight feTile feTurbulence filter foreignObject g image line linearGradient marker mask metadata mpath path pattern polygon polyline radialGradient rect script set stop style svg switch symbol text textPath title tspan use view'.split(' ');
+const instances = new Map();
+const put = (obj) => {
+  if (!obj) return;
+  try {
+    const name = obj.constructor && obj.constructor.name;
+    if (name && !instances.has(name)) instances.set(name, obj);
+  } catch (e) {}
+};
+for (const t of TAGS) { try { put(document.createElement(t)); } catch (e) {} }
+for (const t of SVGTAGS) { try { put(document.createElementNS(SVGNS, t)); } catch (e) {} }
+put(document); put(document.documentElement); put(document.body); put(document.createTextNode('x'));
+put(document.createComment('c')); put(document.createDocumentFragment()); put(document.createRange());
+put(document.implementation); put(document.createAttribute('x')); put(getSelection());
+put(document.getElementById('host').attributes); put(document.getElementById('host').classList);
+put(document.getElementById('host').children); put(document.getElementById('host').childNodes);
+put(document.getElementById('host').style); put(getComputedStyle(document.body));
+put(document.getElementById('host').getBoundingClientRect());
+put(document.getElementById('host').attachShadow({mode:'open'}));
+put(performance); put(performance.timing); put(performance.navigation); put(performance.memory);
+try { for (const e of performance.getEntries()) put(e); } catch (e) {}
+put(navigator); put(screen); put(history); put(localStorage); put(new URL(location.href));
+put(new URLSearchParams('a=1')); put(new Headers()); put(new Request('/x')); put(new Response('x'));
+put(new FormData()); put(new Blob(['x'])); put(new File(['x'], 'f')); put(new FileReader());
+put(new AbortController()); put(new AbortController().signal); put(new TextEncoder()); put(new TextDecoder());
+put(new MessageChannel().port1); put(new EventTarget()); put(new Event('x')); put(new MouseEvent('x'));
+put(new KeyboardEvent('x')); put(new PointerEvent('x')); put(new WheelEvent('x')); put(new InputEvent('x'));
+put(new CustomEvent('x')); put(new ErrorEvent('x')); put(new ProgressEvent('x')); put(new MessageEvent('x'));
+put(new DOMParser()); put(new XMLSerializer()); put(new XMLHttpRequest()); put(new Image()); put(new Audio());
+put(new Option()); put(document.createElement('canvas').getContext('2d'));
+put(new OffscreenCanvas(1,1)); put(new OffscreenCanvas(1,1).getContext('2d'));
+put(new DOMMatrix()); put(new DOMPoint()); put(new DOMRect()); put(new DOMQuad());
+put(new IntersectionObserver(()=>{})); put(new MutationObserver(()=>{})); put(new ResizeObserver(()=>{}));
+put(new PerformanceObserver(()=>{})); put(new ReadableStream()); put(new WritableStream());
+put(new TransformStream()); put(new BroadcastChannel('x')); put(new CSSStyleSheet());
+try { put(new AudioContext()); put(new OfflineAudioContext(1, 128, 44100)); } catch(e) {}
+try { const ac = new AudioContext(); put(ac.createGain()); put(ac.createOscillator()); put(ac.createAnalyser()); put(ac.createPanner()); put(ac.createDynamicsCompressor()); put(ac.destination); put(ac.listener); put(ac.createBuffer(1,128,44100)); put(ac.createBufferSource()); put(ac.createGain().gain); } catch(e) {}
+put(CSS.px(1)); put(CSS.number(1));
+const describe = (v) => {
+  const t = typeof v;
+  if (v === null) return ['null', null];
+  if (t === 'string' || t === 'number' || t === 'boolean') return [t, v];
+  if (t === 'undefined') return ['undefined', null];
+  if (t === 'function') return ['function', v.name || ''];
+  if (t === 'bigint' || t === 'symbol') return [t, String(v)];
+  try {
+    const cname = v.constructor && v.constructor.name;
+    if (Array.isArray(v)) return ['array', v.length];
+    return ['object', cname || 'Object'];
+  } catch (e) { return ['object', 'Object']; }
+};
+const res = {};
+for (const [, obj] of instances) {
+  let proto;
+  try { proto = Object.getPrototypeOf(obj); } catch (e) { continue; }
+  // Walk the whole chain: an <audio> element answers for HTMLMediaElement,
+  // HTMLElement, Element and Node too, and those are where most members live.
+  for (; proto && proto !== Object.prototype; proto = Object.getPrototypeOf(proto)) {
+    let ifaceName;
+    try {
+      ifaceName = Object.prototype.hasOwnProperty.call(proto, 'constructor')
+        && proto.constructor && proto.constructor.name;
+    } catch (e) { continue; }
+    if (!ifaceName) continue;
+    const vals = res[ifaceName] || (res[ifaceName] = {});
+    for (const key of Object.getOwnPropertyNames(proto)) {
+      if (key === 'constructor' || key in vals) continue;
+      const d = Object.getOwnPropertyDescriptor(proto, key);
+      if (!d || !d.get) continue;
+      try { vals[key] = describe(d.get.call(obj)); } catch (e) { vals[key] = ['throws', String(e.name)]; }
+    }
+  }
+}
+out.textContent = JSON.stringify(res);
+</script>

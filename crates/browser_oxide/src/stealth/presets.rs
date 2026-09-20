@@ -1,5 +1,15 @@
 use crate::stealth::profile::{DeviceClass, MediaDeviceInfo, StealthProfile};
 
+const CHROME_DESKTOP_VERSION: &str = "153.0.8010.48";
+const CHROME_DESKTOP_TLS: &str = "chrome_153";
+
+fn chrome_desktop_ua(platform: &str) -> String {
+    let major = CHROME_DESKTOP_VERSION.split('.').next().unwrap_or_default();
+    format!(
+        "Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+    )
+}
+
 fn default_media_devices(seed: &str) -> Vec<MediaDeviceInfo> {
     // Deterministic device IDs based on a seed string
     let hash = |s: &str| -> String {
@@ -35,20 +45,20 @@ fn default_media_devices(seed: &str) -> Vec<MediaDeviceInfo> {
     ]
 }
 
-/// Chrome 147 on Windows 10.
+/// Chrome on Windows 10.
 pub fn chrome_148_windows() -> StealthProfile {
     StealthProfile {
         enforce_csp: true,
-        user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36".into(),
+        user_agent: chrome_desktop_ua("Windows NT 10.0; Win64; x64"),
         browser_name: "Chrome".into(),
-        browser_version: "147.0.7727.117".into(),
+        browser_version: CHROME_DESKTOP_VERSION.into(),
         os_name: "Windows".into(),
         os_version: "10.0".into(),
         platform: "Win32".into(),
         vendor: "Google Inc.".into(),
         vendor_sub: "".into(),
         product_sub: "20030107".into(),
-        app_version: "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36".into(),
+        app_version: chrome_desktop_ua("Windows NT 10.0; Win64; x64")["Mozilla/".len()..].into(),
 
         screen_width: 1920,
         screen_height: 1080,
@@ -62,11 +72,14 @@ pub fn chrome_148_windows() -> StealthProfile {
         max_touch_points: 0,
 
         webgl_vendor: "Google Inc. (NVIDIA)".into(),
-        webgl_renderer: "ANGLE (NVIDIA, NVIDIA GeForce RTX 3080 Direct3D11 vs_5_0 ps_5_0, D3D11)".into(),
+        webgl_renderer: "ANGLE (NVIDIA, NVIDIA GeForce RTX 3080 Direct3D11 vs_5_0 ps_5_0, D3D11)"
+            .into(),
 
         language: "en-US".into(),
         languages: vec!["en-US".into(), "en".into()],
         timezone: "America/New_York".into(),
+        latitude: None,
+        longitude: None,
 
         cpu_architecture: "x86".into(),
         cpu_bitness: "64".into(),
@@ -75,7 +88,7 @@ pub fn chrome_148_windows() -> StealthProfile {
         ua_wow64: false,
 
         device_class: DeviceClass::Desktop,
-        tls_impersonate: "chrome_147".into(),
+        tls_impersonate: CHROME_DESKTOP_TLS.into(),
         connection_effective_type: "4g".into(),
         connection_rtt: 50,
         connection_downlink: 10.0,
@@ -108,29 +121,30 @@ pub fn chrome_148_windows() -> StealthProfile {
     }
 }
 
-/// Chrome 147 desktop contract on macOS 15.
+/// Chrome desktop contract on macOS 15.
 ///
-/// **CRITICAL**: navigator.userAgent reports `Chrome/147.0.0.0` (FROZEN minor versions
+/// **CRITICAL**: navigator.userAgent reports `Chrome/<major>.0.0.0` (FROZEN minor versions
 /// per Chrome's User-Agent reduction since March 2023 / Chrome 110+). The full version
-/// `147.0.7727.117` is ONLY exposed via sec-ch-ua-full-version-list. Sending the full
+/// is ONLY exposed via sec-ch-ua-full-version-list. Sending the full
 /// version in the UA string is a divergence from real Chrome behavior — confirmed by
 /// comparing real-browser header captures against our pipeline.
 pub fn chrome_148_macos() -> StealthProfile {
     StealthProfile {
         enforce_csp: true,
-        user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36".into(),
+        user_agent: chrome_desktop_ua("Macintosh; Intel Mac OS X 10_15_7"),
         browser_name: "Chrome".into(),
         // browser_version stores the FULL version — used by sec-ch-ua-full-version-list
         // and by build_sec_ch_ua's major-version split. The UA string above uses
-        // the reduced 147.0.0.0 form per Chrome's UA-reduction policy.
-        browser_version: "147.0.7727.117".into(),
+        // the reduced <major>.0.0.0 form per Chrome's UA-reduction policy.
+        browser_version: CHROME_DESKTOP_VERSION.into(),
         os_name: "macOS".into(),
         os_version: "15.2".into(),
         platform: "MacIntel".into(),
         vendor: "Google Inc.".into(),
         vendor_sub: "".into(),
         product_sub: "20030107".into(),
-        app_version: "5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36".into(),
+        app_version: chrome_desktop_ua("Macintosh; Intel Mac OS X 10_15_7")["Mozilla/".len()..]
+            .into(),
 
         // Phase 7 — match real Chrome 147 on macOS arm64 (M3 MacBook Pro):
         // 1512x982 viewport, availHeight 949 (982 - 33 top), colorDepth 30,
@@ -152,6 +166,8 @@ pub fn chrome_148_macos() -> StealthProfile {
         language: "en-US".into(),
         languages: vec!["en-US".into(), "en".into()],
         timezone: "America/Los_Angeles".into(),
+        latitude: None,
+        longitude: None,
 
         cpu_architecture: "arm".into(),
         cpu_bitness: "64".into(),
@@ -160,7 +176,7 @@ pub fn chrome_148_macos() -> StealthProfile {
         ua_wow64: false,
 
         device_class: DeviceClass::Desktop,
-        tls_impersonate: "chrome_147".into(),
+        tls_impersonate: CHROME_DESKTOP_TLS.into(),
         connection_effective_type: "4g".into(),
         connection_rtt: 50,
         connection_downlink: 10.0,
@@ -201,16 +217,16 @@ pub fn chrome_148_macos() -> StealthProfile {
 pub fn chrome_148_linux() -> StealthProfile {
     StealthProfile {
         enforce_csp: true,
-        user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36".into(),
+        user_agent: chrome_desktop_ua("X11; Linux x86_64"),
         browser_name: "Chrome".into(),
-        browser_version: "147.0.7727.117".into(),
+        browser_version: CHROME_DESKTOP_VERSION.into(),
         os_name: "Linux".into(),
         os_version: "6.1".into(),
         platform: "Linux x86_64".into(),
         vendor: "Google Inc.".into(),
         vendor_sub: "".into(),
         product_sub: "20030107".into(),
-        app_version: "5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36".into(),
+        app_version: chrome_desktop_ua("X11; Linux x86_64")["Mozilla/".len()..].into(),
 
         screen_width: 1920,
         screen_height: 1080,
@@ -224,11 +240,14 @@ pub fn chrome_148_linux() -> StealthProfile {
         max_touch_points: 0,
 
         webgl_vendor: "Google Inc. (Intel)".into(),
-        webgl_renderer: "ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.6)".into(),
+        webgl_renderer: "ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.6)"
+            .into(),
 
         language: "en-US".into(),
         languages: vec!["en-US".into(), "en".into()],
         timezone: "America/Chicago".into(),
+        latitude: None,
+        longitude: None,
 
         cpu_architecture: "x86".into(),
         cpu_bitness: "64".into(),
@@ -237,7 +256,7 @@ pub fn chrome_148_linux() -> StealthProfile {
         ua_wow64: false,
 
         device_class: DeviceClass::Desktop,
-        tls_impersonate: "chrome_147".into(),
+        tls_impersonate: CHROME_DESKTOP_TLS.into(),
         connection_effective_type: "4g".into(),
         connection_rtt: 50,
         connection_downlink: 10.0,
@@ -275,44 +294,61 @@ pub fn chrome_148_linux() -> StealthProfile {
 pub fn chrome_148_ru() -> StealthProfile {
     StealthProfile {
         enforce_csp: true,
-        user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36".into(),
+        user_agent: chrome_desktop_ua("Windows NT 10.0; Win64; x64"),
         browser_name: "Chrome".into(),
-        browser_version: "147.0.7727.117".into(),
+        browser_version: CHROME_DESKTOP_VERSION.into(),
         os_name: "Windows".into(),
         os_version: "10.0".into(),
         platform: "Win32".into(),
         vendor: "Google Inc.".into(),
         vendor_sub: "".into(),
         product_sub: "20030107".into(),
-        app_version: "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36".into(),
-        screen_width: 1920, screen_height: 1080,
-        screen_avail_width: 1920, screen_avail_height: 1040,
+        app_version: chrome_desktop_ua("Windows NT 10.0; Win64; x64")["Mozilla/".len()..].into(),
+        screen_width: 1920,
+        screen_height: 1080,
+        screen_avail_width: 1920,
+        screen_avail_height: 1040,
         screen_avail_top: 0,
-        screen_color_depth: 24, device_pixel_ratio: 1.0,
-        cpu_cores: 8, device_memory: 8, max_touch_points: 0,
+        screen_color_depth: 24,
+        device_pixel_ratio: 1.0,
+        cpu_cores: 8,
+        device_memory: 8,
+        max_touch_points: 0,
         webgl_vendor: "Google Inc. (NVIDIA)".into(),
-        webgl_renderer: "ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)".into(),
+        webgl_renderer:
+            "ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)".into(),
         language: "ru-RU".into(),
         languages: vec!["ru-RU".into(), "ru".into(), "en-US".into(), "en".into()],
         timezone: "Europe/Moscow".into(),
+        latitude: None,
+        longitude: None,
         cpu_architecture: "x86".into(),
         cpu_bitness: "64".into(),
         platform_version: "15.0.0".into(),
         ua_model: "".into(),
         ua_wow64: false,
         device_class: DeviceClass::Desktop,
-        tls_impersonate: "chrome_147".into(),
+        tls_impersonate: CHROME_DESKTOP_TLS.into(),
         connection_effective_type: "4g".into(),
-        connection_rtt: 100, connection_downlink: 8.0,
-        pdf_viewer_enabled: true, plugins_count: 5, mime_types_count: 2,
-        canvas_seed: 0xaaaa_bbbb_cccc_dddd, audio_seed: 0xdddd_cccc_bbbb_aaaa,
+        connection_rtt: 100,
+        connection_downlink: 8.0,
+        pdf_viewer_enabled: true,
+        plugins_count: 5,
+        mime_types_count: 2,
+        canvas_seed: 0xaaaa_bbbb_cccc_dddd,
+        audio_seed: 0xdddd_cccc_bbbb_aaaa,
         audio_sample_rate: 44100,
-        has_platform_authenticator: true, conditional_mediation: true, allow_http3: false,
+        has_platform_authenticator: true,
+        conditional_mediation: true,
+        allow_http3: false,
         prefers_color_scheme: "dark".into(),
         color_gamut: "srgb".into(),
-        pointer_type: "fine".into(), hover_capability: "hover".into(),
-        inner_width: 1920, inner_height: 969,
-        outer_width: 1920, outer_height: 1040,
+        pointer_type: "fine".into(),
+        hover_capability: "hover".into(),
+        inner_width: 1920,
+        inner_height: 969,
+        outer_width: 1920,
+        outer_height: 1040,
         proxy: None,
         media_devices: default_media_devices("ru"),
         gpu_profile: crate::stealth::gpu::nvidia_rtx_3060_windows(),
@@ -323,44 +359,61 @@ pub fn chrome_148_ru() -> StealthProfile {
 pub fn chrome_148_cn() -> StealthProfile {
     StealthProfile {
         enforce_csp: true,
-        user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36".into(),
+        user_agent: chrome_desktop_ua("Windows NT 10.0; Win64; x64"),
         browser_name: "Chrome".into(),
-        browser_version: "147.0.7727.117".into(),
+        browser_version: CHROME_DESKTOP_VERSION.into(),
         os_name: "Windows".into(),
         os_version: "10.0".into(),
         platform: "Win32".into(),
         vendor: "Google Inc.".into(),
         vendor_sub: "".into(),
         product_sub: "20030107".into(),
-        app_version: "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36".into(),
-        screen_width: 1920, screen_height: 1080,
-        screen_avail_width: 1920, screen_avail_height: 1040,
+        app_version: chrome_desktop_ua("Windows NT 10.0; Win64; x64")["Mozilla/".len()..].into(),
+        screen_width: 1920,
+        screen_height: 1080,
+        screen_avail_width: 1920,
+        screen_avail_height: 1040,
         screen_avail_top: 0,
-        screen_color_depth: 24, device_pixel_ratio: 1.25,
-        cpu_cores: 12, device_memory: 16, max_touch_points: 0,
+        screen_color_depth: 24,
+        device_pixel_ratio: 1.25,
+        cpu_cores: 12,
+        device_memory: 16,
+        max_touch_points: 0,
         webgl_vendor: "Google Inc. (NVIDIA)".into(),
-        webgl_renderer: "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)".into(),
+        webgl_renderer: "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)"
+            .into(),
         language: "zh-CN".into(),
         languages: vec!["zh-CN".into(), "zh".into(), "en-US".into(), "en".into()],
         timezone: "Asia/Shanghai".into(),
+        latitude: None,
+        longitude: None,
         cpu_architecture: "x86".into(),
         cpu_bitness: "64".into(),
         platform_version: "15.0.0".into(),
         ua_model: "".into(),
         ua_wow64: false,
         device_class: DeviceClass::Desktop,
-        tls_impersonate: "chrome_147".into(),
+        tls_impersonate: CHROME_DESKTOP_TLS.into(),
         connection_effective_type: "4g".into(),
-        connection_rtt: 150, connection_downlink: 6.0,
-        pdf_viewer_enabled: true, plugins_count: 5, mime_types_count: 2,
-        canvas_seed: 0x1122_3344_5566_7788, audio_seed: 0x8877_6655_4433_2211,
+        connection_rtt: 150,
+        connection_downlink: 6.0,
+        pdf_viewer_enabled: true,
+        plugins_count: 5,
+        mime_types_count: 2,
+        canvas_seed: 0x1122_3344_5566_7788,
+        audio_seed: 0x8877_6655_4433_2211,
         audio_sample_rate: 44100,
-        has_platform_authenticator: true, conditional_mediation: true, allow_http3: false,
+        has_platform_authenticator: true,
+        conditional_mediation: true,
+        allow_http3: false,
         prefers_color_scheme: "dark".into(),
         color_gamut: "srgb".into(),
-        pointer_type: "fine".into(), hover_capability: "hover".into(),
-        inner_width: 1920, inner_height: 969,
-        outer_width: 1920, outer_height: 1040,
+        pointer_type: "fine".into(),
+        hover_capability: "hover".into(),
+        inner_width: 1920,
+        inner_height: 969,
+        outer_width: 1920,
+        outer_height: 1040,
         proxy: None,
         media_devices: default_media_devices("cn"),
         gpu_profile: crate::stealth::gpu::nvidia_rtx_3060_windows(),
@@ -449,6 +502,8 @@ pub fn firefox_135_macos() -> StealthProfile {
         language: "en-US".into(),
         languages: vec!["en-US".into(), "en".into()],
         timezone: "America/Los_Angeles".into(),
+        latitude: None,
+        longitude: None,
 
         cpu_architecture: "arm".into(),
         cpu_bitness: "64".into(),
@@ -531,6 +586,8 @@ pub fn firefox_135_windows() -> StealthProfile {
         language: "en-US".into(),
         languages: vec!["en-US".into(), "en".into()],
         timezone: "America/New_York".into(),
+        latitude: None,
+        longitude: None,
 
         cpu_architecture: "x86".into(),
         cpu_bitness: "64".into(),
@@ -604,6 +661,8 @@ pub fn firefox_135_linux() -> StealthProfile {
         language: "en-US".into(),
         languages: vec!["en-US".into(), "en".into()],
         timezone: "America/Chicago".into(),
+        latitude: None,
+        longitude: None,
 
         cpu_architecture: "x86".into(),
         cpu_bitness: "64".into(),
@@ -1064,6 +1123,8 @@ pub fn pixel_9_pro_chrome_148() -> StealthProfile {
         language: "en-US".into(),
         languages: vec!["en-US".into(), "en".into()],
         timezone: "America/Los_Angeles".into(),
+        latitude: None,
+        longitude: None,
 
         // Empty cpu_architecture on Android per UA reduction
         cpu_architecture: "".into(),
@@ -1173,6 +1234,8 @@ pub fn iphone_15_pro_safari_18() -> StealthProfile {
         language: "en-US".into(),
         languages: vec!["en-US".into(), "en".into()],
         timezone: "America/Los_Angeles".into(),
+        latitude: None,
+        longitude: None,
 
         // Safari does not send Sec-CH-UA-* at all; these fields are unused
         // for iOS profiles but kept non-empty for serde compatibility.
@@ -1347,8 +1410,9 @@ mod tests {
         let profile = chrome_148_windows();
         // Chrome UA-reduction freezes minor versions to 0; only major is in the UA string.
         // Full version lives in browser_version for sec-ch-ua-full-version-list.
-        assert!(profile.user_agent.contains("147.0.0.0"));
-        assert_eq!(profile.browser_version, "147.0.7727.117");
+        assert!(profile.user_agent.contains("Chrome/153.0.0.0 "));
+        assert_eq!(profile.browser_version, CHROME_DESKTOP_VERSION);
+        assert_eq!(profile.app_version, &profile.user_agent["Mozilla/".len()..]);
     }
 
     #[test]
@@ -1389,8 +1453,13 @@ mod tests {
             assert_eq!(p.audio_sample_rate, 48000);
             assert_eq!(p.cpu_architecture, "arm");
             assert_eq!(p.platform, "MacIntel");
-            // Arithmetic consistency: inner_height = screen_height - 111 (Chrome chrome).
-            assert_eq!(p.inner_height + 111, p.screen_height);
+            // Arithmetic consistency: the viewport is the *available* area
+            // minus Chrome's own UI (111 px), not the whole screen — a
+            // maximised macOS window never covers the menu bar strip, which
+            // is exactly what the sampler documents. Asserting against
+            // `screen_height` encoded the pre-fix behaviour and failed by
+            // the menu-bar height on every sample.
+            assert_eq!(p.inner_height + 111, p.screen_avail_height);
         }
     }
 

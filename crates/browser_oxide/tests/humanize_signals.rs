@@ -67,7 +67,7 @@ async fn humanize_motion_has_finite_alias_coordinates() {
         .unwrap();
     let _ = page
         .evaluate_async(
-            r#"(async()=>{let ns=null;for(const s of Object.getOwnPropertySymbols(globalThis)){const v=globalThis[s];if(v&&v.__bo){ns=v;break}}if(!ns||!ns.input)throw Error('no input');await ns.input.moveTo(320,200)})()"#,
+            r#"(async()=>{let ns=null;for(const s of Object.getOwnPropertySymbols(globalThis,1)){const v=globalThis[s];if(v&&v.__bo){ns=v;break}}if(!ns||!ns.input)throw Error('no input');await ns.input.moveTo(320,200)})()"#,
             std::time::Duration::from_secs(2),
         )
         .await;
@@ -192,6 +192,18 @@ async fn humanize_mouse_intervals_are_right_skewed() {
         .unwrap();
     let humanize = include_str!("../src/js/humanize.js");
     page.evaluate(humanize).unwrap();
+
+    // Idle cursor motion is opt-in: humanize used to start a cycle on load and
+    // repeat it every ~7 s, which could drop an ambient `mousemove` between a
+    // driver's own mousedown and mouseup. A driver that wants the idle stream
+    // asks for it, and so does this test.
+    page.evaluate(
+        "(() => { const ns = (function () { const s = Object.getOwnPropertySymbols(globalThis, 1); \
+          for (let i = 0; i < s.length; i++) { const v = globalThis[s[i]]; if (v && v.__bo) return v; } \
+          return null; })(); \
+          ns.input.setAmbient(true); return 'on'; })()",
+    )
+    .unwrap();
 
     // humanize schedules its mouse stroke on *background* (unref'd) timers so
     // it doesn't pin `run_until_idle` open on benign pages (humanize.js:73 →

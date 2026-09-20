@@ -7,7 +7,12 @@ use browser_oxide::Page;
 use std::time::Duration;
 
 fn html(body: &str) -> String {
-    format!("<html><head></head><body>{}</body></html>", body)
+    // With a doctype, so `document.compatMode` is CSS1Compat and layout runs in
+    // standards mode — these are conformance tests for a normally-served page.
+    format!(
+        "<!DOCTYPE html><html><head></head><body>{}</body></html>",
+        body
+    )
 }
 
 async fn eval(js: &str) -> String {

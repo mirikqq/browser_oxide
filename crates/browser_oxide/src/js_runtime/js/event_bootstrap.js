@@ -1,11 +1,11 @@
 ((globalThis) => {
     // Looked up once at module load — dom_bootstrap.js runs first and has
     // already installed it — rather than scanning
-    // `Object.getOwnPropertySymbols(globalThis)` on every single dispatch,
+    // `Object.getOwnPropertySymbols(globalThis, 1)` on every single dispatch,
     // which `_dispatchEvent` is.
     const _boNs = (function () {
         try {
-            const syms = Object.getOwnPropertySymbols(globalThis);
+            const syms = Object.getOwnPropertySymbols(globalThis, 1);
             for (let i = 0; i < syms.length; i++) {
                 const v = globalThis[syms[i]];
                 if (v && v.__bo) return v;
@@ -13,13 +13,19 @@
         } catch (_e) { /* ignore */ }
         return null;
     })();
+    const _idl = (_boNs && _boNs.idl) || {
+        own: (obj) => obj,
+        read: () => undefined,
+        fields: () => {},
+    };
 
     // ---- Trusted-event authenticity (v0.1.0 behavioral E1) ----------------
     // `isTrusted` MUST be both unforgeable and shaped like a real browser's:
-    //   * a GETTER on Event.prototype — NOT an own data property. Scripts
-    //     that read `getOwnPropertyDescriptor(evt,'isTrusted')` can flag an
-    //     own-data `isTrusted` as synthetic (real browsers expose it via
-    //     the prototype).
+    //   * an own, non-configurable GETTER on every event instance — NOT a data
+    //     property and not a member of Event.prototype. Chrome 153 reports
+    //     {get: f, set: undefined, enumerable: true, configurable: false} on
+    //     the instance, and `Event.prototype` carries no `isTrusted` at all
+    //     ([LegacyUnforgeable] in the IDL).
     //   * backed by a MODULE-PRIVATE WeakSet that page JS cannot reach. The
     //     old design keyed trust off `Symbol.for('__bo_trusted__')` — the
     //     GLOBAL symbol registry — so any page could re-derive the symbol and
@@ -33,37 +39,75 @@
         return ev;
     };
 
+    const _isTrustedGetter = (() => {
+        const get = function () { return _trustedEvents.has(this); };
+        return (typeof _maskFunction === 'function')
+            ? _maskFunction(get, 'get isTrusted') : get;
+    })();
+
+    // Chrome keeps every event attribute on the prototype as an accessor and
+    // leaves the instance without own properties; ours were plain instance data
+    // properties, which a surface diff sees immediately. The state lives in a
+    // WeakMap now and `_evFields` installs the IDL accessors.
+    const _evStates = new WeakMap();
+    const _evOwn = (ev) => {
+        let st = _evStates.get(ev);
+        if (!st) _evStates.set(ev, (st = { __proto__: null }));
+        return st;
+    };
+    const _evGet = (ev, name, fallback) => {
+        const st = _evStates.get(ev);
+        return st && name in st ? st[name] : fallback;
+    };
+    const _evFields = (proto, names) => {
+        for (const name of names) {
+            if (Object.prototype.hasOwnProperty.call(proto, name)) continue;
+            const get = Object.getOwnPropertyDescriptor({
+                get [name]() { return _evGet(this, name, undefined); },
+            }, name).get;
+            if (typeof _maskFunction === 'function') _maskFunction(get, 'get ' + name);
+            Object.defineProperty(proto, name, { get, enumerable: true, configurable: true });
+        }
+    };
+
     class Event {
         constructor(type, options = {}) {
-            this.type = type;
-            this.bubbles = !!options.bubbles;
-            this.cancelable = !!options.cancelable;
-            this.composed = !!options.composed;
-            this.defaultPrevented = false;
-            this.target = null;
-            this.currentTarget = null;
-            this.eventPhase = 0;
-            // NOTE: `isTrusted` is intentionally NOT set here. It is a prototype
-            // getter (installed below) reading the private WeakSet — default
-            // false for page-constructed events; trusted only when our
-            // privileged dispatch path calls `_markTrusted(ev)`.
-            this.timeStamp = performance.now();
-            this._stopped = false;
-            this._stoppedImmediate = false;
+            const _st = _evOwn(this);
+            _st.type = String(type);
+            _st.bubbles = !!options.bubbles;
+            _st.cancelable = !!options.cancelable;
+            _st.composed = !!options.composed;
+            _st.defaultPrevented = false;
+            _st.target = null;
+            _st.currentTarget = null;
+            _st.eventPhase = 0;
+            // `isTrusted` reads the private WeakSet — false for page-constructed
+            // events, true only when our privileged dispatch path calls
+            // `_markTrusted(ev)`.
+            Object.defineProperty(this, 'isTrusted', {
+                get: _isTrustedGetter, enumerable: true, configurable: false,
+            });
+            _st.timeStamp = performance.now();
+            _st._stopped = false;
+            _st._stoppedImmediate = false;
         }
         preventDefault() {
-            if (this.cancelable) this.defaultPrevented = true;
+            const _st = _evOwn(this);
+            if (this.cancelable) _st.defaultPrevented = true;
         }
         /// Legacy initialiser, still used by plenty of shipped code — including
         /// hCaptcha's own error path, which threw `initEvent is not a function`
         /// and in doing so swallowed whatever error it was reporting.
         initEvent(type, bubbles, cancelable) {
-            this.type = String(type);
-            this.bubbles = !!bubbles;
-            this.cancelable = !!cancelable;
+            const _st = _evOwn(this);
+            _st.type = String(type);
+            _st.bubbles = !!bubbles;
+            _st.cancelable = !!cancelable;
         }
-        stopPropagation() { this._stopped = true; }
-        stopImmediatePropagation() { this._stopped = true; this._stoppedImmediate = true; }
+        stopPropagation() {
+            const _st = _evOwn(this); _st._stopped = true; }
+        stopImmediatePropagation() {
+            const _st = _evOwn(this); _st._stopped = true; _st._stoppedImmediate = true; }
         composedPath() {
             const path = [];
             let node = this.target;
@@ -82,45 +126,52 @@
         static AT_TARGET = 2;
         static BUBBLING_PHASE = 3;
     }
+    _evFields(Event.prototype, ["bubbles", "cancelable", "composed", "currentTarget", "defaultPrevented", "eventPhase", "target", "timeStamp", "type"]);
 
-    // isTrusted as an inherited, native-masked prototype accessor backed by the
-    // private WeakSet. Subclasses (CustomEvent, MouseEvent, …) inherit it. The
-    // descriptor shape matches real Chrome: {get: ƒ, set: undefined,
-    // enumerable: true, configurable: true}.
-    Object.defineProperty(Event.prototype, 'isTrusted', {
-        configurable: true,
-        enumerable: true,
-        get: (typeof _maskFunction === 'function')
-            ? _maskFunction(function () { return _trustedEvents.has(this); }, 'get isTrusted')
-            : function () { return _trustedEvents.has(this); },
-    });
 
     class CustomEvent extends Event {
         constructor(type, options = {}) {
             super(type, options);
-            this.detail = options.detail !== undefined ? options.detail : null;
+            const _st = _evOwn(this);
+            _st.detail = options.detail !== undefined ? options.detail : null;
         }
         initCustomEvent(type, bubbles, cancelable, detail) {
-            this.type = type;
-            this.bubbles = bubbles;
-            this.cancelable = cancelable;
-            this.detail = detail;
+            const _st = _evOwn(this);
+            _st.type = type;
+            _st.bubbles = bubbles;
+            _st.cancelable = cancelable;
+            _st.detail = detail;
         }
     }
+    _evFields(CustomEvent.prototype, ["detail"]);
+
+    // `which` lives on UIEvent.prototype in Chrome, never on the subclasses;
+    // a legacy `which` passed through an init dict is remembered here.
+    const _whichSlot = new WeakMap();
 
     // --- UI Event hierarchy ---
     class UIEvent extends Event {
         initUIEvent(type, bubbles, cancelable, view, detail) {
+            const _st = _evOwn(this);
             this.initEvent(type, bubbles, cancelable);
-            this.view = view || null;
-            this.detail = detail || 0;
+            _st.view = view || null;
+            _st.detail = detail || 0;
+        }
+        get which() {
+            const forced = _whichSlot.get(this);
+            if (forced !== undefined) return forced;
+            if (typeof this.keyCode === "number") return this.keyCode;
+            return typeof this.button === "number" ? this.button + 1 : 0;
         }
         constructor(type, options = {}) {
             super(type, options);
-            this.view = options.view || globalThis;
-            this.detail = options.detail || 0;
+            const _st = _evOwn(this);
+            _st.view = options.view || globalThis;
+            _st.detail = options.detail || 0;
+            if (options.which != null) _whichSlot.set(this, options.which | 0);
         }
     }
+    _evFields(UIEvent.prototype, ["detail", "view"]);
 
     // Offset of an event's point inside its target's box.
     const _mouseOffset = (ev, horizontal) => {
@@ -138,21 +189,22 @@
     class MouseEvent extends UIEvent {
         constructor(type, options = {}) {
             super(type, { bubbles: true, cancelable: true, ...options });
-            this.screenX = options.screenX || 0;
-            this.screenY = options.screenY || 0;
-            this.clientX = options.clientX || 0;
-            this.clientY = options.clientY || 0;
-            this.pageX = options.pageX || this.clientX;
-            this.pageY = options.pageY || this.clientY;
-            this.button = options.button || 0;
-            this.buttons = options.buttons || 0;
-            this.ctrlKey = !!options.ctrlKey;
-            this.shiftKey = !!options.shiftKey;
-            this.altKey = !!options.altKey;
-            this.metaKey = !!options.metaKey;
-            this.relatedTarget = options.relatedTarget || null;
-            this.movementX = options.movementX || 0;
-            this.movementY = options.movementY || 0;
+            const _st = _evOwn(this);
+            _st.screenX = options.screenX || 0;
+            _st.screenY = options.screenY || 0;
+            _st.clientX = options.clientX || 0;
+            _st.clientY = options.clientY || 0;
+            _st.pageX = options.pageX || this.clientX;
+            _st.pageY = options.pageY || this.clientY;
+            _st.button = options.button || 0;
+            _st.buttons = options.buttons || 0;
+            _st.ctrlKey = !!options.ctrlKey;
+            _st.shiftKey = !!options.shiftKey;
+            _st.altKey = !!options.altKey;
+            _st.metaKey = !!options.metaKey;
+            _st.relatedTarget = options.relatedTarget || null;
+            _st.movementX = options.movementX || 0;
+            _st.movementY = options.movementY || 0;
         }
         // `offsetX`/`offsetY` are not init members — Chrome computes them from
         // the event's target when they are read, and they are accessors on the
@@ -175,77 +227,85 @@
         // and they are what code falling back from `offsetX` expects to find.
         get layerX() { return this.pageX; }
         get layerY() { return this.pageY; }
-        get which() { return this.button + 1; }
         initMouseEvent(type, bubbles, cancelable, view, detail, screenX, screenY,
                        clientX, clientY, ctrlKey, altKey, shiftKey, metaKey,
                        button, relatedTarget) {
+            const _st = _evOwn(this);
             this.initUIEvent(type, bubbles, cancelable, view, detail);
-            this.screenX = screenX || 0;
-            this.screenY = screenY || 0;
-            this.clientX = clientX || 0;
-            this.clientY = clientY || 0;
-            this.ctrlKey = !!ctrlKey;
-            this.altKey = !!altKey;
-            this.shiftKey = !!shiftKey;
-            this.metaKey = !!metaKey;
-            this.button = button || 0;
-            this.relatedTarget = relatedTarget || null;
+            _st.screenX = screenX || 0;
+            _st.screenY = screenY || 0;
+            _st.clientX = clientX || 0;
+            _st.clientY = clientY || 0;
+            _st.ctrlKey = !!ctrlKey;
+            _st.altKey = !!altKey;
+            _st.shiftKey = !!shiftKey;
+            _st.metaKey = !!metaKey;
+            _st.button = button || 0;
+            _st.relatedTarget = relatedTarget || null;
         }
         getModifierState(key) { return false; }
     }
+    _evFields(MouseEvent.prototype, ["altKey", "button", "buttons", "clientX", "clientY", "ctrlKey", "metaKey", "movementX", "movementY", "pageX", "pageY", "relatedTarget", "screenX", "screenY", "shiftKey"]);
 
     class KeyboardEvent extends UIEvent {
         constructor(type, options = {}) {
             super(type, { bubbles: true, cancelable: true, ...options });
-            this.key = options.key || "";
-            this.code = options.code || "";
-            this.keyCode = options.keyCode || 0;
-            this.charCode = options.charCode || 0;
-            this.which = options.which || options.keyCode || 0;
-            this.ctrlKey = !!options.ctrlKey;
-            this.shiftKey = !!options.shiftKey;
-            this.altKey = !!options.altKey;
-            this.metaKey = !!options.metaKey;
-            this.repeat = !!options.repeat;
-            this.isComposing = !!options.isComposing;
-            this.location = options.location || 0;
+            const _st = _evOwn(this);
+            _st.key = options.key || "";
+            _st.code = options.code || "";
+            _st.keyCode = options.keyCode || 0;
+            _st.charCode = options.charCode || 0;
+            _whichSlot.set(this, options.which || options.keyCode || 0);
+            _st.ctrlKey = !!options.ctrlKey;
+            _st.shiftKey = !!options.shiftKey;
+            _st.altKey = !!options.altKey;
+            _st.metaKey = !!options.metaKey;
+            _st.repeat = !!options.repeat;
+            _st.isComposing = !!options.isComposing;
+            _st.location = options.location || 0;
         }
         getModifierState(key) { return false; }
     }
+    _evFields(KeyboardEvent.prototype, ["altKey", "charCode", "code", "ctrlKey", "isComposing", "key", "keyCode", "location", "metaKey", "repeat", "shiftKey"]);
 
     class InputEvent extends UIEvent {
         constructor(type, options = {}) {
             super(type, { bubbles: true, cancelable: false, ...options });
-            this.data = options.data || null;
-            this.inputType = options.inputType || "";
-            this.isComposing = !!options.isComposing;
+            const _st = _evOwn(this);
+            _st.data = options.data || null;
+            _st.inputType = options.inputType || "";
+            _st.isComposing = !!options.isComposing;
         }
     }
+    _evFields(InputEvent.prototype, ["data", "inputType", "isComposing"]);
 
     class FocusEvent extends UIEvent {
         constructor(type, options = {}) {
             super(type, options);
-            this.relatedTarget = options.relatedTarget || null;
+            const _st = _evOwn(this);
+            _st.relatedTarget = options.relatedTarget || null;
         }
     }
+    _evFields(FocusEvent.prototype, ["relatedTarget"]);
 
     class PointerEvent extends MouseEvent {
         constructor(type, options = {}) {
             super(type, options);
-            this.pointerId = options.pointerId || 0;
-            this.width = options.width || 1;
-            this.height = options.height || 1;
-            this.pressure = options.pressure || 0;
-            this.tangentialPressure = options.tangentialPressure || 0;
-            this.tiltX = options.tiltX || 0;
-            this.tiltY = options.tiltY || 0;
-            this.twist = options.twist || 0;
-            this.pointerType = options.pointerType || "mouse";
-            this.isPrimary = options.isPrimary !== undefined ? options.isPrimary : true;
-            this.altitudeAngle = options.altitudeAngle !== undefined
+            const _st = _evOwn(this);
+            _st.pointerId = options.pointerId || 0;
+            _st.width = options.width || 1;
+            _st.height = options.height || 1;
+            _st.pressure = options.pressure || 0;
+            _st.tangentialPressure = options.tangentialPressure || 0;
+            _st.tiltX = options.tiltX || 0;
+            _st.tiltY = options.tiltY || 0;
+            _st.twist = options.twist || 0;
+            _st.pointerType = options.pointerType || "mouse";
+            _st.isPrimary = options.isPrimary !== undefined ? options.isPrimary : true;
+            _st.altitudeAngle = options.altitudeAngle !== undefined
                 ? options.altitudeAngle : Math.PI / 2;
-            this.azimuthAngle = options.azimuthAngle || 0;
-            this.persistentDeviceId = options.persistentDeviceId || 0;
+            _st.azimuthAngle = options.azimuthAngle || 0;
+            _st.persistentDeviceId = options.persistentDeviceId || 0;
         }
         // Dispatched events carry no coalesced or predicted samples, which is
         // also what Chrome reports for one it did not coalesce. Missing entirely,
@@ -254,135 +314,168 @@
         getCoalescedEvents() { return [this]; }
         getPredictedEvents() { return []; }
     }
+    _evFields(PointerEvent.prototype, ["altitudeAngle", "azimuthAngle", "height", "isPrimary", "persistentDeviceId", "pointerId", "pointerType", "pressure", "tangentialPressure", "tiltX", "tiltY", "twist", "width"]);
 
     class WheelEvent extends MouseEvent {
         constructor(type, options = {}) {
             super(type, options);
-            this.deltaX = options.deltaX || 0;
-            this.deltaY = options.deltaY || 0;
-            this.deltaZ = options.deltaZ || 0;
-            this.deltaMode = options.deltaMode || 0;
+            const _st = _evOwn(this);
+            _st.deltaX = options.deltaX || 0;
+            _st.deltaY = options.deltaY || 0;
+            _st.deltaZ = options.deltaZ || 0;
+            _st.deltaMode = options.deltaMode || 0;
         }
         static DOM_DELTA_PIXEL = 0;
         static DOM_DELTA_LINE = 1;
         static DOM_DELTA_PAGE = 2;
     }
+    _evFields(WheelEvent.prototype, ["deltaMode", "deltaX", "deltaY", "deltaZ"]);
 
     class TouchEvent extends UIEvent {
         constructor(type, options = {}) {
             super(type, { bubbles: true, cancelable: true, ...options });
-            this.touches = options.touches || [];
-            this.targetTouches = options.targetTouches || [];
-            this.changedTouches = options.changedTouches || [];
-            this.ctrlKey = !!options.ctrlKey;
-            this.shiftKey = !!options.shiftKey;
-            this.altKey = !!options.altKey;
-            this.metaKey = !!options.metaKey;
+            const _st = _evOwn(this);
+            _st.touches = options.touches || [];
+            _st.targetTouches = options.targetTouches || [];
+            _st.changedTouches = options.changedTouches || [];
+            _st.ctrlKey = !!options.ctrlKey;
+            _st.shiftKey = !!options.shiftKey;
+            _st.altKey = !!options.altKey;
+            _st.metaKey = !!options.metaKey;
         }
     }
+    _evFields(TouchEvent.prototype, ["altKey", "changedTouches", "ctrlKey", "metaKey", "shiftKey", "targetTouches", "touches"]);
 
     class MessageEvent extends Event {
         constructor(type, options = {}) {
             super(type, options);
-            this.data = options.data !== undefined ? options.data : null;
-            this.origin = options.origin || "";
-            this.lastEventId = options.lastEventId || "";
-            this.source = options.source || null;
-            this.ports = options.ports || [];
+            const _st = _evOwn(this);
+            _st.data = options.data !== undefined ? options.data : null;
+            _st.origin = options.origin || "";
+            _st.lastEventId = options.lastEventId || "";
+            _st.source = options.source || null;
+            _st.ports = options.ports || [];
         }
     }
+    _evFields(MessageEvent.prototype, ["data", "lastEventId", "origin", "ports", "source"]);
 
     class ErrorEvent extends Event {
         constructor(type, options = {}) {
             super(type, options);
-            this.message = options.message || "";
-            this.filename = options.filename || "";
-            this.lineno = options.lineno || 0;
-            this.colno = options.colno || 0;
-            this.error = options.error || null;
+            const _st = _evOwn(this);
+            _st.message = options.message || "";
+            _st.filename = options.filename || "";
+            _st.lineno = options.lineno || 0;
+            _st.colno = options.colno || 0;
+            _st.error = options.error || null;
         }
     }
+    _evFields(ErrorEvent.prototype, ["colno", "error", "filename", "lineno", "message"]);
 
     class ProgressEvent extends Event {
         constructor(type, options = {}) {
             super(type, options);
-            this.lengthComputable = !!options.lengthComputable;
-            this.loaded = options.loaded || 0;
-            this.total = options.total || 0;
+            const _st = _evOwn(this);
+            _st.lengthComputable = !!options.lengthComputable;
+            _st.loaded = options.loaded || 0;
+            _st.total = options.total || 0;
         }
     }
+    _evFields(ProgressEvent.prototype, ["lengthComputable", "loaded", "total"]);
 
     class AnimationEvent extends Event {
         constructor(type, options = {}) {
             super(type, { bubbles: true, ...options });
-            this.animationName = options.animationName || "";
-            this.elapsedTime = options.elapsedTime || 0;
-            this.pseudoElement = options.pseudoElement || "";
+            const _st = _evOwn(this);
+            _st.animationName = options.animationName || "";
+            _st.elapsedTime = options.elapsedTime || 0;
+            _st.pseudoElement = options.pseudoElement || "";
         }
     }
+    _evFields(AnimationEvent.prototype, ["animationName", "elapsedTime", "pseudoElement"]);
 
     class TransitionEvent extends Event {
         constructor(type, options = {}) {
             super(type, { bubbles: true, ...options });
-            this.propertyName = options.propertyName || "";
-            this.elapsedTime = options.elapsedTime || 0;
-            this.pseudoElement = options.pseudoElement || "";
+            const _st = _evOwn(this);
+            _st.propertyName = options.propertyName || "";
+            _st.elapsedTime = options.elapsedTime || 0;
+            _st.pseudoElement = options.pseudoElement || "";
         }
     }
+    _evFields(TransitionEvent.prototype, ["elapsedTime", "propertyName", "pseudoElement"]);
 
     class ClipboardEvent extends Event {
         constructor(type, options = {}) {
             super(type, { bubbles: true, cancelable: true, ...options });
-            this.clipboardData = options.clipboardData || null;
+            const _st = _evOwn(this);
+            _st.clipboardData = options.clipboardData || null;
         }
     }
+    _evFields(ClipboardEvent.prototype, ["clipboardData"]);
 
     class PopStateEvent extends Event {
         constructor(type, options = {}) {
             super(type, options);
-            this.state = options.state !== undefined ? options.state : null;
+            const _st = _evOwn(this);
+            _st.state = options.state !== undefined ? options.state : null;
         }
     }
+    _evFields(PopStateEvent.prototype, ["state"]);
 
     class HashChangeEvent extends Event {
         constructor(type, options = {}) {
             super(type, options);
-            this.oldURL = options.oldURL || "";
-            this.newURL = options.newURL || "";
+            const _st = _evOwn(this);
+            _st.oldURL = options.oldURL || "";
+            _st.newURL = options.newURL || "";
         }
     }
+    _evFields(HashChangeEvent.prototype, ["newURL", "oldURL"]);
 
     class StorageEvent extends Event {
         constructor(type, options = {}) {
             super(type, options);
-            this.key = options.key || null;
-            this.oldValue = options.oldValue || null;
-            this.newValue = options.newValue || null;
-            this.url = options.url || "";
-            this.storageArea = options.storageArea || null;
+            const _st = _evOwn(this);
+            _st.key = options.key || null;
+            _st.oldValue = options.oldValue || null;
+            _st.newValue = options.newValue || null;
+            _st.url = options.url || "";
+            _st.storageArea = options.storageArea || null;
         }
     }
+    _evFields(StorageEvent.prototype, ["key", "newValue", "oldValue", "storageArea", "url"]);
 
     class PageTransitionEvent extends Event {
         constructor(type, options = {}) {
             super(type, options);
-            this.persisted = !!options.persisted;
+            const _st = _evOwn(this);
+            _st.persisted = !!options.persisted;
         }
     }
+    _evFields(PageTransitionEvent.prototype, ["persisted"]);
 
     class BeforeUnloadEvent extends Event {
         constructor(type, options = {}) {
             super(type, { cancelable: true, ...options });
-            this.returnValue = "";
+            const _st = _evOwn(this);
+            _st.returnValue = "";
         }
     }
+    Object.defineProperty(BeforeUnloadEvent.prototype, "returnValue", {
+        get() { return _evGet(this, "returnValue", ""); },
+        set(v) { _evOwn(this).returnValue = v; },
+        enumerable: true, configurable: true,
+    });
 
     class DragEvent extends MouseEvent {
         constructor(type, options = {}) {
             super(type, options);
-            this.dataTransfer = options.dataTransfer || null;
+            const _st = _evOwn(this);
+            _st.dataTransfer = options.dataTransfer || null;
         }
     }
+    _evFields(DragEvent.prototype, ["dataTransfer"]);
 
     // --- EventTarget core logic ---
     const _nodeListeners = new Map(); // nodeId → Map<eventType, [{callback, capture, once}]>
@@ -448,21 +541,36 @@
     }
 
     const _addEventListener = function addEventListener(type, callback, options) {
+        if (callback == null) return;
         if (typeof callback !== "function" && typeof callback !== "object") return;
         const capture = typeof options === "boolean" ? options : !!(options && options.capture);
         const once = typeof options === "object" && options ? !!options.once : false;
         const passive = typeof options === "object" && options ? !!options.passive : false;
+        const signal = options && options.signal;
+        if (signal && signal.aborted) return;
         const listeners = _getListeners(this, type);
         // Prevent duplicate
         if (listeners.some(l => l.callback === callback && l.capture === capture)) return;
-        listeners.push({ callback, capture, once, passive });
+        const listener = { callback, capture, once, passive, signal, removed: false };
+        if (signal) {
+            listener.abort = () => _removeListener(listeners, listener);
+            signal.addEventListener('abort', listener.abort, { once: true });
+        }
+        listeners.push(listener);
     };
+
+    function _removeListener(listeners, listener) {
+        listener.removed = true;
+        const index = listeners.indexOf(listener);
+        if (index !== -1) listeners.splice(index, 1);
+        if (listener.signal) listener.signal.removeEventListener('abort', listener.abort);
+    }
 
     const _removeEventListener = function removeEventListener(type, callback, options) {
         const capture = typeof options === "boolean" ? options : !!(options && options.capture);
         const listeners = _getListeners(this, type);
         const idx = listeners.findIndex(l => l.callback === callback && l.capture === capture);
-        if (idx !== -1) listeners.splice(idx, 1);
+        if (idx !== -1) _removeListener(listeners, listeners[idx]);
     };
 
     // Pointer capture retargeting.
@@ -499,7 +607,7 @@
                 if (captured) dispatchTarget = captured;
             } catch (_e) { /* ignore */ }
         }
-        event.target = dispatchTarget;
+        _evOwn(event).target = dispatchTarget;
         const nodeId = _getNodeIdOrMinusOne(dispatchTarget);
 
         // Build propagation path (target → root) if it's a DOM node.
@@ -529,35 +637,35 @@
         }
 
         // Capture phase (root → target)
-        if (path.length > 0 && !event._stopped) {
+        if (path.length > 0 && !_evGet(event, '_stopped', false)) {
             for (let i = path.length - 1; i > 0; i--) {
-                event.currentTarget = path[i];
-                event.eventPhase = 1;
+                _evOwn(event).currentTarget = path[i];
+                _evOwn(event).eventPhase = 1;
                 _fireListeners(path[i], event, true);
-                if (event._stopped) break;
+                if (_evGet(event, '_stopped', false)) break;
             }
         }
 
         // Target phase
-        if (!event._stopped) {
-            event.currentTarget = dispatchTarget;
-            event.eventPhase = 2;
+        if (!_evGet(event, '_stopped', false)) {
+            _evOwn(event).currentTarget = dispatchTarget;
+            _evOwn(event).eventPhase = 2;
             _fireListeners(dispatchTarget, event, false);
             _fireListeners(dispatchTarget, event, true);
         }
 
         // Bubble phase (target → root)
-        if (path.length > 0 && !event._stopped && event.bubbles) {
+        if (path.length > 0 && !_evGet(event, '_stopped', false) && event.bubbles) {
             for (let i = 1; i < path.length; i++) {
-                event.currentTarget = path[i];
-                event.eventPhase = 3;
+                _evOwn(event).currentTarget = path[i];
+                _evOwn(event).eventPhase = 3;
                 _fireListeners(path[i], event, false);
-                if (event._stopped) break;
+                if (_evGet(event, '_stopped', false)) break;
             }
         }
 
-        event.eventPhase = 0;
-        event.currentTarget = null;
+        _evOwn(event).eventPhase = 0;
+        _evOwn(event).currentTarget = null;
 
         if (_RELEASES_CAPTURE.has(event.type)) {
             try {
@@ -632,7 +740,7 @@
 
     function _fireListeners(target, event, capturePhase) {
         // --- 1. Fire on* handler (Target phase only, not capture phase) ---
-        if (!capturePhase && !event._stoppedImmediate) {
+        if (!capturePhase && !_evGet(event, '_stoppedImmediate', false)) {
             const handlerName = `on${event.type}`;
             const handler = target[handlerName];
             if (typeof handler === "function") {
@@ -660,11 +768,11 @@
 
         // --- 2. Fire registered listeners ---
         const listeners = _getListeners(target, event.type);
-        const toRemove = [];
-        for (let i = 0; i < listeners.length; i++) {
-            const l = listeners[i];
-            if (l.capture !== capturePhase) continue;
-            if (event._stoppedImmediate) break;
+        for (const l of listeners.slice()) {
+            if (l.removed || l.capture !== capturePhase) continue;
+            if (_evGet(event, '_stoppedImmediate', false)) break;
+            // Remove before invoking: a once listener can dispatch recursively.
+            if (l.once) _removeListener(listeners, l);
             // Each listener is isolated. Letting one throw out of the loop
             // aborted the whole dispatch: every listener after it — and the rest
             // of `dispatchEvent` — was skipped, so one widget's bad handler took
@@ -679,10 +787,6 @@
             } catch (e) {
                 _reportListenerError(e, event, target, l.callback);
             }
-            if (l.once) toRemove.push(i);
-        }
-        for (let i = toRemove.length - 1; i >= 0; i--) {
-            listeners.splice(toRemove[i], 1);
         }
     }
 
@@ -727,7 +831,19 @@
     // we ensure the global aliases are correct.
     const _winProto = Object.getPrototypeOf(globalThis);
     if (_winProto && _winProto !== Object.prototype) {
-        // Just ensure they are there if not inherited.
+        if (_ET && _ET.prototype && Object.getPrototypeOf(_winProto) === Object.prototype) {
+            try {
+                if (typeof Deno.core.ops.op_dom_document_node === 'function') {
+                    const _windowProperties = Object.create(_ET.prototype);
+                    Object.defineProperty(_windowProperties, Symbol.toStringTag, {
+                        value: 'WindowProperties', configurable: true,
+                    });
+                    Object.setPrototypeOf(_winProto, _windowProperties);
+                } else {
+                    Object.setPrototypeOf(_winProto, _ET.prototype);
+                }
+            } catch (_) { /* fall back to own copies below */ }
+        }
         if (!('addEventListener' in _winProto)) {
             Object.defineProperty(_winProto, 'addEventListener', {
                 value: _addEventListener, writable: true, enumerable: true, configurable: true,
@@ -759,21 +875,23 @@
     class SecurityPolicyViolationEvent extends Event {
         constructor(type, init) {
             super(type, init || {});
+            const _st = _evOwn(this);
             const i = init || {};
-            this.blockedURI = String(i.blockedURI ?? "");
-            this.documentURI = String(i.documentURI ?? (typeof location !== 'undefined' ? location.href : ""));
-            this.referrer = String(i.referrer ?? (typeof document !== 'undefined' && document.referrer ? document.referrer : ""));
-            this.violatedDirective = String(i.violatedDirective ?? "");
-            this.effectiveDirective = String(i.effectiveDirective ?? this.violatedDirective);
-            this.originalPolicy = String(i.originalPolicy ?? "");
-            this.disposition = String(i.disposition ?? "enforce");
-            this.sample = String(i.sample ?? "");
-            this.sourceFile = String(i.sourceFile ?? "");
-            this.statusCode = +i.statusCode || 0;
-            this.lineNumber = +i.lineNumber || 0;
-            this.columnNumber = +i.columnNumber || 0;
+            _st.blockedURI = String(i.blockedURI ?? "");
+            _st.documentURI = String(i.documentURI ?? (typeof location !== 'undefined' ? location.href : ""));
+            _st.referrer = String(i.referrer ?? (typeof document !== 'undefined' && document.referrer ? document.referrer : ""));
+            _st.violatedDirective = String(i.violatedDirective ?? "");
+            _st.effectiveDirective = String(i.effectiveDirective ?? this.violatedDirective);
+            _st.originalPolicy = String(i.originalPolicy ?? "");
+            _st.disposition = String(i.disposition ?? "enforce");
+            _st.sample = String(i.sample ?? "");
+            _st.sourceFile = String(i.sourceFile ?? "");
+            _st.statusCode = +i.statusCode || 0;
+            _st.lineNumber = +i.lineNumber || 0;
+            _st.columnNumber = +i.columnNumber || 0;
         }
     }
+    _evFields(SecurityPolicyViolationEvent.prototype, ["blockedURI", "columnNumber", "disposition", "documentURI", "effectiveDirective", "lineNumber", "originalPolicy", "referrer", "sample", "sourceFile", "statusCode", "violatedDirective"]);
 
     globalThis.Event = Event;
     globalThis.CustomEvent = CustomEvent;
@@ -794,11 +912,13 @@
     class PromiseRejectionEvent extends Event {
         constructor(type, init) {
             super(type, init || {});
+            const _st = _evOwn(this);
             const i = init || {};
-            this.promise = i.promise;
-            this.reason = i.reason;
+            _st.promise = i.promise;
+            _st.reason = i.reason;
         }
     }
+    _evFields(PromiseRejectionEvent.prototype, ["promise", "reason"]);
     Object.defineProperty(PromiseRejectionEvent.prototype, Symbol.toStringTag, {
         value: "PromiseRejectionEvent", configurable: true,
     });
@@ -819,16 +939,18 @@
 
     // Privileged handoff of the trusted-event minter (behavioral E1/E2). Our
     // init scripts (humanize.js) capture this into a closure and `delete` it
-    // synchronously at their top — before any page script runs — so page JS
-    // never observes it. Non-enumerable to keep it off Object.keys scans even
-    // in the brief window before capture.
+    // synchronously at their top — before any page script runs. It lives on the
+    // engine's symbol-keyed namespace rather than a named global, so a page
+    // loaded without humanize never shows it among window's properties.
     try {
-        Object.defineProperty(globalThis, '__bo_mark_trusted', {
-            value: _markTrusted,
-            configurable: true,
-            enumerable: false,
-            writable: false,
-        });
+        if (_boNs) {
+            Object.defineProperty(_boNs, 'markTrusted', {
+                value: _markTrusted,
+                configurable: true,
+                enumerable: false,
+                writable: false,
+            });
+        }
     } catch (_) { /* ignore */ }
 
     // Timers and the host both need the uncaught-error reporter, and both run
@@ -837,7 +959,7 @@
     try {
         const _ns = (function () {
             try {
-                const syms = Object.getOwnPropertySymbols(globalThis);
+                const syms = Object.getOwnPropertySymbols(globalThis, 1);
                 for (let i = 0; i < syms.length; i++) {
                     const v = globalThis[syms[i]];
                     if (v && v.__bo) return v;
@@ -872,4 +994,297 @@
             return true;
         });
     } catch (_) { /* ignore */ }
+
+    // PerformanceObserver / PerformanceEntry / ReportingObserver
+    if (!globalThis.PerformanceObserver) {
+        globalThis.PerformanceObserver = class PerformanceObserver {
+            #cb;
+            constructor(cb) { this.#cb = cb; }
+            observe() {}
+            disconnect() {}
+            takeRecords() { return []; }
+        };
+        // Real Chrome exposes supportedEntryTypes as a static GETTER, not a
+        // data property. Fingerprinters do Object.getOwnPropertyDescriptor
+        // and a data descriptor is distinctive.
+        Object.defineProperty(globalThis.PerformanceObserver, "supportedEntryTypes", {
+            get() {
+                return ["element", "event", "first-input", "largest-contentful-paint",
+                        "layout-shift", "longtask", "mark", "measure", "navigation",
+                        "paint", "resource", "visibility-state"];
+            },
+            configurable: true,
+            enumerable: true,
+        });
+    }
+    if (!globalThis.PerformanceEntry) {
+        globalThis.PerformanceEntry = class PerformanceEntry {
+            constructor() {
+                const _st = _idl.own(this); _st.name = ""; _st.entryType = ""; _st.startTime = 0; _st.duration = 0; }
+            toJSON() { return { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration }; }
+        };
+    _idl.fields(PerformanceEntry.prototype, ["duration", "entryType", "name", "startTime"]);
+    }
+
+    if (!globalThis.ReportingObserver) {
+        globalThis.ReportingObserver = class ReportingObserver {
+            constructor() {}
+            observe() {}
+            disconnect() {}
+            takeRecords() { return []; }
+        };
+    }
+
+    if (!globalThis.BroadcastChannel) {
+        globalThis.BroadcastChannel = class BroadcastChannel extends EventTarget {
+            constructor(name) {
+                super();
+                _evOwn(this).name = String(name);
+                this.onmessage = null;
+                this.onmessageerror = null;
+            }
+            postMessage() {}
+            close() {}
+        };
+        _evFields(globalThis.BroadcastChannel.prototype, ["name"]);
+    }
+
+    // Proper MessageChannel / MessagePort
+    // implementation per HTML spec §9.4. The pre-fix no-op stub broke
+    // any worker that relays via a channel. Behavior:
+    //   - paired ports route postMessage bidirectionally
+    //   - port stays in "non-started" mode until start() / onmessage
+    //     setter / addEventListener('message') is called (HTML spec
+    //     enables-message-dispatch trigger). Messages queued before
+    //     enabling are delivered when enabled.
+    //   - close() detaches the port from its pair; further postMessage
+    //     is a silent no-op (spec: discard).
+    // Structured-clone is approximated via globalThis.structuredClone
+    // (the engine ships a real impl in structured_clone.js); falls back
+    // to identity if unavailable so tests that bypass the polyfill
+    // still see the right wiring.
+    {
+        const _PortPaired = new WeakMap();   // port → paired port
+        const _PortQueue = new WeakMap();    // port → Array<msg> queued pre-start
+        const _PortEnabled = new WeakMap();  // port → bool (start gate)
+        const _PortClosed = new WeakMap();   // port → bool
+
+        const _clone = (data) => {
+            try {
+                if (typeof globalThis.structuredClone === 'function') {
+                    return globalThis.structuredClone(data);
+                }
+            } catch (_e) {}
+            return data;
+        };
+
+        const _enable = (port) => {
+            if (_PortEnabled.get(port)) return;
+            _PortEnabled.set(port, true);
+            const q = _PortQueue.get(port);
+            if (!q || !q.length) return;
+            _PortQueue.set(port, []);
+            // Drain synchronously. HTML spec routes via the event loop;
+            // we drain inline so that `port.onmessage = fn; port.start()`
+            // sees its queued messages before control returns to the
+            // caller (deno_core's microtask drain across `execute_script`
+            // boundaries isn't reliable for this).
+            for (const msg of q) _deliver(port, msg);
+        };
+
+        // Spec: addEventListener('message', …) implicitly enables dispatch, the
+        // same as the onmessage setter. Chrome does that in C++; an override on
+        // MessagePort.prototype would be an own method Chrome does not have, so
+        // the check happens here instead — a queued port with a message
+        // listener counts as started.
+        const _hasMessageListener = (port) => {
+            const map = _objListeners.get(port);
+            const list = map && map.get('message');
+            return !!(list && list.length);
+        };
+
+        const _deliver = (port, data) => {
+            if (_PortClosed.get(port)) return;
+            if (!_PortEnabled.get(port) && _hasMessageListener(port)) _enable(port);
+            if (!_PortEnabled.get(port)) {
+                let q = _PortQueue.get(port);
+                if (!q) { q = []; _PortQueue.set(port, q); }
+                q.push(data);
+                return;
+            }
+            // Deliver as a MACROTASK, not synchronously. React 18's concurrent
+            // scheduler is built on a MessageChannel: it sets port1.onmessage =
+            // performWorkUntilDeadline and calls port2.postMessage(null) to
+            // schedule the NEXT chunk of work, REQUIRING that callback to run on
+            // a later task so it can yield between units. Synchronous re-entrant
+            // delivery (the previous behaviour) ran performWorkUntilDeadline
+            // inside postMessage — re-entering the scheduler — so the concurrent
+            // render never completed and `#root` stayed an empty shell (the
+            // thin-render gap on duolingo/douyin/adidas/ozon/wildberries). The
+            // event loop drives this timer during the nav drain, so React's
+            // render chain now runs to completion.
+            const _fire = () => {
+                if (_PortClosed.get(port)) return;
+                try {
+                    const ev = new MessageEvent('message', { data, bubbles: false, cancelable: false });
+                    // dispatchEvent fires both addEventListener handlers AND the
+                    // on-property (deno_core's EventTarget auto-promotes
+                    // `onmessage`). Calling the on-property explicitly too would
+                    // double-fire it.
+                    port.dispatchEvent(ev);
+                } catch (_e) {}
+            };
+            const _sched = globalThis.__bgSetTimeout || globalThis.setTimeout;
+            try { _sched(_fire, 0); } catch (_e) { _fire(); }
+        };
+
+        globalThis.MessagePort = class MessagePort extends EventTarget {
+            #onmessage;
+            constructor() {
+                super();
+                this.#onmessage = null;
+                this.onmessageerror = null;
+            }
+            get onmessage() { return this.#onmessage; }
+            set onmessage(fn) {
+                this.#onmessage = (typeof fn === 'function') ? fn : null;
+                // Spec: setting onmessage implicitly enables dispatch.
+                if (this.#onmessage) _enable(this);
+            }
+            postMessage(data /*, transfer */) {
+                if (_PortClosed.get(this)) return;
+                const paired = _PortPaired.get(this);
+                if (!paired) return;
+                const cloned = _clone(data);
+                // Delivery to the PAIRED port (spec semantics).
+                _deliver(paired, cloned);
+            }
+            start() { _enable(this); }
+            close() {
+                _PortClosed.set(this, true);
+                // Detach from pair so the other side stops being able
+                // to deliver to us. Pair is preserved on the other
+                // port's side so its close() still works.
+                const paired = _PortPaired.get(this);
+                if (paired) _PortPaired.delete(this);
+            }
+        };
+
+        // Re-tag the constructor + prototype methods so the universal
+        // mask sweep (cleanup_bootstrap) tags them with the right name;
+        // they are already function declarations so their identity is
+        // fine. The Symbol-tagged closures (_PortPaired et al.) live in
+        // the bootstrap IIFE scope and survive the snapshot.
+
+        globalThis.MessageChannel = class MessageChannel {
+            constructor() {
+                const _st = _evOwn(this);
+                _st.port1 = new globalThis.MessagePort();
+                _st.port2 = new globalThis.MessagePort();
+                _PortPaired.set(_st.port1, _st.port2);
+                _PortPaired.set(_st.port2, _st.port1);
+            }
+        };
+        _evFields(globalThis.MessageChannel.prototype, ["port1", "port2"]);
+    }
+
+    if (!globalThis.EventSource) {
+        globalThis.EventSource = class EventSource extends EventTarget {
+            static CONNECTING = 0;
+            static OPEN = 1;
+            static CLOSED = 2;
+            constructor(url) {
+                super();
+                const _st = _evOwn(this);
+                _st.url = String(url);
+                _st.readyState = 0;
+                _st.withCredentials = false;
+                this.onopen = null;
+                this.onmessage = null;
+                this.onerror = null;
+            }
+            close() { _evOwn(this).readyState = 2; }
+        };
+        _evFields(globalThis.EventSource.prototype, ["url", "readyState", "withCredentials"]);
+    }
+
+    // CompressionStream / DecompressionStream (Chrome 80+)
+    if (!globalThis.CompressionStream) {
+        globalThis.CompressionStream = class CompressionStream {
+            constructor() {
+                const st = _evOwn(this);
+                st.readable = new globalThis.ReadableStream();
+                st.writable = new globalThis.WritableStream();
+            }
+        };
+        _evFields(globalThis.CompressionStream.prototype, ["readable", "writable"]);
+    }
+    if (!globalThis.DecompressionStream) {
+        globalThis.DecompressionStream = class DecompressionStream {
+            constructor() {
+                const st = _evOwn(this);
+                st.readable = new globalThis.ReadableStream();
+                st.writable = new globalThis.WritableStream();
+            }
+        };
+        _evFields(globalThis.DecompressionStream.prototype, ["readable", "writable"]);
+    }
+
+    // CloseEvent for WebSocket
+    if (!globalThis.CloseEvent) {
+        const CloseEvent = class CloseEvent extends Event {
+            constructor(type, options = {}) {
+                super(type, options);
+                const _st = _evOwn(this);
+                _st.code = options.code || 1000;
+                _st.reason = options.reason || "";
+                _st.wasClean = options.wasClean !== undefined ? options.wasClean : true;
+            }
+        };
+        _evFields(CloseEvent.prototype, ["code", "reason", "wasClean"]);
+        globalThis.CloseEvent = CloseEvent;
+    }
+
+    // PressureObserver / PressureRecord — Compute Pressure API
+    // (https://w3c.github.io/compute-pressure/). Chrome 125+. Commonly probed.
+    if (!globalThis.PressureObserver) {
+        class PressureRecord {
+            constructor(source = 'cpu', state = 'nominal') {
+                const _st = _idl.own(this);
+                _st.source = source;
+                _st.state = state;
+                _st.time = performance.now();
+            }
+            toJSON() { return { source: this.source, state: this.state, time: this.time }; }
+        }
+    _idl.fields(PressureRecord.prototype, ["source", "state", "time"]);
+        Object.defineProperty(PressureRecord.prototype, Symbol.toStringTag, {
+            value: 'PressureRecord', configurable: true,
+        });
+        globalThis.PressureRecord = PressureRecord;
+
+        class PressureObserver {
+            #callback;
+            #observing;
+            #options;
+            constructor(callback, options = {}) {
+                this.#callback = callback;
+                this.#options = options;
+                this.#observing = new Set();
+            }
+            observe(source, _options) {
+                this.#observing.add(source);
+                return Promise.resolve();
+            }
+            unobserve(source) { this.#observing.delete(source); }
+            disconnect() { this.#observing.clear(); }
+            takeRecords() { return []; }
+            static get knownSources() { return ['cpu']; }
+        }
+        Object.defineProperty(PressureObserver.prototype, Symbol.toStringTag, {
+            value: 'PressureObserver', configurable: true,
+        });
+        globalThis.PressureObserver = PressureObserver;
+    }
+
 })(globalThis);

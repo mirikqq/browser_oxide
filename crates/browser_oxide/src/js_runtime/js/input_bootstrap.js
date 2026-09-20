@@ -8,9 +8,9 @@
 // loudest mouse tell for behavioural classifiers — the very thing the humanize
 // module exists to avoid.
 //
-// The handle is non-enumerable and `humanize.js` deletes it as soon as it has
-// captured it in a closure, so page scripts never observe it (same discipline as
-// `__bo_mark_trusted` in event_bootstrap.js).
+// The handle lives on the engine's symbol-keyed namespace, and `humanize.js`
+// deletes it as soon as it has captured it in a closure (same discipline as the
+// trusted-event minter in event_bootstrap.js).
 ((globalThis) => {
     const ops = (typeof Deno !== "undefined" && Deno.core && Deno.core.ops) || null;
     if (!ops) return;
@@ -54,12 +54,15 @@
     };
 
     try {
-        Object.defineProperty(globalThis, "__bo_input_api", {
-            value: api,
-            configurable: true,
-            enumerable: false,
-            writable: false,
-        });
+        const ns = (function(){try{var s=Object.getOwnPropertySymbols(globalThis, 1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})();
+        if (ns) {
+            Object.defineProperty(ns, "inputApi", {
+                value: api,
+                configurable: true,
+                enumerable: false,
+                writable: false,
+            });
+        }
     } catch (_) {
         /* ignore */
     }

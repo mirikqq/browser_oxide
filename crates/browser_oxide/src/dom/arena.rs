@@ -5,6 +5,10 @@ use std::collections::HashSet;
 pub struct Dom {
     nodes: Vec<Option<Node>>,
     free_list: Vec<usize>,
+    /// True when the parser saw no (or an unknown) doctype. Drives
+    /// `document.compatMode` and the quirks layout rule where `<html>` and
+    /// `<body>` stretch to the viewport.
+    quirks: bool,
 }
 
 /// Tripwire for tree-walking helpers. A correct DOM tree never has cycles
@@ -30,7 +34,22 @@ impl Dom {
         Self {
             nodes: vec![Some(doc_node)],
             free_list: Vec::new(),
+            quirks: false,
         }
+    }
+
+    /// Whether the document is in quirks mode (no doctype). Chrome reports
+    /// `document.compatMode === "BackCompat"` for such a document and lets
+    /// `<html>`/`<body>` fill the viewport — measured on Chrome 153, an empty
+    /// doctype-less page gives `body.offsetHeight === 397` (viewport 413 minus
+    /// the body's 8px margins) where a standards-mode one gives 0.
+    pub fn quirks(&self) -> bool {
+        self.quirks
+    }
+
+    /// Set by the HTML parser's `set_quirks_mode` callback.
+    pub fn set_quirks(&mut self, quirks: bool) {
+        self.quirks = quirks;
     }
 
     /// Get the document node ID.

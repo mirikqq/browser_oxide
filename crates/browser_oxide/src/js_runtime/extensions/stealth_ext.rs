@@ -86,6 +86,7 @@ pub fn op_get_profile_value(state: &mut OpState, #[string] key: &str) -> String 
             "connection_rtt" => p.connection_rtt.to_string(),
             "connection_downlink" => p.connection_downlink.to_string(),
             "prefers_color_scheme" => p.prefers_color_scheme.clone(),
+            "color_gamut" => p.color_gamut.clone(),
             "pointer_type" => p.pointer_type.clone(),
             "hover_capability" => p.hover_capability.clone(),
             "webgl_vendor" => p.webgl_vendor.clone(),
@@ -121,6 +122,7 @@ pub fn op_get_profile_value(state: &mut OpState, #[string] key: &str) -> String 
             "webgl_shader_precision" => {
                 serde_json::to_string(&p.gpu_profile.shader_precision).unwrap_or_default()
             }
+            "ua_brands" => serde_json::to_string(&p.ua_brands()).unwrap_or_default(),
             "browser_version" => p.browser_version.clone(),
             "browser_name" => p.browser_name.clone(),
             "os_name" => p.os_name.clone(),
@@ -233,11 +235,28 @@ pub fn op_behavior_mouse_trajectory(
     serde_json::to_string(&points).unwrap_or_else(|_| "[]".to_string())
 }
 
+#[op2(fast)]
+pub fn op_libm_trig(#[smi] kind: i32, x: f64) -> f64 {
+    match kind {
+        0 => x.sin(),
+        1 => x.cos(),
+        2 => x.tan(),
+        _ => f64::NAN,
+    }
+}
+
+#[op2(fast)]
+pub fn op_libm_atan2(y: f64, x: f64) -> f64 {
+    y.atan2(x)
+}
+
 deno_core::extension!(
     stealth_extension,
     ops = [
         op_get_profile_value,
         op_has_stealth_profile,
+        op_libm_trig,
+        op_libm_atan2,
         op_cross_origin_isolated,
         op_stealth_mark_native,
         op_is_secure_context,

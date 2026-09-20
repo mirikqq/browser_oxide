@@ -184,7 +184,7 @@ async fn reset_preserves_engine_installed_on_handlers() {
     page.evaluate(
         "window.onerror = function engineHandler() { return true; }; \
          (function(){ \
-            const s = Object.getOwnPropertySymbols(globalThis); \
+            const s = Object.getOwnPropertySymbols(globalThis,1); \
             for (let i = 0; i < s.length; i++) { \
                 const v = globalThis[s[i]]; \
                 if (v && v.__bo) { v.host.__markGlobalsBaseline(); return; } \

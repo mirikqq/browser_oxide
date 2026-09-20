@@ -393,12 +393,13 @@ impl BrowserJsRuntime {
 
     /// Replace the DOM in this runtime with a new one.
     /// Used for CDP Page.navigate to avoid recreating the V8 isolate.
-    pub fn replace_dom(&mut self, dom: Dom, stylesheets: Vec<String>) {
+    pub fn replace_dom(&mut self, dom: Dom, stylesheets: Vec<String>, external: Vec<String>) {
         let state = self.inner.op_state();
         let mut state = state.borrow_mut();
         // Replace DomState — ops will pick up the new DOM on next call
         let mut dom_state = DomState::new(dom);
         dom_state.stylesheets = stylesheets;
+        dom_state.external_stylesheets = external;
         dom_state.update_cached_rules();
         state.put(dom_state);
         // Reset timer state (clear pending timers from old page)
@@ -432,9 +433,14 @@ impl BrowserJsRuntime {
         self.inner.op_state()
     }
 
-    pub fn record_resource_timing(&mut self, timings: crate::net::TimingStats) {
+    pub fn record_resource_timing(
+        &mut self,
+        url: String,
+        decoded_size: u64,
+        timings: crate::net::TimingStats,
+    ) {
         let op_state = self.inner.op_state();
         let mut state = op_state.borrow_mut();
-        extensions::fetch_ext::record_resource_timing(&mut state, timings);
+        extensions::fetch_ext::record_resource_timing(&mut state, url, decoded_size, timings);
     }
 }

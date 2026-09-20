@@ -1,5 +1,20 @@
 ((globalThis) => {
     const ops = Deno.core.ops;
+    const _boNs = (() => {
+        try {
+            const syms = Object.getOwnPropertySymbols(globalThis, 1);
+            for (let i = 0; i < syms.length; i++) {
+                const v = globalThis[syms[i]];
+                if (v && v.__bo) return v;
+            }
+        } catch (_e) {}
+        return null;
+    })();
+    const _idl = (_boNs && _boNs.idl) || {
+        own: (obj) => obj,
+        read: () => undefined,
+        fields: () => {},
+    };
 
     // Base64 → Uint8Array. Self-contained: this runs early in the bootstrap
     // chain, before a page script gets any chance to shadow a global `atob`.
@@ -105,7 +120,7 @@
         async blob() {
             if (this.#rawBytes) {
                 const b = new Blob([]);
-                b._data = this.#rawBytes;
+                _idl.own(b)._data = this.#rawBytes;
                 b.size = this.#rawBytes.byteLength;
                 b.type = this.#headers.get('content-type') || '';
                 return b;
@@ -124,17 +139,19 @@
     }
 
     class Request {
+        #signal;
         constructor(input, init = {}) {
+            const _st = _idl.own(this);
             if (typeof input === "string") {
-                this.url = input;
+                _st.url = input;
             } else if (input instanceof Request) {
-                this.url = input.url;
+                _st.url = input.url;
                 init = { method: input.method, headers: input.headers, body: input.body, ...init };
             }
-            this.method = (init.method ?? "GET").toUpperCase();
-            this.headers = new Headers(init.headers ?? {});
-            this.body = init.body ?? null;
-            this._signal = init.signal ?? null;
+            _st.method = (init.method ?? "GET").toUpperCase();
+            _st.headers = new Headers(init.headers ?? {});
+            _st.body = init.body ?? null;
+            this.#signal = init.signal ?? null;
         }
         // Task#2: real Chrome's Request has a readonly `signal`
         // accessor ON Request.prototype (per the Fetch spec). Defined
@@ -145,15 +162,16 @@
         // /errors/not-supported.html. Lazily backs an AbortSignal so
         // `request.signal` is a non-null AbortSignal like real Chrome.
         get signal() {
-            if (this._signal == null
+            if (this.#signal == null
                 && typeof globalThis.AbortController === "function") {
                 try {
-                    this._signal = new globalThis.AbortController().signal;
+                    this.#signal = new globalThis.AbortController().signal;
                 } catch (_e) { /* leave null if AbortController throws */ }
             }
-            return this._signal;
+            return this.#signal;
         }
     }
+    _idl.fields(Request.prototype, ["body", "headers", "method", "url"]);
 
     // Pull the net::cookies jar snapshot for the current origin into
     // globalThis.__jsCookies so that document.cookie is always in sync.
@@ -166,7 +184,7 @@
             const _st = (function () {
                 if (globalThis._browser_oxide) return globalThis._browser_oxide;
                 try {
-                    const syms = Object.getOwnPropertySymbols(globalThis);
+                    const syms = Object.getOwnPropertySymbols(globalThis, 1);
                     for (let i = 0; i < syms.length; i++) {
                         const v = globalThis[syms[i]];
                         if (v && v.__bo && v.host) return v.host.bo;
@@ -399,16 +417,22 @@
             headers["content-type"] = "text/plain;charset=UTF-8";
         }
 
-        // Pass the page's origin as a pseudo header so the net layer can
+        // Pass the page's FULL url as a pseudo header so the net layer can
         // compute sec-fetch-site (same-origin vs cross-site) and set Origin /
         // Referer correctly. Chrome's fetch API always carries these.
+        //
+        // The origin alone is not enough: Chrome's default referrer policy is
+        // strict-origin-when-cross-origin, which sends the *whole* referring
+        // URL on a same-origin request and only the origin cross-origin. With
+        // just the origin here every same-origin request under-reported its own
+        // Referer — one header disagreeing with the page URL. The net layer
+        // derives the Origin header from this, so nothing else needs the split.
         try {
             const loc = globalThis.location;
-            if (loc && loc.origin && loc.origin !== "null") {
+            if (loc && loc.href && loc.href !== "about:blank") {
+                headers["x-browser-oxide-origin"] = loc.href;
+            } else if (loc && loc.origin && loc.origin !== "null") {
                 headers["x-browser-oxide-origin"] = loc.origin;
-            } else if (loc && loc.href && loc.href !== "about:blank") {
-                const u = new URL(loc.href);
-                headers["x-browser-oxide-origin"] = u.origin;
             }
         } catch {}
 
@@ -416,7 +440,7 @@
             const startTime = performance.now();
             const result = await ops.op_fetch(url, method, headers, body);
             
-            const browser_oxide = (function(){if(globalThis._browser_oxide)return globalThis._browser_oxide;try{const y=Object.getOwnPropertySymbols(globalThis);for(let i=0;i<y.length;i++){const v=globalThis[y[i]];if(v&&v.__bo&&v.host)return v.host.bo;}}catch(_){}return null;})();
+            const browser_oxide = (function(){if(globalThis._browser_oxide)return globalThis._browser_oxide;try{const y=Object.getOwnPropertySymbols(globalThis, 1);for(let i=0;i<y.length;i++){const v=globalThis[y[i]];if(v&&v.__bo&&v.host)return v.host.bo;}}catch(_){}return null;})();
             const fetchLog = browser_oxide && browser_oxide.__fetchLog;
             if (fetchLog) {
                 fetchLog.push({ method, url, status: result.status });
@@ -445,7 +469,7 @@
             });
         } catch (e) {
             // Log error for audit
-            const browser_oxide = (function(){if(globalThis._browser_oxide)return globalThis._browser_oxide;try{const y=Object.getOwnPropertySymbols(globalThis);for(let i=0;i<y.length;i++){const v=globalThis[y[i]];if(v&&v.__bo&&v.host)return v.host.bo;}}catch(_){}return null;})();
+            const browser_oxide = (function(){if(globalThis._browser_oxide)return globalThis._browser_oxide;try{const y=Object.getOwnPropertySymbols(globalThis, 1);for(let i=0;i<y.length;i++){const v=globalThis[y[i]];if(v&&v.__bo&&v.host)return v.host.bo;}}catch(_){}return null;})();
             const fetchLog = browser_oxide && browser_oxide.__fetchLog;
             if (fetchLog) {
                 fetchLog.push({ method, url, status: 0, error: e.message });

@@ -355,19 +355,16 @@ async fn phase7_d3_scroll_eventcounts_grease() {
         "pointerdown,touchend,input,keydown,mouseleave,mouseenter,drop,beforeinput,pointerenter,dragend"
     );
 
-    // 3c) GREASE "8" not "24"
     let brands = p
         .evaluate("navigator.userAgentData.brands.map(b=>b.brand+':'+b.version).join(',')")
         .unwrap();
-    let s = brands.trim_matches('"');
-    assert!(
-        s.contains("Not.A/Brand:8"),
-        "Not.A/Brand version should be '8', got: {s}"
-    );
-    assert!(
-        !s.contains("Not.A/Brand:24"),
-        "stale GREASE version 24 leaked into brands: {s}"
-    );
+    let expected = chrome_148_macos()
+        .ua_brands()
+        .iter()
+        .map(|(b, v)| format!("{b}:{v}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    assert_eq!(brands.trim_matches('"'), expected);
 }
 
 /// Phase 7 D2 gate — 18 [SecureContext] APIs return undefined on

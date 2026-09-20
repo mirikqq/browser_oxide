@@ -41,7 +41,7 @@ where
     send_request(stream, "POST", host, path, headers, Some(body)).await
 }
 
-async fn send_request<S>(
+pub(crate) async fn send_request<S>(
     stream: &mut S,
     method: &str,
     host: &str,

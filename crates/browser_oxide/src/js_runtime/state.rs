@@ -15,6 +15,12 @@ pub struct DomState {
     pub storage: HashMap<String, HashMap<String, String>>,
     /// CSS from `<style>` blocks, used by getComputedStyle
     pub stylesheets: Vec<String>,
+    /// CSS fetched from `<link rel=stylesheet>`, kept separately because it
+    /// cannot be recovered from the DOM. `refresh_stylesheets` rebuilds the
+    /// inline half on every mutation and used to drop these on the floor, so
+    /// external CSS stopped applying — and every `@font-face` it declared
+    /// vanished from `document.fonts` — the moment a page touched the DOM.
+    pub external_stylesheets: Vec<String>,
     /// Parsed and simplified CSS rules for fast lookup
     pub cached_rules: Vec<CachedRule>,
     /// `getComputedStyle` results, keyed by (node, property). Matching a node
@@ -64,8 +70,13 @@ pub struct DomState {
     /// the document's origin (scheme + host + port of the navigated
     /// URL). None for opaque/about:blank documents — those bypass CSP.
     pub csp_origin: Option<url::Url>,
-    /// Resource timings for performance.getEntriesByType('resource')
-    pub resource_timings: Vec<crate::net::TimingStats>,
+    /// Resource timings for performance.getEntriesByType('resource') —
+    /// (url, decoded body size in bytes, timings) per fetched sub-resource.
+    /// url and size travel with the timing because `TimingStats` itself
+    /// carries neither: JS-side entries used to all report a single
+    /// hardcoded placeholder URL and a zero body size regardless of what
+    /// was actually fetched.
+    pub resource_timings: Vec<(String, u64, crate::net::TimingStats)>,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +113,7 @@ impl DomState {
             console_output: Vec::new(),
             storage,
             stylesheets: Vec::new(),
+            external_stylesheets: Vec::new(),
             cached_rules: Vec::new(),
             computed_style_cache: HashMap::new(),
             computed_style_cache_epoch: 0,
