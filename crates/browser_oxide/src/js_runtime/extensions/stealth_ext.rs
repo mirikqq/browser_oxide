@@ -93,35 +93,13 @@ pub fn op_get_profile_value(state: &mut OpState, #[string] key: &str) -> String 
             "webgl_renderer" => p.webgl_renderer.clone(),
             "webgl_unmasked_vendor" => p.gpu_profile.unmasked_vendor.clone(),
             "webgl_unmasked_renderer" => p.gpu_profile.unmasked_renderer.clone(),
-            "webgl_version" => p.gpu_profile.version.clone(),
-            "webgl_shading_language_version" => p.gpu_profile.shading_language_version.clone(),
-            "webgl_extensions" => {
-                serde_json::to_string(&p.gpu_profile.extensions).unwrap_or_default()
-            }
-            // WebGL 1.0 surface (FIX-D2). Empty string = no distinct WebGL 1
-            // surface for this profile → JS keeps legacy shared-surface behaviour.
-            "webgl1_version" => p
-                .gpu_profile
-                .webgl1
-                .as_ref()
-                .map(|w| w.version.clone())
+            // The whole WebGL surface — both APIs' version strings and
+            // extension lists, getParameter / getShaderPrecisionFormat lookup
+            // maps, and the browser's GL identity — as one structure, so the
+            // WebGL 1 / WebGL 2 relationship is derived (and tested) in Rust
+            // rather than reassembled field by field in JS.
+            "webgl_surface" => serde_json::to_string(&p.gpu_profile.webgl_surface(&p.browser_name))
                 .unwrap_or_default(),
-            "webgl1_shading_language_version" => p
-                .gpu_profile
-                .webgl1
-                .as_ref()
-                .map(|w| w.shading_language_version.clone())
-                .unwrap_or_default(),
-            "webgl1_extensions" => p
-                .gpu_profile
-                .webgl1
-                .as_ref()
-                .map(|w| serde_json::to_string(&w.extensions).unwrap_or_default())
-                .unwrap_or_default(),
-            "webgl_params" => serde_json::to_string(&p.gpu_profile.params).unwrap_or_default(),
-            "webgl_shader_precision" => {
-                serde_json::to_string(&p.gpu_profile.shader_precision).unwrap_or_default()
-            }
             "ua_brands" => serde_json::to_string(&p.ua_brands()).unwrap_or_default(),
             "browser_version" => p.browser_version.clone(),
             "browser_name" => p.browser_name.clone(),

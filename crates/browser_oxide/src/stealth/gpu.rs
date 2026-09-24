@@ -795,3 +795,273 @@ mod tests {
         assert_eq!(high_float, [127, 127, 23]);
     }
 }
+
+/// Extensions WebGL 2 absorbed into core, so a WebGL 2 context does not list
+/// them even though a WebGL 1 context on the same GPU does.
+///
+/// Used only to derive a WebGL 2 extension list from a WebGL 1 capture. This
+/// is the spec relationship between the two APIs, not a per-GPU guess.
+const CORE_IN_WEBGL2: &[&str] = &[
+    "ANGLE_instanced_arrays",
+    "EXT_blend_minmax",
+    "EXT_frag_depth",
+    "EXT_sRGB",
+    "EXT_shader_texture_lod",
+    "OES_element_index_uint",
+    "OES_fbo_render_mipmap",
+    "OES_standard_derivatives",
+    "OES_texture_float",
+    "OES_texture_half_float",
+    "OES_texture_half_float_linear",
+    "OES_vertex_array_object",
+    "WEBGL_depth_texture",
+    "WEBGL_draw_buffers",
+];
+
+impl GpuProfile {
+    /// The WebGL surface as JavaScript needs it, keyed the way `getParameter`
+    /// and `getShaderPrecisionFormat` look values up.
+    ///
+    /// `params` and `shader_precision` are association lists in Rust because
+    /// that is what serialises cleanly; JS wants maps it can index by GLenum
+    /// without a scan, so the conversion happens once here rather than on
+    /// every `getParameter` call.
+    ///
+    /// `browser_name` decides the GL identity: Gecko reports `"Mozilla"` for
+    /// VENDOR, RENDERER and both UNMASKED strings, and a VERSION with no
+    /// `(OpenGL ES ... Chromium)` suffix. Chrome's GL identity under a Firefox
+    /// user agent is a complete giveaway, so the whole identity is overridden
+    /// rather than half of it.
+    pub fn webgl_surface(&self, browser_name: &str) -> serde_json::Value {
+        let firefox = browser_name == "Firefox";
+
+        let params: serde_json::Map<String, serde_json::Value> = self
+            .params
+            .iter()
+            .map(|(pname, value)| (pname.to_string(), value.clone()))
+            .collect();
+
+        let shader_precision: serde_json::Map<String, serde_json::Value> = self
+            .shader_precision
+            .iter()
+            .map(
+                |(shader_type, precision_type, [range_min, range_max, precision])| {
+                    (
+                        format!("{shader_type}:{precision_type}"),
+                        serde_json::json!({
+                            "rangeMin": range_min,
+                            "rangeMax": range_max,
+                            "precision": precision,
+                        }),
+                    )
+                },
+            )
+            .collect();
+
+        // Which API the shared fields actually describe. Most of the catalog
+        // was captured from a WebGL 2 context, but some entries (the NVIDIA
+        // one among them) hold a WebGL 1 capture in the shared fields. Both
+        // surfaces have to come out right whichever way round the capture was,
+        // because a `getContext("webgl2")` reporting "WebGL 1.0" -- or a
+        // `getContext("webgl")` reporting "WebGL 2.0" -- is a contradiction a
+        // script catches with two calls and no GPU knowledge at all.
+        let base_is_webgl2 = self.version.starts_with("WebGL 2");
+
+        // The WebGL 1 surface. A captured one wins; otherwise the shared
+        // fields are it (when they are a WebGL 1 capture) or are downgraded.
+        let (version_1, shading_1, extensions_1) = match &self.webgl1 {
+            Some(surface) => (
+                surface.version.as_str(),
+                surface.shading_language_version.as_str(),
+                &surface.extensions,
+            ),
+            // The shared fields already are the WebGL 1 surface.
+            None if !base_is_webgl2 => (
+                self.version.as_str(),
+                self.shading_language_version.as_str(),
+                &self.extensions,
+            ),
+            None => (
+                "WebGL 1.0 (OpenGL ES 2.0 Chromium)",
+                "WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)",
+                &self.extensions,
+            ),
+        };
+        // Gecko's strings whatever was captured: a captured WebGL 1 surface is
+        // Chrome's, and its Chromium suffix under a Firefox user agent is the
+        // same giveaway as the WebGL 2 identity below.
+        let webgl1 = serde_json::json!({
+            "version": if firefox { "WebGL 1.0" } else { version_1 },
+            "shadingLang": if firefox { "WebGL GLSL ES 1.0" } else { shading_1 },
+            "extensions": extensions_1,
+        });
+
+        // The WebGL 2 surface. When the shared fields are a WebGL 1 capture
+        // the version strings are promoted -- they are fixed by the spec, not
+        // guessed per GPU -- and the extensions that WebGL 2 absorbed into
+        // core are dropped, because a WebGL 2 context does not list them.
+        let (version_2, shading_2, extensions_2);
+        if base_is_webgl2 {
+            version_2 = self.version.clone();
+            shading_2 = self.shading_language_version.clone();
+            extensions_2 = self.extensions.clone();
+        } else {
+            version_2 = "WebGL 2.0 (OpenGL ES 3.0 Chromium)".to_string();
+            shading_2 = "WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)".to_string();
+            extensions_2 = self
+                .extensions
+                .iter()
+                .filter(|name| !CORE_IN_WEBGL2.contains(&name.as_str()))
+                .cloned()
+                .collect();
+        }
+
+        serde_json::json!({
+            "vendor": if firefox { "Mozilla" } else { self.vendor.as_str() },
+            "renderer": if firefox { "Mozilla" } else { self.renderer.as_str() },
+            "version": if firefox { "WebGL 2.0" } else { version_2.as_str() },
+            "shadingLang": if firefox { "WebGL GLSL ES 3.00" } else { shading_2.as_str() },
+            "unmaskedVendor": if firefox { "Mozilla" } else { self.unmasked_vendor.as_str() },
+            "unmaskedRenderer": if firefox { "Mozilla" } else { self.unmasked_renderer.as_str() },
+            "extensions": extensions_2,
+            "params": params,
+            "shaderPrec": shader_precision,
+            "webgl1": webgl1,
+        })
+    }
+}
+
+#[cfg(test)]
+mod webgl_surface_tests {
+    use super::*;
+
+    /// Every catalog entry, so a new GPU cannot be added without meeting the
+    /// cross-API rules above.
+    fn catalog() -> Vec<fn() -> GpuProfile> {
+        vec![
+            nvidia_rtx_3060_windows,
+            apple_m3_macos,
+            apple_m3_pro_macos,
+            apple_m3_max_macos,
+            apple_m2_pro_macos,
+            intel_uhd_630_linux,
+        ]
+    }
+
+    #[test]
+    fn params_and_precision_become_lookup_maps() {
+        let surface = nvidia_rtx_3060_windows().webgl_surface("Chrome");
+        let params = surface["params"].as_object().expect("params map");
+        assert!(
+            !params.is_empty(),
+            "the catalog carries getParameter values"
+        );
+        // MAX_TEXTURE_SIZE, the value every fingerprinter reads.
+        assert!(params.contains_key("3379"), "keys are GLenums as strings");
+        let precision = surface["shaderPrec"].as_object().expect("precision map");
+        assert!(
+            precision.keys().all(|key| key.contains(':')),
+            "precision is keyed shaderType:precisionType"
+        );
+    }
+
+    /// Chrome's GL identity under a Firefox user agent is a complete tell, so
+    /// the whole identity flips, not just the unmasked half.
+    #[test]
+    fn firefox_reports_the_gecko_gl_identity() {
+        let surface = nvidia_rtx_3060_windows().webgl_surface("Firefox");
+        for field in ["vendor", "renderer", "unmaskedVendor", "unmaskedRenderer"] {
+            assert_eq!(surface[field], "Mozilla", "{field} must be Gecko's");
+        }
+        assert_eq!(surface["version"], "WebGL 2.0");
+        assert!(
+            !surface["webgl1"]["version"]
+                .as_str()
+                .expect("webgl1 version")
+                .contains("Chromium"),
+            "Gecko's WebGL 1 version carries no Chromium suffix"
+        );
+    }
+
+    #[test]
+    fn chrome_keeps_the_captured_identity() {
+        let gpu = apple_m3_macos();
+        let surface = gpu.webgl_surface("Chrome");
+        assert_eq!(surface["unmaskedRenderer"], gpu.unmasked_renderer.as_str());
+        assert_eq!(surface["vendor"], gpu.vendor.as_str());
+    }
+
+    /// The Gecko identity holds on every entry, including those with a
+    /// captured (Chrome) WebGL 1 surface.
+    #[test]
+    fn firefox_is_gecko_on_every_catalog_entry() {
+        for build in catalog() {
+            let gpu = build();
+            let name = gpu.unmasked_renderer.clone();
+            let surface = gpu.webgl_surface("Firefox");
+            for field in [
+                &surface["version"],
+                &surface["shadingLang"],
+                &surface["webgl1"]["version"],
+                &surface["webgl1"]["shadingLang"],
+            ] {
+                let text = field.as_str().expect("string field");
+                assert!(!text.contains("Chromium"), "{name}: {text} under Firefox");
+            }
+        }
+    }
+
+    /// Each context must report its own API's version, whichever API the
+    /// catalog entry happened to be captured from. Two calls and no GPU
+    /// knowledge is all it takes to catch the mismatch.
+    #[test]
+    fn every_catalog_entry_reports_both_apis_correctly() {
+        for build in catalog() {
+            let gpu = build();
+            let name = gpu.unmasked_renderer.clone();
+            let surface = gpu.webgl_surface("Chrome");
+            let two = surface["version"].as_str().expect("webgl2 version");
+            let one = surface["webgl1"]["version"]
+                .as_str()
+                .expect("webgl1 version");
+            assert!(
+                two.starts_with("WebGL 2"),
+                "{name}: getContext(\"webgl2\") must report WebGL 2, got {two}"
+            );
+            assert!(
+                one.starts_with("WebGL 1"),
+                "{name}: getContext(\"webgl\") must report WebGL 1, got {one}"
+            );
+        }
+    }
+
+    /// A WebGL 2 context does not list the extensions WebGL 2 took into core.
+    #[test]
+    fn webgl2_does_not_list_extensions_it_absorbed() {
+        for build in catalog() {
+            let gpu = build();
+            let name = gpu.unmasked_renderer.clone();
+            let surface = gpu.webgl_surface("Chrome");
+            let two: Vec<String> =
+                serde_json::from_value(surface["extensions"].clone()).expect("ext list");
+            for absorbed in CORE_IN_WEBGL2 {
+                assert!(
+                    !two.contains(&(*absorbed).to_string()),
+                    "{name}: WebGL 2 must not advertise {absorbed}, which is core there"
+                );
+            }
+        }
+    }
+
+    /// The WebGL 1 surface keeps them, because a WebGL 1 context does list them.
+    #[test]
+    fn webgl1_keeps_its_own_extensions() {
+        let surface = nvidia_rtx_3060_windows().webgl_surface("Chrome");
+        let one: Vec<String> =
+            serde_json::from_value(surface["webgl1"]["extensions"].clone()).expect("ext list");
+        assert!(
+            one.iter().any(|ext| CORE_IN_WEBGL2.contains(&ext.as_str())),
+            "a WebGL 1 capture should still list the extensions WebGL 2 absorbed"
+        );
+    }
+}

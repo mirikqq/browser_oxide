@@ -568,93 +568,57 @@
             0x80A9: 4,             // SAMPLES
         };
         let shaderPrec = {};
+        let webgl1 = null;
         try {
             if (ops.op_has_stealth_profile()) {
-                const s = (k) => ops.op_get_profile_value(k);
-                unmaskedVendor = s("webgl_unmasked_vendor") || unmaskedVendor;
-                unmaskedRenderer = s("webgl_unmasked_renderer") || unmaskedRenderer;
-                version = s("webgl_version") || version;
-                shadingLang = s("webgl_shading_language_version") || shadingLang;
-                const extsJson = s("webgl_extensions");
-                if (extsJson) {
-                    try { extensions = JSON.parse(extsJson); } catch {}
+                // One structure, derived in Rust (`GpuProfile::webgl_surface`):
+                // this WebGL 2 surface, its WebGL 1 counterpart, and — under a
+                // Firefox profile — the GL identity Gecko reports ("Mozilla",
+                // no "(OpenGL ES … Chromium)" suffix) in place of Chrome's.
+                const surface = JSON.parse(ops.op_get_profile_value("webgl_surface") || "null");
+                if (surface) {
+                    vendor = surface.vendor || vendor;
+                    renderer = surface.renderer || renderer;
+                    version = surface.version || version;
+                    shadingLang = surface.shadingLang || shadingLang;
+                    unmaskedVendor = surface.unmaskedVendor || unmaskedVendor;
+                    unmaskedRenderer = surface.unmaskedRenderer || unmaskedRenderer;
+                    if (Array.isArray(surface.extensions)) extensions = surface.extensions;
+                    // Keyed by GLenum; merged over the defaults above.
+                    Object.assign(params, surface.params || {});
+                    shaderPrec = surface.shaderPrec || shaderPrec;
+                    webgl1 = surface.webgl1 || null;
                 }
-                const paramsJson = s("webgl_params");
-                if (paramsJson) {
-                    try {
-                        const arr = JSON.parse(paramsJson);
-                        // Array of [glenum, value] pairs → keyed object
-                        for (const [k, v] of arr) params[k] = v;
-                    } catch {}
-                }
-                const spJson = s("webgl_shader_precision");
-                if (spJson) {
-                    try {
-                        // Array of [shader_type, precision_type, [min, max, precision]]
-                        const arr = JSON.parse(spJson);
-                        for (const [st, pt, v] of arr) {
-                            shaderPrec[`${st}:${pt}`] = { rangeMin: v[0], rangeMax: v[1], precision: v[2] };
-                        }
-                    } catch {}
-                }
-            }
-        } catch {}
-        // Firefox WebGL coherence: Gecko reports "Mozilla" for VENDOR /
-        // RENDERER and the UNMASKED_*_WEBGL strings, and a VERSION without
-        // the "(OpenGL ES … Chromium)" suffix. Chrome's GL identity
-        // ("WebKit" / "Google Inc." / "ANGLE (…)") under a Firefox UA is a
-        // 100% tell, so override the whole GL identity for the FF profile.
-        try {
-            if (ops.op_has_stealth_profile() &&
-                /Firefox\//.test(ops.op_get_profile_value("user_agent") || "")) {
-                vendor = "Mozilla";
-                renderer = "Mozilla";
-                unmaskedVendor = "Mozilla";
-                unmaskedRenderer = "Mozilla";
-                version = "WebGL 2.0";
-                shadingLang = "WebGL GLSL ES 3.00";
             }
         } catch {}
         _gpuCache = {
             vendor, renderer, version, shadingLang,
             unmaskedVendor, unmaskedRenderer,
-            extensions, params, shaderPrec,
+            extensions, params, shaderPrec, webgl1,
         };
         return _gpuCache;
     };
     const _g1 = () => {
         if (_gpuCache1) return _gpuCache1;
         const base = _g();
-        // Start from the base surface, then downgrade the version strings to
-        // WebGL 1 whenever base describes a WebGL 2 surface (the apple_m3
-        // default + the no-profile fallback). Legacy profiles whose shared
-        // field already holds WebGL 1 data (e.g. nvidia) or masked Firefox
-        // keep their base strings. Extensions: an empty list defers to
-        // getSupportedExtensions()'s own WebGL-1 fallback.
         let version = base.version;
         let shadingLang = base.shadingLang;
         let extensions = base.extensions;
-        const _ffWebGL = (function () {
-            try { return ops.op_has_stealth_profile() && /Firefox\//.test(ops.op_get_profile_value("user_agent") || ""); }
-            catch { return false; }
-        })();
-        if (/^WebGL 2/.test(version)) {
-            // Firefox WebGL 1 reports "WebGL 1.0" with no "(OpenGL ES … Chromium)" suffix.
-            version = _ffWebGL ? "WebGL 1.0" : "WebGL 1.0 (OpenGL ES 2.0 Chromium)";
-            shadingLang = _ffWebGL ? "WebGL GLSL ES 1.0" : "WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)";
-        }
-        try {
-            if (ops.op_has_stealth_profile()) {
-                const v = ops.op_get_profile_value("webgl1_version");
-                const sl = ops.op_get_profile_value("webgl1_shading_language_version");
-                const extJson = ops.op_get_profile_value("webgl1_extensions");
-                if (v) version = v;
-                if (sl) shadingLang = sl;
-                if (extJson) {
-                    try { const e = JSON.parse(extJson); if (e && e.length) extensions = e; } catch {}
-                }
+        if (base.webgl1) {
+            // The profile's own WebGL 1 surface. A WebGL 2 context does not
+            // list the extensions WebGL 2 absorbed into core; this one does.
+            version = base.webgl1.version || version;
+            shadingLang = base.webgl1.shadingLang || shadingLang;
+            if (Array.isArray(base.webgl1.extensions) && base.webgl1.extensions.length) {
+                extensions = base.webgl1.extensions;
             }
-        } catch {}
+        } else if (/^WebGL 2/.test(version)) {
+            // No profile: downgrade the captured-Chrome defaults. The empty
+            // extension list defers to getSupportedExtensions()'s own
+            // WebGL-1 fallback.
+            version = "WebGL 1.0 (OpenGL ES 2.0 Chromium)";
+            shadingLang = "WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)";
+        }
         _gpuCache1 = { ...base, version, shadingLang, extensions };
         return _gpuCache1;
     };
@@ -766,8 +730,8 @@
         // version string or expose WebGL-2-only extensions (e.g.
         // `EXT_color_buffer_float`) — that cross-API mismatch differs from
         // real Chrome. Derived from the active
-        // profile's `webgl1_*` values; falls back to `_g()` when the profile has
-        // no distinct WebGL 1 surface (legacy profiles) → no behaviour change.
+        // profile's `webgl_surface().webgl1`; with no profile the defaults are
+        // downgraded to their WebGL 1 strings.
         // Per-instance surface selector. `_isWebGL2 === false` only for a
         // context handed back by `getContext("webgl"/"experimental-webgl")`.
         // Anything else (incl. `getParameter.call(notACtx)`) → WebGL 2 surface,
