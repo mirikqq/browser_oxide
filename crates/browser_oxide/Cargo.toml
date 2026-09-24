@@ -19,19 +19,25 @@ categories = ["web-programming", "network-programming", "api-bindings"]
 readme = "../../README.md"
 
 [features]
-default = []
+default = ["stealth"]
+# The optional stealth sources, on by default: a stealth engine should not need
+# a feature flag to sample identities or resolve its exit address offline.
+# Build with `default-features = false` to leave both out (and the C libraries
+# `generator` brings with it).
+stealth = ["generator", "geoip"]
 # Links the OSMesa software-GL backend so the full WebGL fingerprint is
 # emitted. Off by default: OSMesa adds ~15 MB and is not on the critical
 # path for any tracked blocker site.
 webgl-render = ["glow"]
 # Optional in-engine ad/tracker blocker (MPL-2.0 `adblock`); off by default.
 blocker = ["dep:adblock"]
-# Bayesian-network fingerprint sampling (`stealth::generator`); off by default.
-# The network is embedded, but read through a zip reader whose default features
-# build the bzip2 and xz C libraries.
+# Bayesian-network fingerprint sampling (`stealth::generator`); part of
+# `stealth`. The network is embedded, but read through a zip reader whose
+# default features build the bzip2 and xz C libraries.
 generator = ["dep:veilus-fingerprint"]
-# Offline GeoLite2 lookup of the exit address (`stealth::geo`); off by default.
-# Inert without a database on disk — see `BROWSER_OXIDE_GEOIP_MMDB` / `_URL`.
+# Offline GeoLite2 lookup of the exit address (`stealth::geo`); part of
+# `stealth`. Inert without a database on disk — see `BROWSER_OXIDE_GEOIP_MMDB`
+# / `_URL`.
 geoip = ["dep:maxminddb"]
 
 [dependencies]
@@ -76,8 +82,9 @@ rustls = { version = "0.23", default-features = false, features = [
 adblock = { version = "0.13", optional = true }
 # BrowserForge-compatible Bayesian network of observed fingerprints.
 veilus-fingerprint = { version = "0.3.1", optional = true }
-# GeoLite2 (MaxMind DB) reader.
-maxminddb = { version = "0.26", optional = true }
+# GeoLite2 (MaxMind DB) reader. At least 0.27: earlier releases carry
+# RUSTSEC-2025-0132.
+maxminddb = { version = "0.32", optional = true }
 # --- compression ---
 # zlib-rs backend: canvas pins exact PNG output bytes (png_byte_parity test),
 # which the miniz_oxide default backend does not reproduce.

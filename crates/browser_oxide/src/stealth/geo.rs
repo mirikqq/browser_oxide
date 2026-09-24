@@ -22,8 +22,9 @@
 //! This module opens no socket. [`mmdb_path`] says where the database belongs
 //! and [`needs_refresh`] says when it has aged out; `egress` fetches it through
 //! the profile's own client and calls [`install`] — but only from a source the
-//! operator named, see [`mmdb_url`]. Reading it needs the `geoip` feature; without
-//! it [`lookup`] always misses and the HTTP providers answer as before.
+//! operator named, see [`mmdb_url`]. Reading it needs the `geoip` feature, which
+//! the default `stealth` feature turns on; without it [`lookup`] always misses
+//! and the HTTP providers answer as before.
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -151,7 +152,10 @@ pub fn lookup(address: IpAddr) -> Option<Egress> {
             return None;
         }
     };
-    let record: maxminddb::geoip2::City = match reader.lookup(address) {
+    let record = match reader
+        .lookup(address)
+        .and_then(|result| result.decode::<maxminddb::geoip2::City>())
+    {
         Ok(Some(record)) => record,
         Ok(None) => return None,
         Err(error) => {
@@ -174,32 +178,23 @@ pub fn lookup(_address: IpAddr) -> Option<Egress> {
 /// part that can silently go wrong when MaxMind's schema shifts.
 #[cfg(feature = "geoip")]
 fn egress_from_city(record: &maxminddb::geoip2::City<'_>) -> Option<Egress> {
-    let english = |names: &Option<std::collections::BTreeMap<&str, &str>>| -> Option<String> {
-        names.as_ref()?.get("en").map(|name| (*name).to_string())
-    };
+    let english = |names: &maxminddb::geoip2::Names<'_>| names.english.map(str::to_string);
 
     // Without a country there is nothing to align to, which is the same bar
     // the HTTP providers are held to in `egress::parse_egress`.
-    let country = record
-        .country
-        .as_ref()
-        .and_then(|country| country.iso_code)
-        .map(|code| code.to_ascii_uppercase())?;
+    let country = record.country.iso_code?.to_ascii_uppercase();
 
-    let location = record.location.as_ref();
+    let location = &record.location;
     Some(Egress {
         country,
-        city: record.city.as_ref().and_then(|city| english(&city.names)),
+        city: english(&record.city.names),
         region: record
             .subdivisions
-            .as_ref()
-            .and_then(|subdivisions| subdivisions.first())
+            .first()
             .and_then(|subdivision| english(&subdivision.names)),
-        timezone: location
-            .and_then(|location| location.time_zone)
-            .map(str::to_string),
-        latitude: location.and_then(|location| location.latitude),
-        longitude: location.and_then(|location| location.longitude),
+        timezone: location.time_zone.map(str::to_string),
+        latitude: location.latitude,
+        longitude: location.longitude,
     })
 }
 

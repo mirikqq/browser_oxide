@@ -560,8 +560,7 @@ impl DynamicsCompressorKernel {
             let mut compression_diff_db =
                 linear_to_decibels(self.compressor_gain / scaled_desired_gain);
 
-            let envelope_rate;
-            if is_releasing {
+            let envelope_rate = if is_releasing {
                 self.max_attack_compression_diff_db = -1.0;
 
                 if compression_diff_db.is_nan() {
@@ -583,7 +582,7 @@ impl DynamicsCompressorKernel {
                 let release_frames_adaptive = ka + kb * x + kc * x2 + kd * x3 + ke * x4;
 
                 let db_per_frame = K_SPACING_DB / release_frames_adaptive;
-                envelope_rate = decibels_to_linear(db_per_frame);
+                decibels_to_linear(db_per_frame)
             } else {
                 // Attack mode.
                 if compression_diff_db.is_nan() {
@@ -602,8 +601,8 @@ impl DynamicsCompressorKernel {
                 let eff_atten_diff_db = self.max_attack_compression_diff_db.max(0.5);
 
                 let x = 0.25 / eff_atten_diff_db;
-                envelope_rate = 1.0 - x.powf(1.0 / attack_frames);
-            }
+                1.0 - x.powf(1.0 / attack_frames)
+            };
 
             // Inner loop — process N_DIVISION_FRAMES samples.
             let mut pre_delay_read_index = self.pre_delay_read_index;

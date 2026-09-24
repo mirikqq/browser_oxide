@@ -146,7 +146,9 @@ async fn h2_handshake_writes_chrome_146_settings_and_window_update() {
     // ---- 3. SETTINGS payload: bytes 33..57 ----
     let settings_payload = &bytes[33..33 + settings_len];
     let settings: Vec<(u16, u32)> = settings_payload
-        .chunks_exact(6)
+        .as_chunks::<6>()
+        .0
+        .iter()
         .map(|s| {
             let id = u16::from_be_bytes([s[0], s[1]]);
             let v = u32::from_be_bytes([s[2], s[3], s[4], s[5]]);

@@ -39,9 +39,9 @@ override it.
 | `BROWSER_OXIDE_BEHAVIOR_SEED` | Seed the humanized-behavior engine for deterministic mouse/key timing (reproducible runs). Also fixes where the page session's clicks land inside each control. |
 | `BROWSER_OXIDE_STEALTH_PROFILE_FILE` | Read by `stealth::presets::select()`: load a YAML/JSON profile from this path. Checked first. |
 | `BROWSER_OXIDE_STEALTH_PROFILE` | Read by `select()`: pin one preset by its `stealth::presets::all()` name (e.g. `chrome_148_linux`). |
-| `BROWSER_OXIDE_STEALTH_SEED` | Read by `select()`: sample the fingerprint network with this `u64` seed — one seed, one stable identity (canvas/audio seeds included), e.g. pinned to one proxy session. Needs the `generator` feature. |
-| `BROWSER_OXIDE_STEALTH_SAMPLE` | Read by `select()`: sample a fresh identity per call. Needs the `generator` feature. Anything unusable in these four falls back to `default_profile()` with a warning. |
-| `BROWSER_OXIDE_GEOIP_MMDB` | Path to a GeoLite2-City database used to resolve the exit address locally, before the HTTP geolocation providers. Needs the `geoip` feature. |
+| `BROWSER_OXIDE_STEALTH_SEED` | Read by `select()`: sample the fingerprint network with this `u64` seed — one seed, one stable identity (canvas/audio seeds included), e.g. pinned to one proxy session. Needs the `generator` feature (on by default, via `stealth`). |
+| `BROWSER_OXIDE_STEALTH_SAMPLE` | Read by `select()`: sample a fresh identity per call. Needs the `generator` feature (on by default, via `stealth`). Anything unusable in these four falls back to `default_profile()` with a warning. |
+| `BROWSER_OXIDE_GEOIP_MMDB` | Path to a GeoLite2-City database used to resolve the exit address locally, before the HTTP geolocation providers. Needs the `geoip` feature (on by default, via `stealth`). |
 | `BROWSER_OXIDE_GEOIP_URL` | Where to download that database from (a MaxMind permalink with licence key, an internal mirror, …). **No default** — which source to trust is the operator's call. Refreshed after 30 days. |
 | `BROWSER_OXIDE_NO_GEOIP` | Skip the local-database route; the HTTP providers answer. |
 | `BROWSER_OXIDE_CACHE_DIR` | Base cache directory (the GeoLite2 copy lives under `browser_oxide/geoip/`). Defaults to the platform cache dir. |

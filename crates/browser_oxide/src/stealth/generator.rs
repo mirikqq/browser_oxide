@@ -10,8 +10,9 @@
 //! `veilus_fingerprint` samples the Apify/BrowserForge network -- the same
 //! dataset Camoufox draws on -- so the combinations are ones that occur in the
 //! wild. The network is embedded in the crate, so sampling needs no download
-//! and no runtime file IO. It is behind the `generator` feature (off by
-//! default); without it [`sample`] returns [`GeneratorError::Unavailable`].
+//! and no runtime file IO. It is behind the `generator` feature, which the
+//! default `stealth` feature turns on; a build without it (`default-features =
+//! false`) gets [`GeneratorError::Unavailable`] from [`sample`].
 //!
 //! What is deliberately *not* taken from the network
 //! -------------------------------------------------

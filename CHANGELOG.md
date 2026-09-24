@@ -46,6 +46,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `geoip` feature: `stealth::geo` resolves the exit address against a local
   GeoLite2 database before the HTTP providers; downloads only from
   `BROWSER_OXIDE_GEOIP_URL` (no default source).
+- `stealth` feature, **on by default**: turns on `generator` and `geoip`, so
+  identity sampling and the offline exit-address lookup need no feature flag.
+  `default-features = false` builds without them (and without the bzip2 and xz
+  C libraries `generator` pulls in). `geoip` stays inert until a database is on
+  disk or `BROWSER_OXIDE_GEOIP_URL` names one.
 - Humanized clicks land on a per-session, per-control spot in the middle half
   of the target (`BehaviorProfile::aim_point`) instead of fresh noise per click.
 
@@ -58,6 +63,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `net::tls::expected_impersonate` picks the stack by browser family, device
   class and major version from one table; the TLS connector and the HTTP/2
   preface branch on the same decision.
+
+### Dependencies
+- `maxminddb` 0.26 → **0.32** (`geoip` feature), for RUSTSEC-2025-0132 —
+  with `geoip` on by default the advisory would otherwise reach every build.
+- `rustls` 0.23.42 → **0.23.45** (and `rustls-webpki` 0.103.15), for
+  RUSTSEC-2026-0285.
 
 ## [0.1.3]
 
