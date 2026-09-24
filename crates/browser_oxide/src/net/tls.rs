@@ -425,9 +425,8 @@ const ALPN_PROTOS: &[u8] = b"\x02h2\x08http/1.1";
 use rand::prelude::SliceRandom;
 
 /// Chrome 152 extension permutation (indices into BoringSSL kExtensions table).
-/// 17 extensions matching a verified Chrome 152 macOS arm64 reference capture.
-/// Chrome 153 sends an 18th, 0x12E0 (4832, body `00 00`), which our BoringSSL
-/// has no codepoint for — see `desktop_client_hello_matches_the_chrome_153_capture`.
+/// 17 extensions matching a verified Chrome 152 macOS arm64 reference capture,
+/// and the Chrome 153 one (`desktop_client_hello_matches_the_chrome_153_capture`).
 ///
 /// **Real Chrome shuffling behavior** (per Fastly TLS Fingerprinting blog
 /// + Chromestatus 5124606246518784 + BoringSSL `ssl_setup_extension_permutation`
@@ -893,10 +892,10 @@ mod tests {
     /// the capture script next to it). Network-free: the hello goes to a local
     /// listener that never answers.
     ///
-    /// One known divergence is pinned rather than hidden: Chrome 153 sends an
-    /// extension 0x12E0 (4832, body `00 00`) that Chromium 141 does not and our
-    /// BoringSSL has no codepoint for. It moves the JA4 extension count from 17
-    /// to 18. Any *other* difference fails here.
+    /// The capture is taken with `--disable-field-trial-config`. Without it,
+    /// Chrome for Testing applies its built-in field-trial testing config, which
+    /// among other things turns on BoringSSL's server-padding experiment
+    /// (extension 4832) — not what a Chrome install with default features sends.
     #[tokio::test]
     async fn desktop_client_hello_matches_the_chrome_153_capture() {
         use tokio::io::AsyncReadExt;
@@ -985,8 +984,8 @@ mod tests {
         );
         assert_eq!(
             missing,
-            vec![4832],
-            "extensions missing against Chrome 153 (0x12E0 is the known gap)"
+            Vec::<u16>::new(),
+            "extensions Chrome 153 sends and we do not"
         );
     }
 

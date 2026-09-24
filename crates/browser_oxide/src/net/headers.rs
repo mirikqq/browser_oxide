@@ -1438,6 +1438,24 @@ mod tests {
         }
     }
 
+    /// First-visit navigation headers in Chrome 153's order, from the loopback
+    /// capture in `tests/fixtures/chrome153/network_capture.json`.
+    #[test]
+    fn navigation_header_order_matches_the_chrome_153_capture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/chrome153/network_capture.json"
+        ))
+        .expect("fixture");
+        let names: Vec<String> = chrome_headers(&crate::stealth::chrome_148_windows())
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            serde_json::json!(names),
+            fixture["http2"]["navigation_header_order"]
+        );
+    }
+
     #[test]
     fn sec_ch_ua_full_version_list_has_chrome_version() {
         let mut profile = crate::stealth::chrome_148_linux();

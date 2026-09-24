@@ -1,5 +1,5 @@
 {
- "source": "Chrome for Testing 153.0.8010.48, linux64, --headless=new, captured on loopback by capture.py (2026-09-24)",
+ "source": "Chrome for Testing 153.0.8010.48, linux64, --headless=new --disable-field-trial-config, captured on loopback by network_capture.py (2026-09-24)",
  "tls": {
   "cipher_suites": [
    4865,
@@ -32,7 +32,6 @@
    43,
    45,
    51,
-   4832,
    17613,
    51764,
    65037,
@@ -65,8 +64,7 @@
   "alps_17613": "0003026832",
   "cert_compression": "020002",
   "psk_modes": "0101",
-  "status_request": "0100000000",
-  "ext_4832": "0000"
+  "status_request": "0100000000"
  },
  "http2": {
   "settings": [
@@ -103,7 +101,6 @@
    "sec-ch-ua",
    "sec-ch-ua-mobile",
    "sec-ch-ua-platform",
-   "accept-language",
    "upgrade-insecure-requests",
    "user-agent",
    "accept",
@@ -112,6 +109,7 @@
    "sec-fetch-user",
    "sec-fetch-dest",
    "accept-encoding",
+   "accept-language",
    "priority"
   ]
  }

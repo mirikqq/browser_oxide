@@ -80,24 +80,21 @@ was pointed at it with
 
 ```bash
 python3 network_capture.py 40 > out.json &   # cert.pem/key.pem: any self-signed pair for test.example
-chrome --no-proxy-server --ignore-certificate-errors --user-data-dir=/tmp/cap \
+chrome --headless=new --disable-field-trial-config --no-proxy-server \
+  --ignore-certificate-errors --user-data-dir=/tmp/cap \
   --host-resolver-rules="MAP test.example:443 127.0.0.1:8443" https://test.example/
 ```
 
-(headless and headful under Xvfb gave the same result). GREASE values are
-dropped and extension types are a sorted set, since Chrome permutes them per
-connection. `net::tls` and `net::h2_client` tests compare the engine against it.
+**`--disable-field-trial-config` is required.** Chrome for Testing otherwise
+applies its built-in field-trial testing config, which changes the wire: it
+adds BoringSSL's server-padding experiment extension (4832, body `00 00`,
+`TLSEXT_TYPE_server_padding` upstream) — JA4 `…1518h2` instead of `…1517h2` —
+and moves `accept-language` up to right after `sec-ch-ua-platform`. Neither is
+what a Chrome install with default features sends; with the flag, the capture
+matches the engine exactly.
 
-Observed and not acted on:
-
-- **Extension 0x12E0 (4832), body `00 00`.** Sent by 153, not by Chromium 141,
-  unknown to our BoringSSL. It is the one pinned divergence in the TLS test and
-  moves JA4's extension count from 17 to 18. Chrome for Testing runs without
-  field trials, so whether stable Chrome enables it for everyone is not known
-  from this capture alone.
-- **`accept-language` right after `sec-ch-ua-platform`** in the navigation
-  headers, in both 153 and Chromium 141. The engine keeps it before `priority`,
-  per earlier captures of stable Chrome; a fresh-profile capture without field
-  trials is not enough to overturn those.
-- Trust Anchor IDs and ECH GREASE differ in length from ours; neither length
-  enters JA4 (the anchor list tracks the root store, ECH GREASE is padded).
+GREASE values are dropped and extension types are a sorted set, since Chrome
+permutes them per connection. The `net::tls`, `net::h2_client` and
+`net::headers` tests compare the engine against it. Trust Anchor IDs and ECH
+GREASE lengths are not compared: the anchor list tracks the root store and ECH
+GREASE is padded to a varying length; neither length enters JA4.
