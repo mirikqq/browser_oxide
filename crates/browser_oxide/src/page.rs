@@ -2366,6 +2366,9 @@ impl Page {
     ///   on `globalThis.fetch` / `document.cookie` / `XMLHttpRequest`.
     ///   These are the expensive bits we're reusing.
     pub fn reset_for_reuse(&mut self) {
+        // ICU's default zone is process-wide: any page built since this one may
+        // have moved it, and the next document must not start on that zone.
+        self.event_loop.runtime_mut().reapply_profile_timezone();
         let _ = self.event_loop.execute_script(
             r#"(function() {
                 const g = globalThis;
@@ -2507,6 +2510,9 @@ impl Page {
                     )
                 })?
         };
+        // A warm navigation reached without `reset_for_reuse` still serves a
+        // new document from an isolate whose zone may have been moved since.
+        self.event_loop.runtime_mut().reapply_profile_timezone();
         let client = crate::net::HttpClient::shared(&profile)
             .map_err(|e| deno_core::error::AnyError::msg(e.to_string()))?;
         crate::js_runtime::extensions::fetch_ext::set_fetch_client(client.clone());

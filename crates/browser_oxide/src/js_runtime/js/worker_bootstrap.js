@@ -100,9 +100,10 @@
         });
     }
 
-    // --- Intl Sync (matches window_bootstrap) ---
+    // --- Intl locale sync (matches window_bootstrap) ---
+    // The timezone needs nothing here: the worker isolate reads ICU's default
+    // zone, which the runtime set to the profile's (`js_runtime/timezone.rs`).
     if (ops.op_has_stealth_profile && ops.op_has_stealth_profile()) {
-        const profileTz = ops.op_get_profile_value("timezone") || "Europe/Moscow";
         const profileLocale = ops.op_get_profile_value("language") || "ru-RU";
         if (globalThis.Intl) {
             const _intlClasses = ['DateTimeFormat', 'NumberFormat', 'Collator', 'PluralRules', 'RelativeTimeFormat'];
@@ -112,7 +113,6 @@
                     const origResolved = proto.resolvedOptions;
                     proto.resolvedOptions = function() {
                         const res = origResolved.call(this);
-                        res.timeZone = profileTz || res.timeZone;
                         res.locale = profileLocale || res.locale;
                         return res;
                     };

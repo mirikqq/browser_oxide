@@ -276,6 +276,9 @@ pub fn create_runtime_with_signals(
         None => FetchState::new(None),
     };
 
+    // Applied once the isolate exists, before any bootstrap script runs.
+    let timezone = options.stealth_profile.as_ref().map(|p| p.timezone.clone());
+
     let stealth_state = StealthState::new_with_flags(
         options.stealth_profile,
         options.cross_origin_isolated,
@@ -330,6 +333,15 @@ pub fn create_runtime_with_signals(
         module_loader,
         ..Default::default()
     });
+
+    // The profile's zone goes into ICU, where every Date and Intl surface
+    // reads it — before the first script, so nothing sees the host zone. The
+    // lease lives in OpState and is released with the runtime.
+    if let Some(zone) = timezone.as_deref() {
+        if let Some(lease) = super::timezone::claim(runtime.v8_isolate(), zone) {
+            runtime.op_state().borrow_mut().put(lease);
+        }
+    }
 
     // Per-runtime NavSignal — populated by JS via op_set_pending_nav,
     // consumed by BrowserEventLoop to short-circuit run_until_idle.
@@ -511,6 +523,14 @@ pub fn create_worker_runtime(
         ],
         ..Default::default()
     });
+
+    // Workers read the same ICU default as their document; claiming it here
+    // also covers a worker whose profile names a zone nothing else set.
+    if let Some(zone) = profile.as_ref().map(|p| p.timezone.as_str()) {
+        if let Some(lease) = super::timezone::claim(runtime.v8_isolate(), zone) {
+            runtime.op_state().borrow_mut().put(lease);
+        }
+    }
 
     // Populate minimum states required by the enabled extensions.
     runtime.op_state().borrow_mut().put(TimerState::new());

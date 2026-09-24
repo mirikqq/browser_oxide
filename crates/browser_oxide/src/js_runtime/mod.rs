@@ -9,6 +9,7 @@ pub mod native_fns;
 pub mod runtime;
 pub mod snapshot;
 pub mod state;
+mod timezone;
 pub mod utils;
 
 use crate::dom::Dom;
@@ -135,6 +136,27 @@ impl BrowserJsRuntime {
         }
         let (inner, nav_signal) = create_runtime_with_signals(dom, options);
         Self::assemble(inner, nav_signal)
+    }
+
+    /// Re-apply the profile's timezone to this isolate.
+    ///
+    /// ICU's default zone is process-wide and set when a runtime is built, so a
+    /// runtime that outlives its first document — a pooled page, a warm
+    /// navigation — has to set it again before serving the next one: any page
+    /// built in between may have moved it. A runtime without a profile has no
+    /// zone to assert and is left alone.
+    pub fn reapply_profile_timezone(&mut self) {
+        let zone = {
+            let op_state = self.inner.op_state();
+            let state = op_state.borrow();
+            state
+                .try_borrow::<extensions::stealth_ext::StealthState>()
+                .and_then(|s| s.profile.as_ref())
+                .map(|p| p.timezone.clone())
+        };
+        if let Some(zone) = zone {
+            timezone::reapply(self.inner.v8_isolate(), &zone);
+        }
     }
 
     /// Returns true iff JS has set a pending navigation since the last
