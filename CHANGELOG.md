@@ -41,6 +41,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of the target (`BehaviorProfile::aim_point`) instead of fresh noise per click.
 
 ### Changed
+- **Breaking:** `Page::human_click` and `Page::human_type` are now `async`.
+  They evaluated synchronously against a `__browserOxide` global that no
+  longer existed, so every call failed; they now run the humanized input
+  routine (trusted events, Sigma-Lognormal path, keystroke timing) to
+  completion and return its status.
 - `net::tls::expected_impersonate` picks the stack by browser family, device
   class and major version from one table; the TLS connector and the HTTP/2
   preface branch on the same decision.

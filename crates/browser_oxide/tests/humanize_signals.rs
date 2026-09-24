@@ -297,3 +297,47 @@ async fn repeated_clicks_land_around_one_off_centre_spot() {
         "clicks scattered: {raw}"
     );
 }
+
+/// The public `Page::human_click` / `human_type` drive the same humanized
+/// routine: trusted events, a real value typed, and a missing element reported
+/// rather than thrown. They used to fail outright on a global that no longer
+/// existed.
+#[tokio::test]
+async fn page_human_click_and_type_drive_the_humanized_routine() {
+    let mut page = Page::from_html(
+        r#"<button id="go" style="position:absolute;left:40px;top:40px;width:90px;height:30px">go</button>
+           <input id="q" style="position:absolute;left:40px;top:120px;width:200px;height:24px">
+           <script>
+             globalThis.__log = [];
+             document.getElementById('go').addEventListener('click', e => __log.push(['click', e.isTrusted]));
+             document.getElementById('q').addEventListener('keydown', e => __log.push(['key', e.isTrusted]));
+           </script>"#,
+        Some(chrome_148_macos()),
+    )
+    .await
+    .unwrap();
+
+    page.human_click("#go").await.expect("click runs");
+    page.human_type("#q", "hello").await.expect("typing runs");
+
+    assert_eq!(
+        page.evaluate("document.getElementById('q').value").unwrap(),
+        "hello"
+    );
+    let log: Vec<(String, bool)> =
+        serde_json::from_str(&page.evaluate("JSON.stringify(__log)").unwrap()).unwrap();
+    assert!(log.iter().any(|(k, _)| k == "click"), "{log:?}");
+    assert_eq!(log.iter().filter(|(k, _)| k == "key").count(), 5, "{log:?}");
+    assert!(
+        log.iter().all(|(_, trusted)| *trusted),
+        "untrusted event: {log:?}"
+    );
+
+    let missing = page
+        .human_click("#nope")
+        .await
+        .expect("reported, not thrown");
+    assert!(!missing.is_empty());
+    // Nothing leaks onto the page's global object.
+    assert_eq!(page.evaluate("typeof __humanInput").unwrap(), "undefined");
+}
