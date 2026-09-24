@@ -70,3 +70,34 @@ prototypes).
 Chrome. It is what filters `ext:`/`deno:`/bootstrap frames out of `Error.stack`;
 dropping it would leak engine-internal frame names into every stack a page reads,
 which is the louder tell of the two.
+
+## Network capture (TLS ClientHello + HTTP/2 preface)
+
+`network_capture.json` is Chrome for Testing 153.0.8010.48 (linux64) talking to
+a loopback server, recorded by `network_capture.py`: a TCP front records the
+ClientHello and forwards to a TLS/h2 back end that decodes the preface. Chrome
+was pointed at it with
+
+```bash
+python3 network_capture.py 40 > out.json &   # cert.pem/key.pem: any self-signed pair for test.example
+chrome --no-proxy-server --ignore-certificate-errors --user-data-dir=/tmp/cap \
+  --host-resolver-rules="MAP test.example:443 127.0.0.1:8443" https://test.example/
+```
+
+(headless and headful under Xvfb gave the same result). GREASE values are
+dropped and extension types are a sorted set, since Chrome permutes them per
+connection. `net::tls` and `net::h2_client` tests compare the engine against it.
+
+Observed and not acted on:
+
+- **Extension 0x12E0 (4832), body `00 00`.** Sent by 153, not by Chromium 141,
+  unknown to our BoringSSL. It is the one pinned divergence in the TLS test and
+  moves JA4's extension count from 17 to 18. Chrome for Testing runs without
+  field trials, so whether stable Chrome enables it for everyone is not known
+  from this capture alone.
+- **`accept-language` right after `sec-ch-ua-platform`** in the navigation
+  headers, in both 153 and Chromium 141. The engine keeps it before `priority`,
+  per earlier captures of stable Chrome; a fresh-profile capture without field
+  trials is not enough to overturn those.
+- Trust Anchor IDs and ECH GREASE differ in length from ours; neither length
+  enters JA4 (the anchor list tracks the root store, ECH GREASE is padded).

@@ -426,6 +426,8 @@ use rand::prelude::SliceRandom;
 
 /// Chrome 152 extension permutation (indices into BoringSSL kExtensions table).
 /// 17 extensions matching a verified Chrome 152 macOS arm64 reference capture.
+/// Chrome 153 sends an 18th, 0x12E0 (4832, body `00 00`), which our BoringSSL
+/// has no codepoint for — see `desktop_client_hello_matches_the_chrome_153_capture`.
 ///
 /// **Real Chrome shuffling behavior** (per Fastly TLS Fingerprinting blog
 /// + Chromestatus 5124606246518784 + BoringSSL `ssl_setup_extension_permutation`
@@ -822,6 +824,172 @@ mod tests {
     /// the constants fails this test loudly), and machine-checks that
     /// the deliberate UA=148 / TLS-ref=147 split is the documented,
     /// wire-coherent one (see [`TLS_CHROME_MAJOR`] docs).
+    /// What a ClientHello says, GREASE values removed. Extension *types* are
+    /// kept as a sorted set: Chrome permutes their order per connection.
+    #[derive(Debug, Default)]
+    struct HelloSummary {
+        ciphers: Vec<u16>,
+        extensions: Vec<u16>,
+        groups: Vec<u16>,
+        key_shares: Vec<u16>,
+        sigalgs: Vec<u16>,
+        bodies: std::collections::HashMap<u16, Vec<u8>>,
+    }
+
+    fn is_grease(v: u16) -> bool {
+        v & 0x0f0f == 0x0a0a
+    }
+
+    fn parse_client_hello(record: &[u8]) -> HelloSummary {
+        let u16_at = |b: &[u8], i: usize| u16::from_be_bytes([b[i], b[i + 1]]);
+        let list = |b: &[u8]| -> Vec<u16> {
+            let n = usize::from(u16_at(b, 0));
+            (0..n / 2)
+                .map(|i| u16_at(b, 2 + 2 * i))
+                .filter(|v| !is_grease(*v))
+                .collect()
+        };
+        let mut out = HelloSummary::default();
+        // record header (5) + handshake header (4) + version (2) + random (32)
+        let mut p = 5 + 4 + 2 + 32;
+        p += 1 + usize::from(record[p]);
+        let cl = usize::from(u16_at(record, p));
+        out.ciphers = list(&record[p..p + 2 + cl]);
+        p += 2 + cl;
+        p += 1 + usize::from(record[p]);
+        let end = p + 2 + usize::from(u16_at(record, p));
+        p += 2;
+        while p < end {
+            let (ty, len) = (u16_at(record, p), usize::from(u16_at(record, p + 2)));
+            let body = record[p + 4..p + 4 + len].to_vec();
+            p += 4 + len;
+            if is_grease(ty) {
+                continue;
+            }
+            match ty {
+                10 => out.groups = list(&body),
+                13 => out.sigalgs = list(&body),
+                51 => {
+                    let mut q = 2;
+                    while q < body.len() {
+                        let group = u16_at(&body, q);
+                        if !is_grease(group) {
+                            out.key_shares.push(group);
+                        }
+                        q += 4 + usize::from(u16_at(&body, q + 2));
+                    }
+                }
+                _ => {}
+            }
+            out.extensions.push(ty);
+            out.bodies.insert(ty, body);
+        }
+        out.extensions.sort_unstable();
+        out
+    }
+
+    /// Our desktop ClientHello against a Chrome 153.0.8010.48 capture
+    /// (`tests/fixtures/chrome153/network_capture.json`, taken on loopback with
+    /// the capture script next to it). Network-free: the hello goes to a local
+    /// listener that never answers.
+    ///
+    /// One known divergence is pinned rather than hidden: Chrome 153 sends an
+    /// extension 0x12E0 (4832, body `00 00`) that Chromium 141 does not and our
+    /// BoringSSL has no codepoint for. It moves the JA4 extension count from 17
+    /// to 18. Any *other* difference fails here.
+    #[tokio::test]
+    async fn desktop_client_hello_matches_the_chrome_153_capture() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/chrome153/network_capture.json"
+        ))
+        .expect("fixture");
+        let tls = &fixture["tls"];
+        let nums = |key: &str| -> Vec<u16> {
+            tls[key]
+                .as_array()
+                .expect(key)
+                .iter()
+                .map(|v| v.as_u64().expect("number") as u16)
+                .collect()
+        };
+        let hex = |key: &str| tls[key].as_str().expect(key).to_string();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut header = [0u8; 5];
+            stream.read_exact(&mut header).await.unwrap();
+            let len = usize::from(u16::from_be_bytes([header[3], header[4]]));
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).await.unwrap();
+            [header.to_vec(), body].concat()
+        });
+        let profile = crate::stealth::presets::chrome_148_windows();
+        let connector = chrome_connector(&profile).expect("connector");
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            connect_tls(&connector, &profile, "test.example", tcp),
+        )
+        .await;
+        let record = tokio::time::timeout(std::time::Duration::from_secs(3), server)
+            .await
+            .expect("server timeout")
+            .expect("server task");
+        let ours = parse_client_hello(&record);
+
+        assert_eq!(ours.ciphers, nums("cipher_suites"), "cipher suites");
+        assert_eq!(ours.groups, nums("supported_groups"), "supported groups");
+        assert_eq!(ours.key_shares, nums("key_share_groups"), "key shares");
+        assert_eq!(
+            ours.sigalgs,
+            nums("signature_algorithms"),
+            "signature algorithms"
+        );
+        let body_hex = |ty: u16| {
+            ours.bodies
+                .get(&ty)
+                .map(|b| b.iter().map(|x| format!("{x:02x}")).collect::<String>())
+                .unwrap_or_default()
+        };
+        assert_eq!(body_hex(16), hex("alpn"), "ALPN");
+        assert_eq!(body_hex(17613), hex("alps_17613"), "ALPS");
+        assert_eq!(
+            body_hex(27),
+            hex("cert_compression"),
+            "certificate compression"
+        );
+        assert_eq!(body_hex(45), hex("psk_modes"), "PSK modes");
+        assert_eq!(body_hex(5), hex("status_request"), "status_request");
+
+        let chrome = nums("extensions");
+        let missing: Vec<u16> = chrome
+            .iter()
+            .copied()
+            .filter(|t| !ours.extensions.contains(t))
+            .collect();
+        let extra: Vec<u16> = ours
+            .extensions
+            .iter()
+            .copied()
+            .filter(|t| !chrome.contains(t))
+            .collect();
+        assert_eq!(
+            extra,
+            Vec::<u16>::new(),
+            "extensions Chrome 153 does not send"
+        );
+        assert_eq!(
+            missing,
+            vec![4832],
+            "extensions missing against Chrome 153 (0x12E0 is the known gap)"
+        );
+    }
+
     /// A version newer than every capture gets the newest one; older than
     /// every capture, the oldest. Either way a real handshake, never an
     /// invented one.
