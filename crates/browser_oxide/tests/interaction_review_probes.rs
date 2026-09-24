@@ -1008,3 +1008,47 @@ async fn p28_disabled_and_contenteditable() {
     let st = page.evaluate("JSON.stringify({ disabled_button_click_listener_ran: __dis, ce_text: document.getElementById('ce').textContent, ce_expando_value: document.getElementById('ce').value, readonly_value: document.getElementById('ro').value })").unwrap();
     report("p28", format!("{{\"click_disabled\":{r1:?},\"type_contenteditable\":{r2:?},\"type_readonly\":{r3:?},\"state\":{st}}}"));
 }
+
+// ---------------------------------------------------------------------------
+// P29 — the owner <iframe> element's `load`, a script-inserted about:blank
+// frame, and `document.hasFocus()` across the frame tree.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+#[ignore = "diagnostic probe: prints observations, asserts nothing"]
+async fn p29_owner_load_about_blank_and_has_focus() {
+    let html = r##"<!doctype html><html><body>
+<iframe id="a" srcdoc="<p>a</p>"></iframe>
+<script>
+globalThis.__loads = [];
+document.getElementById('a').addEventListener('load', function(){ __loads.push('a'); });
+var f = document.createElement('iframe'); f.id = 'dyn';
+f.addEventListener('load', function(){ __loads.push('dyn-about-blank'); });
+document.body.appendChild(f);
+globalThis.__syncAfterAppend = __loads.slice();
+</script></body></html>"##;
+    let mut page = Page::from_html_with_url(html, "http://127.0.0.1:9/", Some(chrome_148_macos()))
+        .await
+        .unwrap();
+    let _ = page.materialize_new_iframes().await;
+    for _ in 0..3 {
+        page.drive_children(Duration::from_millis(50)).await;
+        let _ = page.evaluate_async("0", Duration::from_millis(50)).await;
+    }
+    let child_focus = page
+        .child_iframe(0)
+        .map(|c| {
+            c.evaluate("String(document.hasFocus())")
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    report(
+        "p29",
+        format!(
+            "{{\"owner_load_events\":{},\"sync_load_after_append\":{},\"materialized_children\":{},\"top_hasFocus\":{},\"child_hasFocus\":{child_focus}}}",
+            page.evaluate("JSON.stringify(__loads)").unwrap(),
+            page.evaluate("JSON.stringify(__syncAfterAppend)").unwrap(),
+            page.child_iframe_count(),
+            page.evaluate("String(document.hasFocus())").unwrap(),
+        ),
+    );
+}
