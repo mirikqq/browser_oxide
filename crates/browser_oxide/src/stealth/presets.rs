@@ -1,6 +1,8 @@
 use crate::stealth::profile::{DeviceClass, MediaDeviceInfo, StealthProfile};
 
-const CHROME_DESKTOP_VERSION: &str = "153.0.8010.48";
+/// The full Chrome version every desktop Chrome preset reports; its major is
+/// the one the `chrome_153` wire stack was captured from.
+pub(crate) const CHROME_DESKTOP_VERSION: &str = "153.0.8010.48";
 const CHROME_DESKTOP_TLS: &str = "chrome_153";
 
 fn chrome_desktop_ua(platform: &str) -> String {
@@ -435,7 +437,9 @@ pub fn chrome_148_de() -> StealthProfile {
 pub fn chrome_148_jp() -> StealthProfile {
     let mut p = chrome_148_windows();
     p.language = "ja-JP".into();
-    p.languages = vec!["ja".into(), "en-US".into(), "en".into()];
+    // `language` must lead `languages`, as in every Chrome; the same list the
+    // egress table uses for JP.
+    p.languages = vec!["ja-JP".into(), "ja".into(), "en-US".into(), "en".into()];
     p.timezone = "Asia/Tokyo".into();
     p.canvas_seed = 0x0a00_0000_0000_0001;
     p.audio_seed = 0x0a00_0000_0000_0002;
@@ -1246,7 +1250,7 @@ pub fn iphone_15_pro_safari_18() -> StealthProfile {
         ua_wow64: false,
 
         device_class: DeviceClass::MobileIOS,
-        tls_impersonate: "safari_18_ios".into(), // Phase 3 will wire this up
+        tls_impersonate: "safari_18_ios".into(),
         connection_effective_type: "4g".into(),
         connection_rtt: 50,
         connection_downlink: 10.0,
@@ -1282,9 +1286,226 @@ pub fn iphone_15_pro_safari_18() -> StealthProfile {
     }
 }
 
+/// Every preset this crate ships, by name.
+///
+/// The transport and validation tests walk this list, so a preset added
+/// without a matching wire stack fails the build rather than reaching a site.
+pub fn all() -> Vec<(&'static str, StealthProfile)> {
+    vec![
+        ("chrome_148_windows", chrome_148_windows()),
+        ("chrome_148_macos", chrome_148_macos()),
+        ("chrome_148_linux", chrome_148_linux()),
+        ("chrome_148_ru", chrome_148_ru()),
+        ("chrome_148_cn", chrome_148_cn()),
+        ("chrome_148_de", chrome_148_de()),
+        ("chrome_148_jp", chrome_148_jp()),
+        ("firefox_135_macos", firefox_135_macos()),
+        ("firefox_135_windows", firefox_135_windows()),
+        ("firefox_135_linux", firefox_135_linux()),
+        ("chrome_148_macos_sampled", chrome_148_macos_sampled()),
+        ("pixel_9_pro_chrome_148", pixel_9_pro_chrome_148()),
+        ("iphone_15_pro_safari_18", iphone_15_pro_safari_18()),
+    ]
+}
+
+/// Look a preset up by the name [`all`] gives it.
+pub fn by_name(name: &str) -> Option<StealthProfile> {
+    all()
+        .into_iter()
+        .find(|(candidate, _)| *candidate == name)
+        .map(|(_, profile)| profile)
+}
+
+/// The profile a run should use, from the environment.
+///
+/// Rotating identity from one address is itself a signal — a real address maps
+/// to a stable device — so the default is one fixed profile and everything
+/// else is opt-in, checked in this order:
+///
+/// * `BROWSER_OXIDE_STEALTH_PROFILE_FILE=<path>` loads a YAML/JSON profile
+///   from disk.
+/// * `BROWSER_OXIDE_STEALTH_PROFILE=<name>` pins one of [`all`].
+/// * `BROWSER_OXIDE_STEALTH_SEED=<u64>` samples the Bayesian network with that
+///   seed, so one seed means one stable identity that can be pinned to one
+///   proxy session. Needs the `generator` feature.
+/// * `BROWSER_OXIDE_STEALTH_SAMPLE=1` samples a fresh identity per call.
+///   Needs the `generator` feature.
+///
+/// Anything unusable falls back to [`default_profile`] with a warning rather
+/// than failing the run: a fixed real identity beats no identity.
+pub fn select() -> StealthProfile {
+    if let Some(path) = std::env::var_os("BROWSER_OXIDE_STEALTH_PROFILE_FILE") {
+        match StealthProfile::load_from_file(&path) {
+            Ok(profile) => return profile,
+            Err(error) => tracing::warn!(
+                path = ?path,
+                %error,
+                "BROWSER_OXIDE_STEALTH_PROFILE_FILE could not be loaded; using the default profile"
+            ),
+        }
+    }
+    if let Ok(name) = std::env::var("BROWSER_OXIDE_STEALTH_PROFILE") {
+        match by_name(name.trim()) {
+            Some(profile) => return profile,
+            None => tracing::warn!(
+                %name,
+                "BROWSER_OXIDE_STEALTH_PROFILE names no known preset; using the default profile"
+            ),
+        }
+    }
+
+    let seed = std::env::var("BROWSER_OXIDE_STEALTH_SEED").ok();
+    let parsed_seed = seed
+        .as_deref()
+        .and_then(|seed| seed.trim().parse::<u64>().ok());
+    if let (Some(raw), None) = (&seed, parsed_seed) {
+        tracing::warn!(
+            seed = %raw,
+            "BROWSER_OXIDE_STEALTH_SEED is not a u64; ignoring it"
+        );
+    }
+    let sample =
+        parsed_seed.is_some() || std::env::var_os("BROWSER_OXIDE_STEALTH_SAMPLE").is_some();
+    if sample {
+        let constraints = crate::stealth::generator::Constraints {
+            seed: parsed_seed,
+            ..crate::stealth::generator::Constraints::default()
+        };
+        match crate::stealth::generator::sample(&constraints) {
+            Ok(profile) => return profile,
+            Err(error) => tracing::warn!(
+                %error,
+                "could not sample a fingerprint; using the default profile"
+            ),
+        }
+    }
+
+    default_profile()
+}
+
+/// The identity used when nothing selects another.
+///
+/// Chrome on Windows: the most ordinary desktop client on the web, and the one
+/// least likely to be interesting on its own.
+pub fn default_profile() -> StealthProfile {
+    chrome_148_windows()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every preset declares the wire stack `net::tls` will emit for it — the
+    /// rule `validate()` enforces, checked over the whole catalog so a preset
+    /// added with a mismatched stack fails the build.
+    #[test]
+    fn every_preset_declares_the_stack_it_emits() {
+        for (name, profile) in all() {
+            assert_eq!(
+                profile.tls_impersonate,
+                crate::net::tls::expected_impersonate(&profile),
+                "{name} declares a TLS identity it does not emit"
+            );
+            assert!(
+                profile.validate().is_ok(),
+                "{name}: {:?}",
+                profile.validate()
+            );
+        }
+    }
+
+    /// Every stack name a preset can declare is one `net::tls` can build.
+    #[test]
+    fn every_declared_stack_can_be_built() {
+        let supported: Vec<&str> = crate::net::tls::supported_impersonations().collect();
+        for (name, profile) in all() {
+            assert!(
+                supported.contains(&profile.tls_impersonate.as_str()),
+                "{name} names '{}', which is not a stack net::tls can emit",
+                profile.tls_impersonate
+            );
+            let connector = crate::net::tls::chrome_connector(&profile)
+                .unwrap_or_else(|e| panic!("{name}: connector: {e}"));
+            crate::net::tls::configure_connection(&connector, &profile, "example.com")
+                .unwrap_or_else(|e| panic!("{name}: connection: {e}"));
+        }
+    }
+
+    /// And the reverse: every stack is declared by some preset, so each one is
+    /// built by the test above rather than only listed.
+    #[test]
+    fn every_stack_is_declared_by_some_preset() {
+        let declared: Vec<String> = all().into_iter().map(|(_, p)| p.tls_impersonate).collect();
+        for stack in crate::net::tls::supported_impersonations() {
+            assert!(
+                declared.iter().any(|name| name == stack),
+                "no preset declares {stack}"
+            );
+        }
+    }
+
+    #[test]
+    fn by_name_resolves_every_catalog_entry() {
+        for (name, profile) in all() {
+            let found = by_name(name).unwrap_or_else(|| panic!("{name} not found"));
+            assert_eq!(found.user_agent, profile.user_agent, "{name}");
+        }
+        assert!(by_name("netscape_4").is_none());
+    }
+
+    /// The environment picks the profile; anything unusable falls back to the
+    /// default rather than failing the run.
+    #[test]
+    fn select_reads_the_environment_and_falls_back() {
+        const VARS: [&str; 4] = [
+            "BROWSER_OXIDE_STEALTH_PROFILE_FILE",
+            "BROWSER_OXIDE_STEALTH_PROFILE",
+            "BROWSER_OXIDE_STEALTH_SEED",
+            "BROWSER_OXIDE_STEALTH_SAMPLE",
+        ];
+        let saved: Vec<_> = VARS.iter().map(|v| (v, std::env::var_os(v))).collect();
+        for var in VARS {
+            std::env::remove_var(var);
+        }
+        let default_ua = default_profile().user_agent;
+
+        assert_eq!(select().user_agent, default_ua, "nothing set");
+
+        std::env::set_var("BROWSER_OXIDE_STEALTH_PROFILE", "chrome_148_linux");
+        assert_eq!(select().os_name, "Linux", "a named preset");
+        std::env::set_var("BROWSER_OXIDE_STEALTH_PROFILE", "no_such_preset");
+        assert_eq!(select().user_agent, default_ua, "an unknown name");
+        std::env::remove_var("BROWSER_OXIDE_STEALTH_PROFILE");
+
+        std::env::set_var(
+            "BROWSER_OXIDE_STEALTH_PROFILE_FILE",
+            "/nonexistent/profile.yaml",
+        );
+        assert_eq!(select().user_agent, default_ua, "an unreadable file");
+        std::env::remove_var("BROWSER_OXIDE_STEALTH_PROFILE_FILE");
+
+        std::env::set_var("BROWSER_OXIDE_STEALTH_SEED", "not-a-number");
+        assert_eq!(select().user_agent, default_ua, "an unparsable seed");
+        std::env::set_var("BROWSER_OXIDE_STEALTH_SEED", "42");
+        let seeded = select();
+        seeded.validate().expect("a seeded selection is coherent");
+        if cfg!(feature = "generator") {
+            assert_eq!(
+                seeded.canvas_seed,
+                select().canvas_seed,
+                "one seed, one identity"
+            );
+        } else {
+            assert_eq!(seeded.user_agent, default_ua, "no generator: the default");
+        }
+
+        for (var, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(var, value),
+                None => std::env::remove_var(var),
+            }
+        }
+    }
 
     #[test]
     fn chrome_148_windows_validates() {

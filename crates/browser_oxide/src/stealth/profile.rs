@@ -315,9 +315,11 @@ impl StealthProfile {
             errors.push("WebGL renderer is Apple but vendor doesn't match".into());
         }
 
-        // Apple GPU only on macOS
-        if self.webgl_renderer.contains("Apple") && self.os_name != "macOS" {
-            errors.push("Apple GPU on non-macOS".into());
+        // Apple GPU only on Apple platforms
+        if self.webgl_renderer.contains("Apple")
+            && !matches!(self.os_name.as_str(), "macOS" | "iOS")
+        {
+            errors.push("Apple GPU on non-Apple OS".into());
         }
 
         // Screen dimensions sanity
@@ -372,7 +374,10 @@ impl StealthProfile {
         if self.cpu_cores == 0 || self.cpu_cores > 128 {
             errors.push(format!("Unrealistic cpu_cores: {}", self.cpu_cores));
         }
-        if self.device_memory == 0 || self.device_memory > 64 {
+        // Safari does not expose `navigator.deviceMemory`; its profiles carry 0
+        // for "absent", which is the one place 0 is not a bogus value.
+        let memory_absent = self.browser_name == "Safari" && self.device_memory == 0;
+        if (self.device_memory == 0 && !memory_absent) || self.device_memory > 64 {
             errors.push(format!("Unrealistic device_memory: {}", self.device_memory));
         }
 
@@ -385,8 +390,11 @@ impl StealthProfile {
         }
 
         // === Client Hints consistency ===
-        // Architecture enum
-        if !matches!(self.cpu_architecture.as_str(), "x86" | "arm") {
+        // Architecture enum. Chrome on Android reports an empty architecture
+        // under UA reduction, so "" is the correct value there and only there.
+        let android_reduced =
+            self.device_class == DeviceClass::MobileAndroid && self.cpu_architecture.is_empty();
+        if !android_reduced && !matches!(self.cpu_architecture.as_str(), "x86" | "arm") {
             errors.push(format!(
                 "cpu_architecture must be 'x86' or 'arm' (got '{}')",
                 self.cpu_architecture
@@ -413,12 +421,15 @@ impl StealthProfile {
                 self.platform_version
             ));
         }
-        // Apple Silicon (arm) only on macOS
+        // ARM only where it ships: Apple Silicon, phones, ChromeOS
         if self.cpu_architecture == "arm"
-            && !matches!(self.os_name.as_str(), "macOS" | "Android" | "ChromeOS")
+            && !matches!(
+                self.os_name.as_str(),
+                "macOS" | "iOS" | "Android" | "ChromeOS"
+            )
         {
             errors.push(format!(
-                "cpu_architecture=arm only on macOS/Android/ChromeOS (got '{}')",
+                "cpu_architecture=arm only on macOS/iOS/Android/ChromeOS (got '{}')",
                 self.os_name
             ));
         }
@@ -430,10 +441,10 @@ impl StealthProfile {
             ));
         }
         // The declared TLS identity must be the one the wire stack will
-        // actually emit. `net::tls` picks the stack from browser_name +
-        // device_class; `tls_impersonate` was a free-text field nothing
-        // read, so a profile could claim `firefox_135` and hand a Chrome
-        // ClientHello to the server — the JA4-vs-UA contradiction the
+        // actually emit. `net::tls` picks the stack from the browser family,
+        // device class and major version; `tls_impersonate` was a free-text
+        // field nothing read, so a profile could claim `firefox_135` and hand a
+        // Chrome ClientHello to the server — the JA4-vs-UA contradiction the
         // Firefox branch exists to prevent, reintroduced by a typo.
         let expected_tls = crate::net::tls::expected_impersonate(self);
         if self.tls_impersonate != expected_tls {

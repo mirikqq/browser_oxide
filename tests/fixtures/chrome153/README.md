@@ -70,3 +70,31 @@ prototypes).
 Chrome. It is what filters `ext:`/`deno:`/bootstrap frames out of `Error.stack`;
 dropping it would leak engine-internal frame names into every stack a page reads,
 which is the louder tell of the two.
+
+## Network capture (TLS ClientHello + HTTP/2 preface)
+
+`network_capture.json` is Chrome for Testing 153.0.8010.48 (linux64) talking to
+a loopback server, recorded by `network_capture.py`: a TCP front records the
+ClientHello and forwards to a TLS/h2 back end that decodes the preface. Chrome
+was pointed at it with
+
+```bash
+python3 network_capture.py 40 > out.json &   # cert.pem/key.pem: any self-signed pair for test.example
+chrome --headless=new --disable-field-trial-config --no-proxy-server \
+  --ignore-certificate-errors --user-data-dir=/tmp/cap \
+  --host-resolver-rules="MAP test.example:443 127.0.0.1:8443" https://test.example/
+```
+
+**`--disable-field-trial-config` is required.** Chrome for Testing otherwise
+applies its built-in field-trial testing config, which changes the wire: it
+adds BoringSSL's server-padding experiment extension (4832, body `00 00`,
+`TLSEXT_TYPE_server_padding` upstream) — JA4 `…1518h2` instead of `…1517h2` —
+and moves `accept-language` up to right after `sec-ch-ua-platform`. Neither is
+what a Chrome install with default features sends; with the flag, the capture
+matches the engine exactly.
+
+GREASE values are dropped and extension types are a sorted set, since Chrome
+permutes them per connection. The `net::tls`, `net::h2_client` and
+`net::headers` tests compare the engine against it. Trust Anchor IDs and ECH
+GREASE lengths are not compared: the anchor list tracks the root store and ECH
+GREASE is padded to a varying length; neither length enters JA4.

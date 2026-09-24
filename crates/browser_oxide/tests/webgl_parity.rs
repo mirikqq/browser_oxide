@@ -207,3 +207,78 @@ async fn webgl_debug_renderer_info_extension_present() {
     .await;
     assert_eq!(r, "true");
 }
+
+/// Profiles whose catalog entry holds a WebGL 1 capture in its shared fields
+/// (NVIDIA, Intel, Apple M2 Pro) used to hand that capture to the WebGL 2
+/// context unchanged: `getContext("webgl2")` reported "WebGL 1.0" and listed the
+/// extensions WebGL 2 absorbed into core. Two calls and no GPU knowledge catch
+/// either. Firefox profiles additionally must not show Chrome's GL identity.
+#[tokio::test]
+async fn every_preset_reports_each_api_as_itself() {
+    // Absorbed into core by WebGL 2 — a WebGL 2 context never lists them.
+    const CORE_IN_WEBGL2: [&str; 6] = [
+        "ANGLE_instanced_arrays",
+        "OES_vertex_array_object",
+        "OES_texture_float",
+        "OES_standard_derivatives",
+        "WEBGL_draw_buffers",
+        "WEBGL_depth_texture",
+    ];
+    let probe = "
+        const gl1 = document.createElement('canvas').getContext('webgl');
+        const gl2 = document.createElement('canvas').getContext('webgl2');
+        JSON.stringify({
+            v1: gl1.getParameter(gl1.VERSION),
+            v2: gl2.getParameter(gl2.VERSION),
+            sl2: gl2.getParameter(gl2.SHADING_LANGUAGE_VERSION),
+            vendor2: gl2.getParameter(gl2.VENDOR),
+            unmasked1: gl1.getParameter(0x9246),
+            e1: gl1.getSupportedExtensions(),
+            e2: gl2.getSupportedExtensions(),
+        })
+    ";
+    use browser_oxide::stealth::presets;
+    for (label, profile) in [
+        ("chrome_148_windows", presets::chrome_148_windows()),
+        ("chrome_148_linux", presets::chrome_148_linux()),
+        ("chrome_148_macos", presets::chrome_148_macos()),
+        ("firefox_135_macos", presets::firefox_135_macos()),
+        ("firefox_135_windows", presets::firefox_135_windows()),
+        ("firefox_135_linux", presets::firefox_135_linux()),
+    ] {
+        let firefox = profile.browser_name == "Firefox";
+        let mut page = Page::with_profile(
+            "<!DOCTYPE html><html><body></body></html>",
+            "https://example.com/",
+            profile,
+        )
+        .await
+        .unwrap();
+        let r = page.evaluate(probe).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&r)
+            .unwrap_or_else(|_| panic!("{label}: probe returned non-JSON: {r}"));
+        let text = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+        assert!(text("v1").starts_with("WebGL 1"), "{label}: {v}");
+        assert!(text("v2").starts_with("WebGL 2"), "{label}: {v}");
+        assert!(text("sl2").contains("ES 3.0"), "{label}: {v}");
+        let e2: Vec<String> = serde_json::from_value(v["e2"].clone()).unwrap();
+        let e1: Vec<String> = serde_json::from_value(v["e1"].clone()).unwrap();
+        for absorbed in CORE_IN_WEBGL2 {
+            assert!(
+                !e2.iter().any(|e| e == absorbed),
+                "{label}: webgl2 lists {absorbed}"
+            );
+        }
+        assert!(
+            e1.iter().any(|e| e == "ANGLE_instanced_arrays"),
+            "{label}: webgl1 must keep ANGLE_instanced_arrays: {v}"
+        );
+        if firefox {
+            assert_eq!(text("vendor2"), "Mozilla", "{label}: {v}");
+            assert_eq!(text("unmasked1"), "Mozilla", "{label}: {v}");
+            for k in ["v1", "v2", "sl2"] {
+                assert!(!text(k).contains("Chromium"), "{label}: {k} = {}", text(k));
+            }
+        }
+    }
+}

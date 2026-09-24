@@ -1,7 +1,9 @@
-//! Ordered browser header construction for Chrome 130.
+//! Ordered browser header construction.
 //!
 //! Anti-bot systems check both the presence and order of HTTP headers.
-//! This module builds headers in the exact Chrome 130 order.
+//! This module builds each browser family's headers in its captured order,
+//! with the values (user agent, client hints, languages) taken from the
+//! profile — see `build_sec_ch_ua`.
 
 use crate::stealth::{DeviceClass, StealthProfile};
 
@@ -1434,6 +1436,24 @@ mod tests {
                 "expected header '{required}' missing from accept-ch variant",
             );
         }
+    }
+
+    /// First-visit navigation headers in Chrome 153's order, from the loopback
+    /// capture in `tests/fixtures/chrome153/network_capture.json`.
+    #[test]
+    fn navigation_header_order_matches_the_chrome_153_capture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/chrome153/network_capture.json"
+        ))
+        .expect("fixture");
+        let names: Vec<String> = chrome_headers(&crate::stealth::chrome_148_windows())
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            serde_json::json!(names),
+            fixture["http2"]["navigation_header_order"]
+        );
     }
 
     #[test]

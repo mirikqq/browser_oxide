@@ -252,3 +252,92 @@ async fn humanize_mouse_intervals_are_right_skewed() {
         "interval range must span ≥3× (asymmetric distribution; uniform sampling would have max ≈ min), got min={min} max={max}"
     );
 }
+
+/// Clicks land on the session's habitual spot for a control — inside the middle
+/// half of the box, not its exact centre — and repeated clicks on the same
+/// control cluster around that spot instead of scattering across it.
+#[tokio::test]
+async fn repeated_clicks_land_around_one_off_centre_spot() {
+    // Box: x 280..360, y 180..220 → middle half x 300..340, y 190..210.
+    let mut page = Page::from_html(
+        r#"<button style="position:absolute;left:280px;top:180px;width:80px;height:40px;padding:0;border:0">target</button>
+           <script>globalThis.__clicks=[];document.addEventListener('click',e=>__clicks.push([e.clientX,e.clientY]));</script>"#,
+        Some(chrome_148_macos()),
+    )
+    .await
+    .unwrap();
+    page.evaluate(include_str!("../src/js/humanize.js"))
+        .unwrap();
+    let _ = page
+        .evaluate_async(
+            r#"(async()=>{let ns=null;for(const s of Object.getOwnPropertySymbols(globalThis,1)){const v=globalThis[s];if(v&&v.__bo){ns=v;break}}if(!ns||!ns.input)throw Error('no input');for(let i=0;i<3;i++)await ns.input.clickSelector('button')})()"#,
+            std::time::Duration::from_secs(8),
+        )
+        .await;
+    let raw = page.evaluate("JSON.stringify(__clicks)").unwrap();
+    let clicks: Vec<[f64; 2]> = serde_json::from_str(&raw).unwrap();
+    assert_eq!(clicks.len(), 3, "three clicks: {raw}");
+    for [x, y] in &clicks {
+        assert!(
+            (300.0..=340.0).contains(x) && (190.0..=210.0).contains(y),
+            "{raw}"
+        );
+    }
+    assert!(
+        clicks.iter().any(|c| *c != [320.0, 200.0]),
+        "not the exact centre every time: {raw}"
+    );
+    let spread = |axis: usize| {
+        let values = clicks.iter().map(|c| c[axis]);
+        values.clone().fold(f64::MIN, f64::max) - values.fold(f64::MAX, f64::min)
+    };
+    // Motor noise is ±4% of the extent (3.2 px / 1.6 px) plus rounding.
+    assert!(
+        spread(0) <= 8.0 && spread(1) <= 5.0,
+        "clicks scattered: {raw}"
+    );
+}
+
+/// The public `Page::human_click` / `human_type` drive the same humanized
+/// routine: trusted events, a real value typed, and a missing element reported
+/// rather than thrown. They used to fail outright on a global that no longer
+/// existed.
+#[tokio::test]
+async fn page_human_click_and_type_drive_the_humanized_routine() {
+    let mut page = Page::from_html(
+        r#"<button id="go" style="position:absolute;left:40px;top:40px;width:90px;height:30px">go</button>
+           <input id="q" style="position:absolute;left:40px;top:120px;width:200px;height:24px">
+           <script>
+             globalThis.__log = [];
+             document.getElementById('go').addEventListener('click', e => __log.push(['click', e.isTrusted]));
+             document.getElementById('q').addEventListener('keydown', e => __log.push(['key', e.isTrusted]));
+           </script>"#,
+        Some(chrome_148_macos()),
+    )
+    .await
+    .unwrap();
+
+    page.human_click("#go").await.expect("click runs");
+    page.human_type("#q", "hello").await.expect("typing runs");
+
+    assert_eq!(
+        page.evaluate("document.getElementById('q').value").unwrap(),
+        "hello"
+    );
+    let log: Vec<(String, bool)> =
+        serde_json::from_str(&page.evaluate("JSON.stringify(__log)").unwrap()).unwrap();
+    assert!(log.iter().any(|(k, _)| k == "click"), "{log:?}");
+    assert_eq!(log.iter().filter(|(k, _)| k == "key").count(), 5, "{log:?}");
+    assert!(
+        log.iter().all(|(_, trusted)| *trusted),
+        "untrusted event: {log:?}"
+    );
+
+    let missing = page
+        .human_click("#nope")
+        .await
+        .expect("reported, not thrown");
+    assert!(!missing.is_empty());
+    // Nothing leaks onto the page's global object.
+    assert_eq!(page.evaluate("typeof __humanInput").unwrap(), "undefined");
+}

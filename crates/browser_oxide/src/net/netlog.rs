@@ -34,7 +34,7 @@ pub struct NetRecord {
     /// Decompressed body length in bytes, before truncation.
     pub size: usize,
     pub headers: Vec<(String, String)>,
-    /// Body preview, truncated to [`MAX_BODY`]. Empty for binary types.
+    /// Body preview, truncated to `MAX_BODY` bytes. Empty for binary types.
     pub body: String,
     /// What went *out*. A response alone cannot answer why a server refused:
     /// the question is almost always what was sent — which headers carried the

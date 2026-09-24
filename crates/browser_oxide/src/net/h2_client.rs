@@ -1,17 +1,21 @@
-//! HTTP/2 client with Chrome 147 SETTINGS fingerprint.
+//! HTTP/2 client reproducing the browser's SETTINGS fingerprint — Chrome's,
+//! Firefox's or iOS Safari's, following the profile's wire family (the same
+//! decision `tls::expected_impersonate` names).
 //!
 //! Uses the `http2` crate (a fork of h2) which supports custom
 //! SETTINGS order, pseudo-header order, and stream priority — all
 //! required to match Chrome's HTTP/2 fingerprint.
 //!
-//! Verified byte-for-byte against a fresh Chrome 147 (147.0.0.0)
-//! capture on macOS arm64 from a TLS-fingerprint reference service:
+//! The Chrome values were first verified against a Chrome 147 capture and
+//! re-verified on the wire against Chrome 153.0.8010.48
+//! (`tests/fixtures/chrome153/network_capture.json`, checked by
+//! `chrome_preface_matches_the_chrome_153_capture`):
 //! ```text
 //! akamai_fingerprint: "1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p"
 //! priority: { weight: 256, depends_on: 0, exclusive: 1 }
 //! ```
 
-use crate::stealth::{DeviceClass, StealthProfile};
+use crate::stealth::StealthProfile;
 use bytes::Bytes;
 use http2::client::{Builder, Connection, SendRequest};
 use http2::frame::{PseudoId, PseudoOrder, SettingId, SettingsOrder, StreamDependency, StreamId};
@@ -21,8 +25,8 @@ use crate::net::error::NetError;
 
 /// Chrome HTTP/2 SETTINGS values.
 ///
-/// **Verified against a fresh Chrome 147 capture** from a real browser
-/// via a TLS-fingerprint reference service:
+/// **Verified against Chrome 147 and Chrome 153.0.8010.48 captures** (see the
+/// module docs):
 /// ```text
 /// 1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p
 /// ```
@@ -43,7 +47,7 @@ const MAX_HEADER_LIST_SIZE: u32 = 262_144; // SETTINGS 6 = 256 KB
                                            // http2 lib sends a WINDOW_UPDATE of (target - 65535) on the wire to
                                            // raise the connection window from the protocol default (65535) up to
                                            // the configured value. So 15_728_640 here → 15_663_105 on the wire,
-                                           // which is what real Chrome 147 emits. Verified against wreq-util's
+                                           // which is what the Chrome 147 and 153 captures show. Verified against wreq-util's
                                            // chrome profile (the gold-standard Rust impl,
                                            // `0x676e67/wreq-util/src/emulate/profile/chrome/http2.rs`).
 const INITIAL_CONNECTION_WINDOW_SIZE: u32 = 15_728_640; // → wire 15_663_105 = Chrome match
@@ -84,7 +88,7 @@ const FIREFOX_INITIAL_CONNECTION_WINDOW_SIZE: u32 = 12_582_912; // → wire 12_5
 ///
 /// The connection must be driven by spawning it onto a tokio task.
 /// The sender is used to send requests. Per `profile.device_class`:
-///  - Desktop / Android: Chrome 147 SETTINGS (1,2,4,6) + masp pseudo-header order
+///  - Chrome desktop / Android: Chrome SETTINGS (1,2,4,6) + masp pseudo-header order
 ///    + 6 MB stream window + 15663105 wire connection-window
 ///  - MobileIOS: Safari 18.4 SETTINGS (2,3,4,9) + msap pseudo-header order
 ///    + 2 MB stream window + 10420225 wire connection-window
@@ -95,8 +99,11 @@ pub async fn handshake<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let is_safari_ios = profile.device_class == DeviceClass::MobileIOS;
-    let is_firefox = profile.browser_name == "Firefox";
+    // The TLS stack's decision, so the HTTP/2 preface always belongs to the
+    // same browser as the ClientHello before it.
+    let family = crate::net::tls::wire_family(profile);
+    let is_safari_ios = family == crate::net::tls::WireFamily::SafariIos;
+    let is_firefox = family == crate::net::tls::WireFamily::Firefox;
 
     // Pseudo-header order:
     //   Chrome  (masp) = :method, :authority, :scheme, :path
@@ -216,7 +223,7 @@ where
             .settings_order(settings_order)
             .headers_stream_dependency(StreamDependency::new(
                 StreamId::zero(),
-                // Chrome 147 sends weight 256 (wire byte 255), exclusive=true,
+                // Chrome sends weight 256 (wire byte 255), exclusive=true,
                 // depends_on=0 — verified against a real-browser capture
                 // from a TLS-fingerprint reference service.
                 255,
@@ -333,6 +340,118 @@ pub async fn send_post(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The HTTP/2 preface our Chrome profile writes, against a Chrome
+    /// 153.0.8010.48 capture (`tests/fixtures/chrome153/network_capture.json`):
+    /// SETTINGS, the connection WINDOW_UPDATE, the HEADERS priority and the
+    /// pseudo-header order. Runs over an in-memory pipe — no TLS, no network.
+    #[tokio::test]
+    async fn chrome_preface_matches_the_chrome_153_capture() {
+        use tokio::io::AsyncReadExt;
+
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/chrome153/network_capture.json"
+        ))
+        .expect("fixture");
+        let h2 = &fixture["http2"];
+
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let profile = crate::stealth::presets::chrome_148_windows();
+        let (mut sender, conn) = handshake(client, &profile).await.unwrap();
+        tokio::spawn(conn);
+        tokio::spawn(async move {
+            let _ = send_get(&mut sender, "https://test.example/", "test.example", &[]).await;
+        });
+
+        let mut preface = [0u8; 24];
+        server.read_exact(&mut preface).await.unwrap();
+        assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+
+        let (mut settings, mut window_update, mut headers) = (None, None, None);
+        while headers.is_none() {
+            let mut head = [0u8; 9];
+            server.read_exact(&mut head).await.unwrap();
+            let len = usize::from(head[0]) << 16 | usize::from(head[1]) << 8 | usize::from(head[2]);
+            let mut payload = vec![0u8; len];
+            server.read_exact(&mut payload).await.unwrap();
+            match head[3] {
+                4 => {
+                    settings = Some(
+                        payload
+                            .chunks(6)
+                            .map(|c| {
+                                serde_json::json!([
+                                    u16::from_be_bytes([c[0], c[1]]),
+                                    u32::from_be_bytes([c[2], c[3], c[4], c[5]])
+                                ])
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                }
+                8 => {
+                    window_update = Some(
+                        u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
+                            & 0x7fff_ffff,
+                    )
+                }
+                1 => headers = Some((head[4], payload)),
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            serde_json::json!(settings.unwrap()),
+            h2["settings"],
+            "SETTINGS"
+        );
+        assert_eq!(
+            serde_json::json!(window_update.unwrap()),
+            h2["window_update"]
+        );
+
+        let (flags, block) = headers.unwrap();
+        assert_ne!(flags & 0x20, 0, "HEADERS carries a priority");
+        let dependency = u32::from_be_bytes([block[0], block[1], block[2], block[3]]);
+        let priority = &h2["headers_priority"];
+        assert_eq!(
+            serde_json::json!(dependency >> 31 == 1),
+            priority["exclusive"]
+        );
+        assert_eq!(
+            serde_json::json!(dependency & 0x7fff_ffff),
+            priority["depends_on"]
+        );
+        assert_eq!(serde_json::json!(block[4]), priority["weight_byte"]);
+
+        // The first four HPACK representations name the pseudo-headers; all
+        // reference the static table (:authority 1, :method 2-3, :path 4-5,
+        // :scheme 6-7), whether fully indexed or literal-with-indexed-name.
+        let mut order = Vec::new();
+        let mut p = 5;
+        while order.len() < 4 {
+            let byte = block[p];
+            let (index, literal) = if byte & 0x80 != 0 {
+                (byte & 0x7f, false)
+            } else if byte & 0x40 != 0 {
+                (byte & 0x3f, true)
+            } else {
+                (byte & 0x0f, true)
+            };
+            p += 1;
+            if literal {
+                let value_len = usize::from(block[p] & 0x7f);
+                p += 1 + value_len;
+            }
+            order.push(match index {
+                1 => ":authority",
+                2 | 3 => ":method",
+                4 | 5 => ":path",
+                6 | 7 => ":scheme",
+                other => panic!("unexpected static index {other}"),
+            });
+        }
+        assert_eq!(serde_json::json!(order), h2["pseudo_header_order"]);
+    }
 
     #[tokio::test]
     #[ignore] // requires network

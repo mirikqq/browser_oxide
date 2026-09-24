@@ -6,6 +6,59 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **`getHours()` disagreed with `Intl` under any non-host timezone.** The
+  profile's zone was a JS override of `Intl.DateTimeFormat`,
+  `getTimezoneOffset` and the `toString` family, while the local getters, the
+  `Date` constructor and `Temporal.Now` kept the host's zone — so
+  `new Date().toString()` printed the profile's offset and `getHours()` on the
+  same object the host's hour. The zone is now set as ICU's default before the
+  first script (and again when a pooled page is reused), which every one of
+  those surfaces reads; the ~150-line override is gone. ICU's default is
+  process-wide: concurrently running pages with different zones are logged,
+  and should run in separate processes.
+- **A WebGL 2 context reported itself as WebGL 1** on every profile whose GPU
+  entry holds a WebGL 1 capture — the default Windows/NVIDIA one included:
+  `getContext("webgl2").getParameter(VERSION)` said "WebGL 1.0" and the
+  extension list carried those WebGL 2 absorbed into core. The surface is now
+  derived per API in Rust (`GpuProfile::webgl_surface`), including Gecko's GL
+  identity for Firefox profiles.
+- `chrome_148_jp` listed `language` outside `languages`; `validate()` rejected
+  the Android and iOS presets over rules written for desktop Chrome (empty
+  Android architecture, Apple GPU and ARM on iOS, Safari's absent
+  `deviceMemory`).
+
+- **The profile locale was a JS wrapper** around the `Intl` constructors
+  (whose `prototype.constructor` no longer pointed back at them), forced
+  `resolvedOptions().locale` to the profile's even for an explicit
+  `new Intl.DateTimeFormat("de")`, and missed `toLocaleDateString`,
+  `toLocaleTimeString`, `Number#toLocaleString` and `localeCompare`, which
+  kept the host's locale. It is now ICU's default locale, set alongside the
+  timezone (`uloc_setDefault` + V8's `LocaleConfigurationChangeNotification`),
+  and the `Intl` natives are no longer wrapped.
+
+### Added
+- `stealth::presets::{all, by_name, select, default_profile}` — the preset
+  catalog, and profile selection from `BROWSER_OXIDE_STEALTH_*`. Catalog tests
+  check every preset validates and declares a stack `net::tls` can build.
+- `generator` feature: `stealth::generator` samples Chrome identities from a
+  Bayesian network of observed fingerprints (`veilus-fingerprint`).
+- `geoip` feature: `stealth::geo` resolves the exit address against a local
+  GeoLite2 database before the HTTP providers; downloads only from
+  `BROWSER_OXIDE_GEOIP_URL` (no default source).
+- Humanized clicks land on a per-session, per-control spot in the middle half
+  of the target (`BehaviorProfile::aim_point`) instead of fresh noise per click.
+
+### Changed
+- **Breaking:** `Page::human_click` and `Page::human_type` are now `async`.
+  They evaluated synchronously against a `__browserOxide` global that no
+  longer existed, so every call failed; they now run the humanized input
+  routine (trusted events, Sigma-Lognormal path, keystroke timing) to
+  completion and return its status.
+- `net::tls::expected_impersonate` picks the stack by browser family, device
+  class and major version from one table; the TLS connector and the HTTP/2
+  preface branch on the same decision.
+
 ## [0.1.3]
 
 > Lands the `deno_core` 0.408 bump deferred from 0.1.2 — a V8 isolate must now be

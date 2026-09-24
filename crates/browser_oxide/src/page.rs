@@ -582,6 +582,11 @@ fn preload_dest(kind: &str) -> (&'static str, bool) {
 /// is the only thing that gets them loaded.
 const IMG_SCAN: &str = "(function(){var ns=null;try{var y=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<y.length;i++){var v=globalThis[y[i]];if(v&&v.__bo){ns=v;break;}}}catch(e){}try{if(ns&&ns.images)ns.images.scan();}catch(e){}})();";
 
+/// Upper bound on one [`Page::human_click`] / [`Page::human_type`]: a path,
+/// a settle and a press take well under a second; typing a long string takes
+/// longer, and this still has to end.
+const HUMAN_INPUT_TIMEOUT: Duration = Duration::from_secs(30);
+
 const NS_RESOLVE: &str = "(function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()";
 
 /// Tell the DOM which script the host is about to run.
@@ -1241,8 +1246,9 @@ impl Page {
             .collect()
     }
 
-    /// `(node_id, position among the top document's `<iframe>` elements)` for
-    /// every materialized child frame, in materialization order.
+    /// `(node_id, position)` for every materialized child frame, in
+    /// materialization order — the position counting among the top document's
+    /// `<iframe>` elements.
     ///
     /// The position is `None` when the element the realm was built for is no
     /// longer in the tree. Pairs with [`Self::child_frame_ids`], and exists
@@ -1778,61 +1784,89 @@ impl Page {
             .unwrap_or(false)
     }
 
-    /// Simulate a human-like mouse click on a CSS selector.
-    /// Generates a Bezier curve mouse path, dispatches mousemove events along
-    /// the path, then mousedown+mouseup+click at the target.
-    pub fn human_click(&mut self, selector: &str) -> Result<String, deno_core::error::AnyError> {
-        let sel = selector.replace('\\', "\\\\").replace('"', "\\\"");
-        self.evaluate(&format!(r#"
-            (() => {{
-                const el = document.querySelector("{}");
-                if (!el) return "element not found";
-                const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : {{x:0,y:0,width:100,height:30}};
-                const tx = rect.x + rect.width / 2;
-                const ty = rect.y + rect.height / 2;
-                const path = __browserOxide.humanMousePath(0, 0, tx, ty, 15);
-                for (const p of path) {{
-                    el.dispatchEvent(new MouseEvent('mousemove', {{clientX: p.x, clientY: p.y, bubbles: true}}));
-                }}
-                el.dispatchEvent(new MouseEvent('mousedown', {{clientX: tx, clientY: ty, bubbles: true, button: 0}}));
-                el.dispatchEvent(new MouseEvent('mouseup', {{clientX: tx, clientY: ty, bubbles: true, button: 0}}));
-                el.dispatchEvent(new MouseEvent('click', {{clientX: tx, clientY: ty, bubbles: true, button: 0}}));
-                el.click && el.click();
-                return "clicked";
-            }})()
-        "#, sel))
+    /// Click the element matching `selector` the way a person would: a
+    /// Sigma-Lognormal path to the session's spot on it, a pointer and mouse
+    /// press/release sequence marked trusted, focus moved, the default action
+    /// run — the same routine drivers reach through the input namespace.
+    ///
+    /// Returns the routine's own status text (e.g. an element that is hidden
+    /// or covered is reported, not clicked). Runs the page's event loop until
+    /// the click completes or `HUMAN_INPUT_TIMEOUT` passes.
+    pub async fn human_click(
+        &mut self,
+        selector: &str,
+    ) -> Result<String, deno_core::error::AnyError> {
+        let selector = serde_json::to_string(selector)?;
+        self.run_human_input(&format!("ns.input.clickSelector({selector})"))
+            .await
     }
 
-    /// Simulate human-like typing into a CSS selector (input/textarea).
-    /// Uses variable inter-key timing based on character pairs.
-    pub fn human_type(
+    /// Type `text` into the element matching `selector`: click it first, then
+    /// per-character keydown / input / keyup with the bigram-aware timing
+    /// model, and a final `change`. See [`Self::human_click`] for the result.
+    pub async fn human_type(
         &mut self,
         selector: &str,
         text: &str,
     ) -> Result<String, deno_core::error::AnyError> {
-        let sel = selector.replace('\\', "\\\\").replace('"', "\\\"");
-        let text_escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+        let selector = serde_json::to_string(selector)?;
+        let text = serde_json::to_string(text)?;
+        self.run_human_input(&format!("ns.input.typeSelector({selector}, {text})"))
+            .await
+    }
+
+    /// Run one humanized-input call (`call`, an expression over `ns`, the
+    /// engine's symbol-keyed namespace) to completion and return its result.
+    ///
+    /// These used to evaluate synchronously against a `__browserOxide` global
+    /// that no longer exists, so every call failed with a ReferenceError; and a
+    /// synchronous evaluate cannot wait for input that unfolds over timers
+    /// anyway. The result is parked on the namespace — never on `window` — and
+    /// read back once the loop has run.
+    async fn run_human_input(&mut self, call: &str) -> Result<String, deno_core::error::AnyError> {
+        let installed = self.evaluate(&format!(
+            "String(!!(({NS_RESOLVE})||{{}}).input && typeof ({NS_RESOLVE}).input.clickSelector === 'function')"
+        ))?;
+        if installed != "true" {
+            self.evaluate(include_str!("js/humanize.js"))?;
+        }
         self.evaluate(&format!(
-            r#"
-            (() => {{
-                const el = document.querySelector("{}");
-                if (!el) return "element not found";
-                el.focus && el.focus();
-                const text = "{}";
-                const delays = __browserOxide.humanTypingDelays(text, 65);
-                for (let i = 0; i < text.length; i++) {{
-                    const ch = text[i];
-                    el.dispatchEvent(new KeyboardEvent('keydown', {{key: ch, bubbles: true}}));
-                    el.dispatchEvent(new KeyboardEvent('keypress', {{key: ch, bubbles: true}}));
-                    if (el.value !== undefined) el.value += ch;
-                    el.dispatchEvent(new KeyboardEvent('keyup', {{key: ch, bubbles: true}}));
-                    el.dispatchEvent(new Event('input', {{bubbles: true}}));
+            r#"(() => {{
+                const ns = {NS_RESOLVE};
+                if (!ns || !ns.input || typeof ns.input.clickSelector !== 'function') {{
+                    throw new Error('humanized input is not installed');
                 }}
-                return "typed " + text.length + " chars";
-            }})()
-        "#,
-            sel, text_escaped
-        ))
+                ns.__humanInput = {{ done: false }};
+                Promise.resolve({call}).then(
+                    (r) => {{ ns.__humanInput = {{ done: true, value: String(r) }}; }},
+                    (e) => {{ ns.__humanInput = {{ done: true, error: String(e && e.message || e) }}; }},
+                );
+            }})()"#
+        ))?;
+        let deadline = std::time::Instant::now() + HUMAN_INPUT_TIMEOUT;
+        loop {
+            let state = self.evaluate(&format!(
+                "JSON.stringify((({NS_RESOLVE})||{{}}).__humanInput || null)"
+            ))?;
+            let state: serde_json::Value = serde_json::from_str(&state).unwrap_or_default();
+            if state["done"] == true {
+                let _ = self.evaluate(&format!(
+                    "(() => {{ const ns = {NS_RESOLVE}; if (ns) delete ns.__humanInput; }})()"
+                ));
+                if let Some(error) = state["error"].as_str() {
+                    return Err(deno_core::error::AnyError::msg(error.to_string()));
+                }
+                return Ok(state["value"].as_str().unwrap_or_default().to_string());
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(deno_core::error::AnyError::msg(
+                    "humanized input did not finish in time",
+                ));
+            }
+            self.evaluate_async("0", (deadline - now).min(Duration::from_millis(250)))
+                .await?;
+        }
     }
 
     /// Get the page URL.
@@ -2366,6 +2400,11 @@ impl Page {
     ///   on `globalThis.fetch` / `document.cookie` / `XMLHttpRequest`.
     ///   These are the expensive bits we're reusing.
     pub fn reset_for_reuse(&mut self) {
+        // ICU's defaults are process-wide: any page built since this one may
+        // have moved them, and the next document must not start on those.
+        self.event_loop
+            .runtime_mut()
+            .reapply_profile_intl_defaults();
         let _ = self.event_loop.execute_script(
             r#"(function() {
                 const g = globalThis;
@@ -2507,6 +2546,11 @@ impl Page {
                     )
                 })?
         };
+        // A warm navigation reached without `reset_for_reuse` still serves a
+        // new document from an isolate whose defaults may have moved since.
+        self.event_loop
+            .runtime_mut()
+            .reapply_profile_intl_defaults();
         let client = crate::net::HttpClient::shared(&profile)
             .map_err(|e| deno_core::error::AnyError::msg(e.to_string()))?;
         crate::js_runtime::extensions::fetch_ext::set_fetch_client(client.clone());

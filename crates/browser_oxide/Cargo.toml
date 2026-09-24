@@ -26,6 +26,13 @@ default = []
 webgl-render = ["glow"]
 # Optional in-engine ad/tracker blocker (MPL-2.0 `adblock`); off by default.
 blocker = ["dep:adblock"]
+# Bayesian-network fingerprint sampling (`stealth::generator`); off by default.
+# The network is embedded, but read through a zip reader whose default features
+# build the bzip2 and xz C libraries.
+generator = ["dep:veilus-fingerprint"]
+# Offline GeoLite2 lookup of the exit address (`stealth::geo`); off by default.
+# Inert without a database on disk — see `BROWSER_OXIDE_GEOIP_MMDB` / `_URL`.
+geoip = ["dep:maxminddb"]
 
 [dependencies]
 # --- runtime / async ---
@@ -67,6 +74,10 @@ rustls = { version = "0.23", default-features = false, features = [
   "std",
 ] }
 adblock = { version = "0.13", optional = true }
+# BrowserForge-compatible Bayesian network of observed fingerprints.
+veilus-fingerprint = { version = "0.3.1", optional = true }
+# GeoLite2 (MaxMind DB) reader.
+maxminddb = { version = "0.26", optional = true }
 # --- compression ---
 # zlib-rs backend: canvas pins exact PNG output bytes (png_byte_parity test),
 # which the miniz_oxide default backend does not reproduce.

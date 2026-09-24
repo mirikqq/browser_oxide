@@ -100,26 +100,8 @@
         });
     }
 
-    // --- Intl Sync (matches window_bootstrap) ---
-    if (ops.op_has_stealth_profile && ops.op_has_stealth_profile()) {
-        const profileTz = ops.op_get_profile_value("timezone") || "Europe/Moscow";
-        const profileLocale = ops.op_get_profile_value("language") || "ru-RU";
-        if (globalThis.Intl) {
-            const _intlClasses = ['DateTimeFormat', 'NumberFormat', 'Collator', 'PluralRules', 'RelativeTimeFormat'];
-            for (const klass of _intlClasses) {
-                if (globalThis.Intl[klass]) {
-                    const proto = globalThis.Intl[klass].prototype;
-                    const origResolved = proto.resolvedOptions;
-                    proto.resolvedOptions = function() {
-                        const res = origResolved.call(this);
-                        res.timeZone = profileTz || res.timeZone;
-                        res.locale = profileLocale || res.locale;
-                        return res;
-                    };
-                }
-            }
-        }
-    }
+    // Intl timezone and locale come from ICU's defaults, which the runtime set
+    // to the profile's (`js_runtime/intl.rs`); nothing to patch here.
 
     if (_svc) {
         const WN = _svc.iface("WorkerNavigator");
