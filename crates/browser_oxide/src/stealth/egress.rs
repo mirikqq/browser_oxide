@@ -11,8 +11,33 @@
 //! actually leaves, through the very client that will carry the page load —
 //! proxy included, since that is the address the site sees.
 
+use std::net::IpAddr;
+use std::time::Duration;
+
 use crate::net::HttpClient;
+use crate::stealth::geo;
 use crate::stealth::profile::StealthProfile;
+
+/// How long one provider may take to answer.
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// How long the GeoLite2 download may take. Generous next to a lookup: the
+/// database is tens of megabytes and this happens at most once a month.
+const GEOIP_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Geolocation providers, in preference order. Two report a full record;
+/// `api.country.is` only a country and is the last resort. Independent
+/// operators on purpose: one being down or blocked must not silently leave
+/// every profile mis-localised.
+const PROVIDERS: &[&str] = &[
+    "https://ipinfo.io/json",
+    "https://ipapi.co/json/",
+    "https://api.country.is/",
+];
+
+/// Endpoints that report only the caller's address, for the local-database
+/// route.
+const IP_PROVIDERS: &[&str] = &["https://api.ipify.org", "https://checkip.amazonaws.com"];
 
 /// Country → (language tag, `navigator.languages`, IANA timezone).
 ///
@@ -219,8 +244,9 @@ fn wants_egress(has_proxy: bool, forced: bool, disabled: bool, already_aligned: 
 /// Best-effort: a failed lookup leaves the sampled locale untouched.
 ///
 /// Public so PagePool embedders can align a profile once before handing it to
-/// the pool — the warm-reuse path bakes the timezone into the live isolate at
-/// construction, too early to align per-navigate.
+/// the pool — a pooled page keeps the profile it was built with, so the
+/// alignment has to happen before construction, not per navigate. (Its
+/// timezone is re-applied to ICU on every reuse; see `js_runtime::timezone`.)
 pub async fn align_to_egress(profile: &mut StealthProfile) -> bool {
     let has_proxy = profile.proxy.is_some() || std::env::var_os("BROWSER_OXIDE_PROXY").is_some();
     let forced = std::env::var_os("BROWSER_OXIDE_ALIGN_EGRESS").is_some();
@@ -250,11 +276,14 @@ pub fn known_countries() -> impl Iterator<Item = &'static str> {
     COUNTRY_LOCALES.iter().map(|(c, ..)| *c)
 }
 
-/// The two-letter country of the address this profile's traffic leaves from.
+/// What is known about the address this profile's traffic leaves from.
 ///
 /// Goes through a client built from `profile`, so it follows the same proxy the
 /// page load will: the answer has to describe the address the *site* sees, not
 /// the machine running the engine.
+///
+/// A local GeoLite2 database answers first when there is one (see
+/// [`crate::stealth::geo`]); the HTTP geolocation providers are the fallback.
 ///
 /// `None` on any failure — no network, a lookup that is blocked, an
 /// unrecognised body. The caller keeps its sampled locale in that case, which
@@ -262,28 +291,87 @@ pub fn known_countries() -> impl Iterator<Item = &'static str> {
 /// lookup exists to prevent.
 pub async fn detect_egress(profile: &StealthProfile) -> Option<Egress> {
     let client = HttpClient::shared(profile).ok()?;
-    // Two independent providers: one being down or blocked must not silently
-    // leave every profile mis-localised.
-    for url in [
-        "https://ipinfo.io/json",
-        "https://ipapi.co/json/",
-        "https://api.country.is/",
-    ] {
-        let Ok(resp) =
-            tokio::time::timeout(std::time::Duration::from_secs(6), client.get_follow(url, 3))
-                .await
-        else {
+    if let Some(egress) = detect_via_geolite(&client).await {
+        return Some(egress);
+    }
+    for url in PROVIDERS {
+        let Some(body) = get_text(&client, url).await else {
             continue;
         };
-        let Ok(resp) = resp else { continue };
-        if !resp.ok() {
-            continue;
-        }
-        if let Some(egress) = parse_egress(&resp.text()) {
+        if let Some(egress) = parse_egress(&body) {
             return Some(egress);
         }
     }
     None
+}
+
+/// Learn the exit address, then resolve it against the local database.
+///
+/// Skipped outright when the route is off or there is no database to read:
+/// learning the address costs a request, and spending it with nothing to look
+/// the address up in would only delay the provider fallback.
+async fn detect_via_geolite(client: &HttpClient) -> Option<Egress> {
+    if geo::disabled() {
+        return None;
+    }
+    let path = geo::mmdb_path();
+    if geo::needs_refresh(&path) {
+        // A refresh that fails is not fatal: an existing (stale) database still
+        // answers, and a missing one falls through to the providers.
+        refresh_geolite(client).await;
+    }
+    if !path.is_file() {
+        return None;
+    }
+    let address = detect_public_ip(client).await?;
+    let egress = geo::lookup(address);
+    if egress.is_some() {
+        tracing::debug!(%address, "resolved the egress address from the local GeoLite2 database");
+    }
+    egress
+}
+
+/// Ask an endpoint for the address it sees us as.
+async fn detect_public_ip(client: &HttpClient) -> Option<IpAddr> {
+    for url in IP_PROVIDERS {
+        let Some(body) = get_text(client, url).await else {
+            continue;
+        };
+        if let Ok(address) = body.trim().parse::<IpAddr>() {
+            return Some(address);
+        }
+    }
+    None
+}
+
+/// Download the GeoLite2 database into the cache — only from a source the
+/// operator named ([`geo::mmdb_url`]); there is no default.
+async fn refresh_geolite(client: &HttpClient) {
+    let Some(url) = geo::mmdb_url() else {
+        tracing::debug!("no BROWSER_OXIDE_GEOIP_URL configured; skipping the GeoLite2 download");
+        return;
+    };
+    let download = client.get_follow(&url, 5);
+    let response = match tokio::time::timeout(GEOIP_DOWNLOAD_TIMEOUT, download).await {
+        Ok(Ok(response)) if response.ok() => response,
+        _ => {
+            tracing::debug!(%url, "GeoLite2 download did not complete; continuing without it");
+            return;
+        }
+    };
+    match geo::install(&response.body) {
+        Ok(path) => tracing::info!(path = %path.display(), "cached the GeoLite2 database"),
+        Err(error) => tracing::debug!(%error, "could not cache the GeoLite2 database"),
+    }
+}
+
+/// One GET through the profile's own client, bounded by [`LOOKUP_TIMEOUT`].
+async fn get_text(client: &HttpClient, url: &str) -> Option<String> {
+    let response = tokio::time::timeout(LOOKUP_TIMEOUT, client.get_follow(url, 3))
+        .await
+        .ok()?
+        .ok()?;
+    response.ok().then(|| response.text())
 }
 
 /// Country-only convenience for callers that do not need the rest.

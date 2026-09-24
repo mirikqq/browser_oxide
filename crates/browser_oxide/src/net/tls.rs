@@ -1,9 +1,10 @@
-//! BoringSSL TLS configuration with Chrome 147 fingerprint.
+//! BoringSSL TLS configuration reproducing captured browser ClientHellos.
 //!
-//! Configures TLS to produce a ClientHello identical to Chrome 147,
-//! including cipher suites, curves, signature algorithms, extensions,
-//! and certificate compression — all in the exact order that produces
-//! the correct JA3/JA4 fingerprint.
+//! The Chrome desktop stack is the one captured from Chrome
+//! [`TLS_CHROME_MAJOR`] (cipher suites, curves, signature algorithms,
+//! extensions and certificate compression, all in the order that produces
+//! its JA3/JA4); Chrome Android, Safari on iOS and Firefox each have their
+//! own. [`expected_impersonate`] names the stack a profile gets.
 
 use crate::stealth::{DeviceClass, StealthProfile};
 use boring2::ssl::{
@@ -51,6 +52,97 @@ pub const TLS_CHROME_MAJOR: u32 = 153;
 /// `tls_impersonate` rule in `StealthProfile::validate`.
 pub const UA_CHROME_MAJOR: u32 = 153;
 
+/// Which captured ClientHello family a profile gets on the wire.
+///
+/// The one decision both halves read: [`expected_impersonate`] names the stack
+/// a profile may declare, and [`chrome_connector`] / [`configure_connection`]
+/// branch on the same value to build it, so the declaration and the bytes
+/// cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WireFamily {
+    ChromeDesktop,
+    ChromeAndroid,
+    /// Every browser on iOS: they all run on WebKit's network stack, whatever
+    /// the user agent names.
+    SafariIos,
+    /// NSS-class ClientHello (GeckoView on Android shares it).
+    Firefox,
+}
+
+pub(crate) fn wire_family(profile: &StealthProfile) -> WireFamily {
+    match (profile.device_class, profile.browser_name.as_str()) {
+        (DeviceClass::MobileIOS, _) => WireFamily::SafariIos,
+        (_, "Firefox") => WireFamily::Firefox,
+        (DeviceClass::MobileAndroid, _) => WireFamily::ChromeAndroid,
+        (DeviceClass::Desktop, _) => WireFamily::ChromeDesktop,
+    }
+}
+
+/// A captured ClientHello this module can put on the wire.
+struct Stack {
+    /// The `tls_impersonate` name a profile declares for it.
+    name: &'static str,
+    family: WireFamily,
+    /// The browser major the capture was taken from.
+    major: u32,
+    /// That browser's full version, as a profile built around this stack
+    /// reports it.
+    version: &'static str,
+}
+
+/// Every stack this module can emit, oldest first within a family.
+const STACKS: &[Stack] = &[
+    Stack {
+        name: "chrome_153",
+        family: WireFamily::ChromeDesktop,
+        major: TLS_CHROME_MAJOR,
+        version: crate::stealth::presets::CHROME_DESKTOP_VERSION,
+    },
+    Stack {
+        name: "chrome_147_android",
+        family: WireFamily::ChromeAndroid,
+        major: 147,
+        version: "147.0.7727.117",
+    },
+    Stack {
+        name: "safari_18_ios",
+        family: WireFamily::SafariIos,
+        major: 18,
+        version: "18.0.1",
+    },
+    Stack {
+        name: "firefox_135",
+        family: WireFamily::Firefox,
+        major: 135,
+        version: "135.0",
+    },
+];
+
+/// Every `tls_impersonate` name a profile may declare.
+pub fn supported_impersonations() -> impl Iterator<Item = &'static str> {
+    STACKS.iter().map(|stack| stack.name)
+}
+
+/// The full browser version a stack's capture was taken from, as a profile
+/// built around it reports it (the generator presents sampled machines as
+/// running exactly this version).
+pub fn impersonation_version(name: &str) -> Option<&'static str> {
+    STACKS
+        .iter()
+        .find(|stack| stack.name == name)
+        .map(|stack| stack.version)
+}
+
+/// The major version a profile's `browser_version` names; 0 when unparsable.
+fn browser_major(profile: &StealthProfile) -> u32 {
+    profile
+        .browser_version
+        .split('.')
+        .next()
+        .and_then(|major| major.trim().parse().ok())
+        .unwrap_or(0)
+}
+
 /// The TLS identity `chrome_connector`/`configure_connection` will actually
 /// emit for this profile.
 ///
@@ -63,6 +155,14 @@ pub const UA_CHROME_MAJOR: u32 = 153;
 /// this function, so the field is a machine-checked statement of intent
 /// rather than a comment.
 ///
+/// Within the profile's wire family the stack is the newest capture at or
+/// below the profile's browser major, else the oldest: a profile newer than
+/// every capture still has to put a real handshake on the wire, and the newest
+/// one is the closest available truth — inventing parameters for the version
+/// it names would produce a ClientHello no shipping browser emits. With one
+/// capture per family today this picks that capture; a second capture joins
+/// the stack table and is selected by version with no change here.
+///
 /// This is also what makes TLS *generated* rather than hardcoded: a
 /// generated profile names its TLS identity as data, and the check keeps
 /// that name honest. Note the values are a small set of **captured, real**
@@ -74,17 +174,20 @@ pub const UA_CHROME_MAJOR: u32 = 153;
 /// `CHROME_EXTENSION_PERMUTATION`), so JA3 differs handshake to handshake
 /// while JA4 stays stable — exactly Chrome's own behaviour since 110.
 pub fn expected_impersonate(profile: &StealthProfile) -> &'static str {
-    if profile.browser_name == "Firefox" {
-        return "firefox_135";
-    }
-    match profile.device_class {
-        DeviceClass::MobileIOS => "safari_18_ios",
-        DeviceClass::MobileAndroid => "chrome_147_android",
-        DeviceClass::Desktop => "chrome_153",
-    }
+    let family = wire_family(profile);
+    let major = browser_major(profile);
+    let mut candidates = STACKS.iter().filter(|stack| stack.family == family);
+    let oldest = candidates.clone().next();
+    candidates
+        .rfind(|stack| stack.major <= major)
+        .or(oldest)
+        .map(|stack| stack.name)
+        .expect("STACKS covers every WireFamily")
 }
 
-/// Chrome 147 cipher suite list (order is critical for JA3 fingerprint).
+/// Chrome's cipher suite list, desktop and Android (order is critical for the
+/// JA3 fingerprint). Unchanged through the `chrome_153` capture; pinned by
+/// `tls_fingerprint_vectors_no_silent_drift`.
 const CIPHER_LIST: &str = concat!(
     "TLS_AES_128_GCM_SHA256",
     ":TLS_AES_256_GCM_SHA384",
@@ -103,7 +206,9 @@ const CIPHER_LIST: &str = concat!(
     ":TLS_RSA_WITH_AES_256_CBC_SHA",
 );
 
-/// Chrome 147 signature algorithms (order matters).
+/// Chrome's base signature algorithms (order matters). Desktop Chrome 152+
+/// appends the ML-DSA ones after these — see
+/// `CHROME_DESKTOP_ADVERTISED_EXTRA_SIGALGS`.
 const SIGALGS_LIST: &str = concat!(
     "ecdsa_secp256r1_sha256",
     ":rsa_pss_rsae_sha256",
@@ -397,25 +502,28 @@ fn shuffled_chrome_extension_permutation() -> Vec<u8> {
     permutation
 }
 
-/// Build an `SslConnector` configured with the TLS fingerprint matching
-/// `profile.device_class`. Currently all variants share Chrome 147 desktop
-/// configuration; this also branches for Android and iOS Safari.
+/// Build an `SslConnector` configured with the TLS fingerprint of the
+/// profile's wire family — the same decision [`expected_impersonate`]
+/// names, so the declared stack and the emitted one cannot differ.
 pub fn chrome_connector(profile: &StealthProfile) -> Result<SslConnector, NetError> {
-    // Per-device_class branching.
-    //  - Desktop / Android: shared Chrome 147 cipher/sigalg/extension config.
-    //    Android only diverges in the curves list (Kyber768Draft00 vs MLKEM).
+    // Per-family branching.
+    //  - Chrome desktop / Android: shared cipher/sigalg/extension config.
+    //    Android diverges in the curves list, and desktop alone adds the
+    //    ML-DSA sigalgs and Trust Anchor IDs of the chrome_153 capture.
+    //  - Firefox: the NSS-class ClientHello (see `is_firefox` below).
     //  - MobileIOS: distinct Safari 18 cipher/sigalg/curves + skip Fisher-Yates
     //    extension permutation + zlib cert compression + SslOptions::NO_TICKET.
     //    Per-connection ALPS and ECH grease are also skipped — see
     //    configure_connection() below.
-    let is_safari_ios = profile.device_class == DeviceClass::MobileIOS;
+    let family = wire_family(profile);
+    let is_safari_ios = family == WireFamily::SafariIos;
     // Firefox wire class: a desktop profile whose browser family is Firefox
     // emits an NSS-class ClientHello (no GREASE, FFDHE groups,
     // delegated_credentials + record_size_limit, fixed extension order)
     // instead of Chrome's. Without this a firefox_135_* profile put a
     // Chrome JA4 under a Firefox UA — an incoherent identity that any JA4↔UA
     // cross-check would flag.
-    let is_firefox = profile.browser_name == "Firefox";
+    let is_firefox = family == WireFamily::Firefox;
     let curves: &[SslCurve] = if is_firefox {
         CURVES_FIREFOX
     } else {
@@ -576,7 +684,7 @@ pub fn chrome_connector(profile: &StealthProfile) -> Result<SslConnector, NetErr
         );
     }
 
-    if !is_safari_ios && !is_firefox && profile.device_class == DeviceClass::Desktop {
+    if family == WireFamily::ChromeDesktop {
         let ctx = connector.context().as_ptr();
         // SAFETY: `ctx` is the live SSL_CTX of the connector built above and is
         // not yet shared with any connection. Both setters read `len` elements
@@ -606,7 +714,7 @@ pub fn chrome_connector(profile: &StealthProfile) -> Result<SslConnector, NetErr
 }
 
 /// Configure a per-connection TLS session with ALPS, ECH GREASE, and SNI.
-/// Per-`profile.device_class` branching:
+/// Per-wire-family branching:
 ///  - Desktop / Android: ECH grease + ALPS HTTP/2 SETTINGS payload
 ///  - MobileIOS: skip BOTH (Safari has neither)
 pub fn configure_connection(
@@ -618,8 +726,9 @@ pub fn configure_connection(
         .configure()
         .map_err(|e| NetError::Tls(e.to_string()))?;
 
-    let is_safari_ios = profile.device_class == DeviceClass::MobileIOS;
-    let is_firefox = profile.browser_name == "Firefox";
+    let family = wire_family(profile);
+    let is_safari_ios = family == WireFamily::SafariIos;
+    let is_firefox = family == WireFamily::Firefox;
 
     if !is_safari_ios {
         // ECH GREASE — Chrome desktop+Android AND Firefox all send it.
@@ -628,8 +737,8 @@ pub fn configure_connection(
     }
 
     if !is_safari_ios && !is_firefox {
-        // Application-layer settings (ALPS) for HTTP/2.
-        // Chrome 147 Headless sends 4 settings: 1, 2, 4, 6.
+        // Application-layer settings (ALPS) for HTTP/2: the same four
+        // SETTINGS (1, 2, 4, 6) Chrome's HTTP/2 preface sends — see h2_client.
         // Safari has no ALPS extension at all — skip entirely on iOS.
         // Firefox has no ALPS extension either — skip for the Firefox arm.
         let alps_payload: &[u8] = &[
@@ -713,6 +822,71 @@ mod tests {
     /// the constants fails this test loudly), and machine-checks that
     /// the deliberate UA=148 / TLS-ref=147 split is the documented,
     /// wire-coherent one (see [`TLS_CHROME_MAJOR`] docs).
+    /// A version newer than every capture gets the newest one; older than
+    /// every capture, the oldest. Either way a real handshake, never an
+    /// invented one.
+    #[test]
+    fn the_stack_is_chosen_by_version_within_the_family() {
+        let mut profile = crate::stealth::presets::chrome_148_windows();
+        profile.browser_version = "400.0.1.2".into();
+        assert_eq!(expected_impersonate(&profile), "chrome_153");
+        profile.browser_version = "100.0.0.0".into();
+        assert_eq!(expected_impersonate(&profile), "chrome_153");
+        profile.browser_version = "garbage".into();
+        assert_eq!(expected_impersonate(&profile), "chrome_153");
+    }
+
+    /// Firefox must not be handed the Chromium stack, nor the reverse; and
+    /// every browser on iOS runs on WebKit's network stack.
+    #[test]
+    fn the_browser_family_selects_the_stack_family() {
+        use crate::stealth::presets;
+        assert_eq!(
+            expected_impersonate(&presets::firefox_135_macos()),
+            "firefox_135"
+        );
+        assert_eq!(
+            expected_impersonate(&presets::chrome_148_macos()),
+            "chrome_153"
+        );
+        assert_eq!(
+            expected_impersonate(&presets::pixel_9_pro_chrome_148()),
+            "chrome_147_android"
+        );
+        assert_eq!(
+            expected_impersonate(&presets::iphone_15_pro_safari_18()),
+            "safari_18_ios"
+        );
+        let mut firefox_ios = presets::iphone_15_pro_safari_18();
+        firefox_ios.browser_name = "Firefox".into();
+        assert_eq!(wire_family(&firefox_ios), WireFamily::SafariIos);
+    }
+
+    /// `expected_impersonate` relies on every family having a stack, and each
+    /// stack's full version has to name its own major.
+    #[test]
+    fn the_stack_table_is_complete_and_consistent() {
+        for family in [
+            WireFamily::ChromeDesktop,
+            WireFamily::ChromeAndroid,
+            WireFamily::SafariIos,
+            WireFamily::Firefox,
+        ] {
+            assert!(
+                STACKS.iter().any(|stack| stack.family == family),
+                "{family:?} has no stack"
+            );
+        }
+        for stack in STACKS {
+            assert_eq!(
+                stack.version.split('.').next(),
+                Some(stack.major.to_string().as_str()),
+                "{}",
+                stack.name
+            );
+        }
+    }
+
     #[test]
     fn tls_fingerprint_vectors_no_silent_drift() {
         // --- JA4 input 1: cipher suites (order is JA4-significant) ---

@@ -8,12 +8,15 @@
 pub mod behavior;
 pub mod config;
 pub mod egress;
+pub mod generator;
+pub mod geo;
 pub mod gpu;
 pub mod presets;
 pub mod profile;
 
 pub use behavior::{BehaviorProfile, Handedness, MousePoint, ScrollStyle, WheelTick};
 pub use config::{ConfigError, ConfigFormat};
+pub use generator::{Constraints, GeneratorError};
 pub use gpu::GpuProfile;
 pub use presets::*;
 pub use profile::{DeviceClass, StealthProfile};

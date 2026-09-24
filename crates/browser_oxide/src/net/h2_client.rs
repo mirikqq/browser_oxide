@@ -1,17 +1,22 @@
-//! HTTP/2 client with Chrome 147 SETTINGS fingerprint.
+//! HTTP/2 client reproducing the browser's SETTINGS fingerprint — Chrome's,
+//! Firefox's or iOS Safari's, following the profile's wire family (the same
+//! decision `tls::expected_impersonate` names).
 //!
 //! Uses the `http2` crate (a fork of h2) which supports custom
 //! SETTINGS order, pseudo-header order, and stream priority — all
 //! required to match Chrome's HTTP/2 fingerprint.
 //!
-//! Verified byte-for-byte against a fresh Chrome 147 (147.0.0.0)
-//! capture on macOS arm64 from a TLS-fingerprint reference service:
+//! The Chrome values were verified byte-for-byte against a Chrome 147
+//! (147.0.0.0) capture on macOS arm64 from a TLS-fingerprint reference
+//! service. The profiles now claim Chrome 153; Chrome's HTTP/2 fingerprint
+//! has held these values across many majors, but it has not been re-captured
+//! on 153 — do that before trusting this block for a newer major:
 //! ```text
 //! akamai_fingerprint: "1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p"
 //! priority: { weight: 256, depends_on: 0, exclusive: 1 }
 //! ```
 
-use crate::stealth::{DeviceClass, StealthProfile};
+use crate::stealth::StealthProfile;
 use bytes::Bytes;
 use http2::client::{Builder, Connection, SendRequest};
 use http2::frame::{PseudoId, PseudoOrder, SettingId, SettingsOrder, StreamDependency, StreamId};
@@ -21,8 +26,9 @@ use crate::net::error::NetError;
 
 /// Chrome HTTP/2 SETTINGS values.
 ///
-/// **Verified against a fresh Chrome 147 capture** from a real browser
-/// via a TLS-fingerprint reference service:
+/// **Verified against a Chrome 147 capture** from a real browser via a
+/// TLS-fingerprint reference service (not yet re-captured on 153, see the
+/// module docs):
 /// ```text
 /// 1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p
 /// ```
@@ -43,7 +49,7 @@ const MAX_HEADER_LIST_SIZE: u32 = 262_144; // SETTINGS 6 = 256 KB
                                            // http2 lib sends a WINDOW_UPDATE of (target - 65535) on the wire to
                                            // raise the connection window from the protocol default (65535) up to
                                            // the configured value. So 15_728_640 here → 15_663_105 on the wire,
-                                           // which is what real Chrome 147 emits. Verified against wreq-util's
+                                           // which is what the Chrome 147 capture shows. Verified against wreq-util's
                                            // chrome profile (the gold-standard Rust impl,
                                            // `0x676e67/wreq-util/src/emulate/profile/chrome/http2.rs`).
 const INITIAL_CONNECTION_WINDOW_SIZE: u32 = 15_728_640; // → wire 15_663_105 = Chrome match
@@ -84,7 +90,7 @@ const FIREFOX_INITIAL_CONNECTION_WINDOW_SIZE: u32 = 12_582_912; // → wire 12_5
 ///
 /// The connection must be driven by spawning it onto a tokio task.
 /// The sender is used to send requests. Per `profile.device_class`:
-///  - Desktop / Android: Chrome 147 SETTINGS (1,2,4,6) + masp pseudo-header order
+///  - Chrome desktop / Android: Chrome SETTINGS (1,2,4,6) + masp pseudo-header order
 ///    + 6 MB stream window + 15663105 wire connection-window
 ///  - MobileIOS: Safari 18.4 SETTINGS (2,3,4,9) + msap pseudo-header order
 ///    + 2 MB stream window + 10420225 wire connection-window
@@ -95,8 +101,11 @@ pub async fn handshake<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let is_safari_ios = profile.device_class == DeviceClass::MobileIOS;
-    let is_firefox = profile.browser_name == "Firefox";
+    // The TLS stack's decision, so the HTTP/2 preface always belongs to the
+    // same browser as the ClientHello before it.
+    let family = crate::net::tls::wire_family(profile);
+    let is_safari_ios = family == crate::net::tls::WireFamily::SafariIos;
+    let is_firefox = family == crate::net::tls::WireFamily::Firefox;
 
     // Pseudo-header order:
     //   Chrome  (masp) = :method, :authority, :scheme, :path
@@ -216,7 +225,7 @@ where
             .settings_order(settings_order)
             .headers_stream_dependency(StreamDependency::new(
                 StreamId::zero(),
-                // Chrome 147 sends weight 256 (wire byte 255), exclusive=true,
+                // Chrome sends weight 256 (wire byte 255), exclusive=true,
                 // depends_on=0 — verified against a real-browser capture
                 // from a TLS-fingerprint reference service.
                 255,
