@@ -16,10 +16,15 @@ use std::convert::TryInto;
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_int, c_uint, c_ulong};
 
+// `unpredictable_function_pointer_comparisons`: bindgen derives `PartialEq`
+// on structs that hold C callbacks (`OPENSSL_sk_cmp_func` and friends), and
+// the lint fires on that generated derive. This crate is a path dependency, so
+// its lints are not capped and `RUSTFLAGS=-D warnings` would fail the build.
 #[allow(
     clippy::useless_transmute,
     clippy::derive_partial_eq_without_eq,
-    dead_code
+    dead_code,
+    unpredictable_function_pointer_comparisons
 )]
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));

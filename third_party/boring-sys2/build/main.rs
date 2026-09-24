@@ -730,7 +730,11 @@ fn main() {
     let supports_layout_tests = autocfg::new().probe_rustc_version(1, 77);
 
     let mut builder = bindgen::Builder::default()
-        .rust_target(bindgen::RustTarget::Stable_1_68) // bindgen MSRV is 1.70, so this is enough
+        // bindgen MSRV is 1.70, so this is enough. `RustTarget::stable` is the
+        // non-deprecated spelling of the `Stable_1_68` constant: same target.
+        .rust_target(
+            bindgen::RustTarget::stable(68, 0).expect("1.68 is a supported bindgen target"),
+        )
         .derive_copy(true)
         .derive_debug(true)
         .derive_default(true)
