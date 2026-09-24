@@ -55,6 +55,10 @@ up; the catalog tests walk that list, so a preset whose declared TLS stack
 
 ### Sampled from the fingerprint network (`generator` feature)
 
+The `generator` feature is part of the default `stealth` feature, so this is
+available without any flag; `default-features = false` leaves it out, and
+`sample` then returns `GeneratorError::Unavailable`.
+
 `stealth::generator::sample(&Constraints { seed, os, .. })` draws a Chrome
 desktop identity from a Bayesian network of observed fingerprints
 (BrowserForge's), so the *combinations* of screen, cores, memory and GPU are

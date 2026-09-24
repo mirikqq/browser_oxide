@@ -113,11 +113,12 @@ jobs:
         env:
           CARGO_INCREMENTAL: "0"
 
-      # The optional stealth sources are off by default, so the step above never
-      # compiles them. Their tests are pure Rust — no page, no network — and
-      # cheap to run on their own.
-      - name: Test optional stealth features (generator, geoip)
-        run: "cargo test -p browser_oxide --lib --features generator,geoip -- --test-threads=1 stealth::"
+      # The `stealth` feature (generator + geoip) is on by default, so the step
+      # above only ever compiles the stealth sources *with* it. This covers the
+      # `default-features = false` side: the fallbacks those modules take
+      # without their dependencies. Pure Rust — no page, no network — and cheap.
+      - name: Test stealth sources without the default features
+        run: "cargo test -p browser_oxide --lib --no-default-features -- --test-threads=1 stealth::"
         env:
           CARGO_INCREMENTAL: "0"
 
