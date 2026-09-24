@@ -28,6 +28,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Android architecture, Apple GPU and ARM on iOS, Safari's absent
   `deviceMemory`).
 
+- **The profile locale was a JS wrapper** around the `Intl` constructors
+  (whose `prototype.constructor` no longer pointed back at them), forced
+  `resolvedOptions().locale` to the profile's even for an explicit
+  `new Intl.DateTimeFormat("de")`, and missed `toLocaleDateString`,
+  `toLocaleTimeString`, `Number#toLocaleString` and `localeCompare`, which
+  kept the host's locale. It is now ICU's default locale, set alongside the
+  timezone (`uloc_setDefault` + V8's `LocaleConfigurationChangeNotification`),
+  and the `Intl` natives are no longer wrapped.
+
 ### Added
 - `stealth::presets::{all, by_name, select, default_profile}` — the preset
   catalog, and profile selection from `BROWSER_OXIDE_STEALTH_*`. Catalog tests

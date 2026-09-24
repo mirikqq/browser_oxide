@@ -4,12 +4,12 @@
 
 pub mod extensions;
 pub mod inspect;
+mod intl;
 pub mod module_loader;
 pub mod native_fns;
 pub mod runtime;
 pub mod snapshot;
 pub mod state;
-mod timezone;
 pub mod utils;
 
 use crate::dom::Dom;
@@ -138,24 +138,30 @@ impl BrowserJsRuntime {
         Self::assemble(inner, nav_signal)
     }
 
-    /// Re-apply the profile's timezone to this isolate.
+    /// Re-apply the profile's timezone and locale to this isolate.
     ///
-    /// ICU's default zone is process-wide and set when a runtime is built, so a
+    /// ICU's defaults are process-wide and set when a runtime is built, so a
     /// runtime that outlives its first document — a pooled page, a warm
-    /// navigation — has to set it again before serving the next one: any page
-    /// built in between may have moved it. A runtime without a profile has no
-    /// zone to assert and is left alone.
-    pub fn reapply_profile_timezone(&mut self) {
-        let zone = {
+    /// navigation — has to set them again before serving the next one: any page
+    /// built in between may have moved them. A runtime without a profile has
+    /// nothing to assert and is left alone.
+    pub fn reapply_profile_intl_defaults(&mut self) {
+        let wanted = {
             let op_state = self.inner.op_state();
             let state = op_state.borrow();
             state
                 .try_borrow::<extensions::stealth_ext::StealthState>()
                 .and_then(|s| s.profile.as_ref())
-                .map(|p| p.timezone.clone())
+                .map(|p| (p.timezone.clone(), p.language.clone()))
         };
-        if let Some(zone) = zone {
-            timezone::reapply(self.inner.v8_isolate(), &zone);
+        if let Some((timezone, locale)) = wanted {
+            intl::reapply(
+                self.inner.v8_isolate(),
+                &intl::IntlDefaults {
+                    timezone: &timezone,
+                    locale: &locale,
+                },
+            );
         }
     }
 

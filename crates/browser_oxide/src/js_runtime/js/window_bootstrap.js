@@ -2465,79 +2465,11 @@
         usedJSHeapSize: 8000000,
     };
 
-    // =========================================================
-    // Intl locale consistency.
-    //
-    // The timezone is NOT handled here: the runtime sets the profile's zone as
-    // ICU's default before bootstrap (`js_runtime/timezone.rs`), which is where
-    // V8 reads local time, the `Intl` default zone and `toLocale*String` alike.
-    // The JS override that used to live here re-pointed `Intl`,
-    // `getTimezoneOffset` and the `toString` family, but not the local getters
-    // or the `Date` constructor — so `toString()` printed the profile's offset
-    // while `getHours()` on the same object returned the host's hour.
-    //
-    // What remains is the default *locale*, which V8 takes from ICU's default
-    // locale — the host's, not the profile's.
-    //
-    // IMPORTANT: the original gate `if (op_has_stealth_profile())` fired at
-    // V8-snapshot-build time — returning false and skipping the patch. The
-    // snapshot then froze stock V8 Intl, so no override ever took effect when a
-    // profile loaded. Install unconditionally; each call reads the live profile
-    // via _p, falling back to stock V8 when no profile is installed.
-    // =========================================================
-    if (globalThis.Intl) {
-        const _profileLocale = () => _p("language", "");
-
-        const _patchIntl = (klass) => {
-            if (!globalThis.Intl[klass]) return;
-            const _Orig = globalThis.Intl[klass];
-            const Patched = function(...args) {
-                let locales = args[0];
-                const pLoc = _profileLocale();
-                if (!locales && pLoc) locales = pLoc;
-                return new _Orig(locales, args[1]);
-            };
-            Patched.prototype = _Orig.prototype;
-            if (_Orig.supportedLocalesOf) Patched.supportedLocalesOf = _Orig.supportedLocalesOf.bind(_Orig);
-            // Real Chrome's Intl.DateTimeFormat/etc. constructors report
-            // their own class name here — a wrapper's `.name` defaulting to
-            // "Patched" is a direct giveaway (`Intl.DateTimeFormat.name`
-            // is a one-line probe).
-            if (typeof _maskFunction === "function") _maskFunction(Patched, klass);
-            else Object.defineProperty(Patched, 'name', { value: klass, configurable: true });
-            Object.defineProperty(globalThis.Intl, klass, { value: Patched, writable: true, configurable: true });
-        };
-
-        for (const k of ['DateTimeFormat', 'NumberFormat', 'Collator', 'PluralRules', 'RelativeTimeFormat']) {
-            _patchIntl(k);
-        }
-
-        // Deep prototype override: resolvedOptions() must report the
-        // profile's locale regardless of how the instance was constructed.
-        for (const klass of ['DateTimeFormat', 'NumberFormat', 'Collator', 'PluralRules', 'RelativeTimeFormat']) {
-            if (!globalThis.Intl[klass]) continue;
-            const proto = globalThis.Intl[klass].prototype;
-            const origResolved = proto.resolvedOptions;
-            proto.resolvedOptions = { resolvedOptions() {
-                const res = origResolved.call(this);
-                const pLoc = _profileLocale();
-                if (pLoc) res.locale = pLoc;
-                return res;
-            } }.resolvedOptions;
-            if (typeof _maskAsNative === "function") _maskAsNative(proto, 'resolvedOptions');
-        }
-
-        // Date.prototype.toLocaleString() with no locale formats in V8's
-        // default locale; give it the profile's, as the constructors above do.
-        // Method shorthand (no `prototype`, length 0) masked like the rest.
-        const _origDateToLocaleString = Date.prototype.toLocaleString;
-        Date.prototype.toLocaleString = { toLocaleString(...args) {
-            const loc = _profileLocale();
-            if (args[0] !== undefined || !loc) return _origDateToLocaleString.apply(this, args);
-            return _origDateToLocaleString.call(this, loc, args[1]);
-        } }.toLocaleString;
-        if (typeof _maskAsNative === "function") _maskAsNative(Date.prototype, 'toLocaleString');
-    }
+    // Intl timezone and locale: nothing to patch here. The runtime sets the
+    // profile's zone and locale as ICU's defaults before bootstrap
+    // (`js_runtime/intl.rs`), which is where V8 reads local time, the `Intl`
+    // defaults and every `toLocale*String` — so the natives stay untouched and
+    // cannot disagree with each other.
 
     // =========================================================
     // PerformanceNavigationTiming + PerformanceResourceTiming

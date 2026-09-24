@@ -1,4 +1,4 @@
-//! Every Date and Intl surface reports the profile's timezone, and they agree
+//! Every Date and Intl surface reports the profile's timezone and locale, and they agree
 //! with each other — on a fresh page and on a pooled one that is reused after
 //! another page moved the process-wide ICU zone.
 //!
@@ -145,4 +145,78 @@ async fn an_unknown_zone_is_not_half_applied() {
         .expect("page");
     // The process default stays what it was, and every surface agrees on it.
     assert_consistent(&mut page, "Europe/Berlin");
+}
+
+/// Every locale-dependent surface formats in the profile's locale, and the
+/// `Intl` constructors are V8's own again.
+const LOCALE_PROBE: &str = r#"(() => {
+    const d = new Date(Date.UTC(2026, 0, 2, 12));
+    const n = 1234567.5;
+    return JSON.stringify({
+        navigator: navigator.language,
+        dtf: Intl.DateTimeFormat().resolvedOptions().locale,
+        nf: new Intl.NumberFormat().resolvedOptions().locale,
+        collator: new Intl.Collator().resolvedOptions().locale,
+        numberSame: n.toLocaleString() === new Intl.NumberFormat().format(n),
+        dateSame: d.toLocaleDateString() === new Intl.DateTimeFormat().format(d),
+        timeSame: d.toLocaleTimeString() === new Intl.DateTimeFormat(undefined, { timeStyle: "medium" }).format(d),
+        explicit: new Intl.DateTimeFormat("de").resolvedOptions().locale,
+        ctor: Intl.DateTimeFormat.prototype.constructor === Intl.DateTimeFormat
+            && Intl.NumberFormat.prototype.constructor === Intl.NumberFormat,
+        number: n.toLocaleString(),
+    });
+})()"#;
+
+fn with_locale(language: &str, languages: &[&str]) -> StealthProfile {
+    let mut profile = presets::chrome_148_windows();
+    profile.language = language.to_string();
+    profile.languages = languages.iter().map(|s| s.to_string()).collect();
+    profile
+}
+
+fn locale_probe(page: &mut Page) -> serde_json::Value {
+    serde_json::from_str(&page.evaluate(LOCALE_PROBE).expect("probe runs")).expect("JSON")
+}
+
+#[tokio::test]
+async fn every_locale_surface_reads_the_profile_locale() {
+    let mut page = Page::with_profile(HTML, URL, with_locale("ru-RU", &["ru-RU", "ru", "en"]))
+        .await
+        .expect("page");
+    let p = locale_probe(&mut page);
+    for key in ["navigator", "dtf", "nf", "collator"] {
+        assert_eq!(p[key], "ru-RU", "{key}: {p}");
+    }
+    for key in ["numberSame", "dateSame", "timeSame", "ctor"] {
+        assert_eq!(p[key], true, "{key}: {p}");
+    }
+    // Russian grouping and decimal separator, not the host's `1,234,567.5`.
+    assert_eq!(p["number"], "1\u{a0}234\u{a0}567,5", "{p}");
+    // An explicit locale is honoured, not overwritten with the profile's.
+    assert_eq!(p["explicit"], "de", "{p}");
+}
+
+/// Same rule as the zone: a pooled page gets its locale back after another
+/// page moved the process default.
+#[tokio::test]
+async fn a_reused_page_gets_its_locale_back() {
+    let pool = PagePool::new(1);
+    let page = pool
+        .acquire(Some(with_locale("ja-JP", &["ja-JP", "ja", "en-US", "en"])))
+        .await
+        .expect("pooled page");
+    pool.release(page);
+    {
+        let mut other = Page::with_profile(HTML, URL, with_locale("de-DE", &["de-DE", "de"]))
+            .await
+            .expect("page");
+        assert_eq!(locale_probe(&mut other)["dtf"], "de-DE");
+    }
+    let mut reused = pool
+        .acquire(Some(with_locale("ja-JP", &["ja-JP", "ja", "en-US", "en"])))
+        .await
+        .expect("reused page");
+    let p = locale_probe(&mut reused);
+    assert_eq!(p["dtf"], "ja-JP", "{p}");
+    assert_eq!(p["numberSame"], true, "{p}");
 }

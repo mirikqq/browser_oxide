@@ -100,26 +100,8 @@
         });
     }
 
-    // --- Intl locale sync (matches window_bootstrap) ---
-    // The timezone needs nothing here: the worker isolate reads ICU's default
-    // zone, which the runtime set to the profile's (`js_runtime/timezone.rs`).
-    if (ops.op_has_stealth_profile && ops.op_has_stealth_profile()) {
-        const profileLocale = ops.op_get_profile_value("language") || "ru-RU";
-        if (globalThis.Intl) {
-            const _intlClasses = ['DateTimeFormat', 'NumberFormat', 'Collator', 'PluralRules', 'RelativeTimeFormat'];
-            for (const klass of _intlClasses) {
-                if (globalThis.Intl[klass]) {
-                    const proto = globalThis.Intl[klass].prototype;
-                    const origResolved = proto.resolvedOptions;
-                    proto.resolvedOptions = function() {
-                        const res = origResolved.call(this);
-                        res.locale = profileLocale || res.locale;
-                        return res;
-                    };
-                }
-            }
-        }
-    }
+    // Intl timezone and locale come from ICU's defaults, which the runtime set
+    // to the profile's (`js_runtime/intl.rs`); nothing to patch here.
 
     if (_svc) {
         const WN = _svc.iface("WorkerNavigator");

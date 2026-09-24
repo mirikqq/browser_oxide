@@ -277,7 +277,10 @@ pub fn create_runtime_with_signals(
     };
 
     // Applied once the isolate exists, before any bootstrap script runs.
-    let timezone = options.stealth_profile.as_ref().map(|p| p.timezone.clone());
+    let intl_defaults = options
+        .stealth_profile
+        .as_ref()
+        .map(|p| (p.timezone.clone(), p.language.clone()));
 
     let stealth_state = StealthState::new_with_flags(
         options.stealth_profile,
@@ -334,13 +337,15 @@ pub fn create_runtime_with_signals(
         ..Default::default()
     });
 
-    // The profile's zone goes into ICU, where every Date and Intl surface
-    // reads it — before the first script, so nothing sees the host zone. The
-    // lease lives in OpState and is released with the runtime.
-    if let Some(zone) = timezone.as_deref() {
-        if let Some(lease) = super::timezone::claim(runtime.v8_isolate(), zone) {
-            runtime.op_state().borrow_mut().put(lease);
-        }
+    // The profile's zone and locale go into ICU, where every Date and Intl
+    // surface reads them — before the first script, so nothing sees the host's.
+    // The lease lives in OpState and is released with the runtime.
+    if let Some((timezone, locale)) = &intl_defaults {
+        let lease = super::intl::claim(
+            runtime.v8_isolate(),
+            &super::intl::IntlDefaults { timezone, locale },
+        );
+        runtime.op_state().borrow_mut().put(lease);
     }
 
     // Per-runtime NavSignal — populated by JS via op_set_pending_nav,
@@ -524,12 +529,17 @@ pub fn create_worker_runtime(
         ..Default::default()
     });
 
-    // Workers read the same ICU default as their document; claiming it here
-    // also covers a worker whose profile names a zone nothing else set.
-    if let Some(zone) = profile.as_ref().map(|p| p.timezone.as_str()) {
-        if let Some(lease) = super::timezone::claim(runtime.v8_isolate(), zone) {
-            runtime.op_state().borrow_mut().put(lease);
-        }
+    // Workers read the same ICU defaults as their document; claiming them here
+    // also covers a worker whose profile names values nothing else set.
+    if let Some(p) = profile.as_ref() {
+        let lease = super::intl::claim(
+            runtime.v8_isolate(),
+            &super::intl::IntlDefaults {
+                timezone: &p.timezone,
+                locale: &p.language,
+            },
+        );
+        runtime.op_state().borrow_mut().put(lease);
     }
 
     // Populate minimum states required by the enabled extensions.

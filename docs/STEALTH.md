@@ -174,7 +174,7 @@ default and may be omitted from YAML/JSON; everything else is required.
 
 | Field | Type | Notes |
 |---|---|---|
-| `language` | String | Primary, e.g. `"en-US"`. Must appear in `languages`. |
+| `language` | String | Primary, e.g. `"en-US"`. Must appear in `languages`. Also applied as ICU's default locale, so `Intl` defaults and every `toLocale*String` format in it; process-wide like `timezone` below. A tag ICU cannot parse is refused. |
 | `languages` | Vec<String> | `navigator.languages`. |
 | `timezone` | String | IANA name, e.g. `"America/New_York"`. Applied as ICU's default zone, so `Date` (local getters, constructor, `toString`), `Intl` and `Temporal` all report it. ICU's default is **process-wide**: pages running concurrently with different zones cannot all be right — use one timezone per process. An id ICU does not know is refused (the process default stays). |
 
