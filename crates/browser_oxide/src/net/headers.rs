@@ -1,7 +1,9 @@
-//! Ordered browser header construction for Chrome 130.
+//! Ordered browser header construction.
 //!
 //! Anti-bot systems check both the presence and order of HTTP headers.
-//! This module builds headers in the exact Chrome 130 order.
+//! This module builds each browser family's headers in its captured order,
+//! with the values (user agent, client hints, languages) taken from the
+//! profile — see `build_sec_ch_ua`.
 
 use crate::stealth::{DeviceClass, StealthProfile};
 

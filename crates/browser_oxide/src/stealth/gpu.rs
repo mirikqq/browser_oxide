@@ -508,7 +508,7 @@ fn standard_shader_precision() -> Vec<(u32, u32, [i32; 3])> {
 /// but omits `gpu_profile` would otherwise silently fall back to the
 /// `nvidia_rtx_3060_windows()` serde default and report NVIDIA-on-Windows
 /// extensions and getParameter values under, say, a macOS user agent.
-/// [`StealthProfile::load_from_file`] uses this to resolve the entry the
+/// [`crate::stealth::StealthProfile::load_from_file`] uses this to resolve the entry the
 /// profile actually meant.
 ///
 /// Apple Silicon names not in the fixed list resolve through

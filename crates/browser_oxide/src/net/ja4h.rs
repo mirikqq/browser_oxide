@@ -243,7 +243,7 @@ mod tests {
     // ============================================================
     // Per-profile JA4H stability tests (P1.4c)
     // ============================================================
-    // For each shipped Chrome 130 preset, compute the navigation JA4H
+    // For each shipped Chrome preset, compute the navigation JA4H
     // and assert:
     //   - The format prefix is `ge20nn13<lang4>_<hash>_000000000000_000000000000`
     //     (GET, h2, no-cookie, no-referer, 13 navigation headers, no

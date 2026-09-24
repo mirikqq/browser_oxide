@@ -17,7 +17,15 @@ a fully custom profile from YAML/JSON at runtime — no recompile.
 > signal, so this is enforced, not advisory. See
 > [Consistency rules](#consistency-rules-validate).
 
-## Three ways to get a profile
+## Ways to get a profile
+
+`stealth::presets::select()` picks one from the environment — a file
+(`BROWSER_OXIDE_STEALTH_PROFILE_FILE`), a preset name
+(`BROWSER_OXIDE_STEALTH_PROFILE`), or a sample from the fingerprint network
+(`BROWSER_OXIDE_STEALTH_SEED` / `_SAMPLE`) — and otherwise returns
+`default_profile()` (Chrome on Windows). Rotation is opt-in on purpose: a real
+address maps to a stable device, so changing identity from one address is a
+signal in itself. See [CONFIGURATION.md](CONFIGURATION.md).
 
 ### 1. Built-in presets (recommended starting point)
 
@@ -40,6 +48,22 @@ Available constructors (`stealth::presets::*`):
 | `firefox_135_windows` / `_macos` / `_linux` | Firefox 135 desktop |
 | `pixel_9_pro_chrome_148` | Chrome 148 on Android 15 (Pixel 9 Pro) |
 | `iphone_15_pro_safari_18` | Safari 18 on iOS 18 (iPhone 15 Pro) |
+
+`stealth::presets::all()` lists every preset by name and `by_name()` looks one
+up; the catalog tests walk that list, so a preset whose declared TLS stack
+`net::tls` cannot build — or that fails `validate()` — fails the build.
+
+### Sampled from the fingerprint network (`generator` feature)
+
+`stealth::generator::sample(&Constraints { seed, os, .. })` draws a Chrome
+desktop identity from a Bayesian network of observed fingerprints
+(BrowserForge's), so the *combinations* of screen, cores, memory and GPU are
+ones seen in the wild. What must be exact is not sampled: the wire stack is
+the captured one and the browser version follows it, the WebGL surface comes
+from the GPU catalog (samples with an uncatalogued GPU are discarded — in
+practice that leaves mostly Apple Silicon Macs), and locale/timezone are left
+for the egress alignment. Firefox is not sampled: the network's Firefox
+renderer strings match no catalog entry.
 
 ### 2. Clone a preset and override fields
 
@@ -152,7 +176,7 @@ default and may be omitted from YAML/JSON; everything else is required.
 |---|---|---|
 | `language` | String | Primary, e.g. `"en-US"`. Must appear in `languages`. |
 | `languages` | Vec<String> | `navigator.languages`. |
-| `timezone` | String | IANA name, e.g. `"America/New_York"`. |
+| `timezone` | String | IANA name, e.g. `"America/New_York"`. Applied as ICU's default zone, so `Date` (local getters, constructor, `toString`), `Intl` and `Temporal` all report it. ICU's default is **process-wide**: pages running concurrently with different zones cannot all be right — use one timezone per process. An id ICU does not know is refused (the process default stays). |
 
 ### Client Hints (high-entropy)
 
@@ -211,16 +235,21 @@ violation. After editing a profile in code, call `validate()` yourself.
 3. **Touch vs pointer** — `max_touch_points > 0` with a desktop-sized
    screen (`> 1024` wide) and `pointer_type == "fine"` is rejected.
 4. **GPU vendor matches renderer** — NVIDIA/Intel/Apple renderer requires
-   the matching vendor string; an Apple GPU is only valid on macOS.
+   the matching vendor string; an Apple GPU is only valid on macOS/iOS.
 5. **Screen sanity** — non-zero dimensions; `inner_width ≤ screen_width`;
    `outer_width ≥ inner_width`.
-6. **CPU/memory sanity** — `cpu_cores` in 1–128, `device_memory` in 1–64.
+6. **CPU/memory sanity** — `cpu_cores` in 1–128, `device_memory` in 1–64
+   (0 is accepted for Safari, which does not expose `deviceMemory`).
 7. **Language in list** — `language` must appear in `languages`.
-8. **Client Hints** — `cpu_architecture` ∈ {`x86`,`arm`};
-   `cpu_bitness` ∈ {`64`,`32`}; `ua_wow64` only with Windows + 32-bit;
-   Linux Chrome must report empty `platform_version`; `arm` only on
-   macOS/Android/ChromeOS; a non-empty `ua_model` requires a touch
-   device (`max_touch_points > 0`).
+8. **Client Hints** — `cpu_architecture` ∈ {`x86`,`arm`} (empty on Android,
+   as UA reduction reports it); `cpu_bitness` ∈ {`64`,`32`}; `ua_wow64`
+   only with Windows + 32-bit; Linux Chrome must report empty
+   `platform_version`; `arm` only on macOS/iOS/Android/ChromeOS; a
+   non-empty `ua_model` requires a touch device (`max_touch_points > 0`).
+9. **Wire stack** — `tls_impersonate` must name the stack `net::tls` emits
+   for the profile: chosen by browser family and device class (every iOS
+   browser gets WebKit's), then the newest capture at or below the
+   profile's major version.
 
 When in doubt, start from the preset closest to your target identity and
 change one field at a time, re-running `validate()` — the presets in

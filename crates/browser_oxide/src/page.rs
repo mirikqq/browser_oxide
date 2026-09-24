@@ -1241,8 +1241,9 @@ impl Page {
             .collect()
     }
 
-    /// `(node_id, position among the top document's `<iframe>` elements)` for
-    /// every materialized child frame, in materialization order.
+    /// `(node_id, position)` for every materialized child frame, in
+    /// materialization order — the position counting among the top document's
+    /// `<iframe>` elements.
     ///
     /// The position is `None` when the element the realm was built for is no
     /// longer in the tree. Pairs with [`Self::child_frame_ids`], and exists
