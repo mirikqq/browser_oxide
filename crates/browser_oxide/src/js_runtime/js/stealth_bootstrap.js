@@ -175,6 +175,20 @@
         }
     } catch (_e) {}
 
+    // Where to aim inside a click target: the session's habitual spot for that
+    // target, off the centre (`BehaviorProfile::aim_point`). humanize.js reads
+    // it the same way as `rand`.
+    try {
+        const _aimOp = Deno && Deno.core && Deno.core.ops
+            && Deno.core.ops.op_behavior_aim_point;
+        if (typeof _aimOp === 'function') {
+            _boNs.aim = function (salt, left, top, width, height) {
+                try { return _aimOp(salt >>> 0, +left, +top, +width, +height); }
+                catch (_e) { return null; }
+            };
+        }
+    } catch (_e) {}
+
     // Expose CMU+Buffalo keystroke-schedule
     // generator under a Symbol-keyed slot. humanize.js calls it on
     // input focus to synthesize plausible per-char timings (LogNormal

@@ -115,6 +115,26 @@ impl BehaviorProfile {
     }
 }
 
+impl BehaviorProfile {
+    /// Where inside a target rectangle to aim.
+    ///
+    /// Not the centre. A person lands somewhere in the middle of a control,
+    /// and hitting the exact midpoint every time is a pattern in its own
+    /// right — one that survives however good the trajectory leading to it
+    /// is. Drawn from the session RNG, so it is stable for this session and
+    /// this target (`salt`) rather than fresh noise per click.
+    pub fn aim_point(&self, salt: u64, left: f32, top: f32, width: f32, height: f32) -> (f32, f32) {
+        let mut rng = self.rng_for(salt);
+        // Confined to the middle half of the box, so the point stays clear of
+        // the edges even on a small control.
+        let mut within = |extent: f32| -> f32 {
+            let unit: f32 = rng.random_range(0.0..1.0);
+            extent * (0.25 + unit * 0.5)
+        };
+        (left + within(width), top + within(height))
+    }
+}
+
 // ================================================================
 // Mouse trajectory (Sigma-Lognormal — Plamondon 1995)
 // ----------------------------------------------------------------
@@ -551,7 +571,41 @@ mod tests {
         ChaCha20Rng::seed_from_u64(42)
     }
 
+    fn profile() -> BehaviorProfile {
+        BehaviorProfile {
+            seed: 0x5eed,
+            ..BehaviorProfile::default()
+        }
+    }
+
     // ---- BehaviorProfile defaults / determinism ----
+
+    #[test]
+    fn aim_point_stays_in_the_middle_half() {
+        let p = profile();
+        for salt in 0..200 {
+            let (x, y) = p.aim_point(salt, 100.0, 50.0, 80.0, 24.0);
+            assert!((120.0..=160.0).contains(&x), "salt {salt}: x {x}");
+            assert!((56.0..=68.0).contains(&y), "salt {salt}: y {y}");
+        }
+    }
+
+    /// Stable for a session and a target; different across targets and
+    /// sessions, and not the centre.
+    #[test]
+    fn aim_point_is_a_habit_not_noise() {
+        let p = profile();
+        let target = |p: &BehaviorProfile, salt| p.aim_point(salt, 0.0, 0.0, 200.0, 40.0);
+        assert_eq!(target(&p, 7), target(&p, 7));
+        assert_ne!(target(&p, 7), target(&p, 8));
+        let mut other = profile();
+        other.seed ^= 1;
+        assert_ne!(target(&p, 7), target(&other, 7));
+        let off_centre = (0..50)
+            .filter(|salt| target(&p, *salt) != (100.0, 20.0))
+            .count();
+        assert_eq!(off_centre, 50);
+    }
 
     #[test]
     fn profile_defaults_are_sensible() {

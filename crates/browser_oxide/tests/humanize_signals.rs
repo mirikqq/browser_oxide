@@ -252,3 +252,48 @@ async fn humanize_mouse_intervals_are_right_skewed() {
         "interval range must span ≥3× (asymmetric distribution; uniform sampling would have max ≈ min), got min={min} max={max}"
     );
 }
+
+/// Clicks land on the session's habitual spot for a control — inside the middle
+/// half of the box, not its exact centre — and repeated clicks on the same
+/// control cluster around that spot instead of scattering across it.
+#[tokio::test]
+async fn repeated_clicks_land_around_one_off_centre_spot() {
+    // Box: x 280..360, y 180..220 → middle half x 300..340, y 190..210.
+    let mut page = Page::from_html(
+        r#"<button style="position:absolute;left:280px;top:180px;width:80px;height:40px;padding:0;border:0">target</button>
+           <script>globalThis.__clicks=[];document.addEventListener('click',e=>__clicks.push([e.clientX,e.clientY]));</script>"#,
+        Some(chrome_148_macos()),
+    )
+    .await
+    .unwrap();
+    page.evaluate(include_str!("../src/js/humanize.js"))
+        .unwrap();
+    let _ = page
+        .evaluate_async(
+            r#"(async()=>{let ns=null;for(const s of Object.getOwnPropertySymbols(globalThis,1)){const v=globalThis[s];if(v&&v.__bo){ns=v;break}}if(!ns||!ns.input)throw Error('no input');for(let i=0;i<3;i++)await ns.input.clickSelector('button')})()"#,
+            std::time::Duration::from_secs(8),
+        )
+        .await;
+    let raw = page.evaluate("JSON.stringify(__clicks)").unwrap();
+    let clicks: Vec<[f64; 2]> = serde_json::from_str(&raw).unwrap();
+    assert_eq!(clicks.len(), 3, "three clicks: {raw}");
+    for [x, y] in &clicks {
+        assert!(
+            (300.0..=340.0).contains(x) && (190.0..=210.0).contains(y),
+            "{raw}"
+        );
+    }
+    assert!(
+        clicks.iter().any(|c| *c != [320.0, 200.0]),
+        "not the exact centre every time: {raw}"
+    );
+    let spread = |axis: usize| {
+        let values = clicks.iter().map(|c| c[axis]);
+        values.clone().fold(f64::MIN, f64::max) - values.fold(f64::MAX, f64::min)
+    };
+    // Motor noise is ±4% of the extent (3.2 px / 1.6 px) plus rounding.
+    assert!(
+        spread(0) <= 8.0 && spread(1) <= 5.0,
+        "clicks scattered: {raw}"
+    );
+}

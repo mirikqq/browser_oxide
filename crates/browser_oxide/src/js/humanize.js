@@ -69,6 +69,11 @@
     const _rand = ((function(){try{var s=Object.getOwnPropertySymbols(globalThis, 1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return {};})().rand)
         || Math.random;
 
+    // The session's habitual spot inside a click target (Rust
+    // `BehaviorProfile::aim_point`, keyed by the target). Absent without the
+    // op; `_pickPoint` then falls back to a fresh off-centre spot.
+    const _aim = (_boNsTop && typeof _boNsTop.aim === 'function') ? _boNsTop.aim : null;
+
     // Use the engine-internal background-timer helper so our synthetic
     // mouse/scroll/key timers don't pin `run_until_idle` open. They fire
     // eventually when the event loop is alive (anti-bot pages keep it
@@ -320,13 +325,46 @@
         return t === el || (typeof el.contains === 'function' && el.contains(t));
     };
 
+    /// Which target this is, as a stable 32-bit key: what the element is and
+    /// its size, not where it currently sits — scrolling must not move the
+    /// session's spot on it.
+    const _targetSalt = (el) => {
+        let key = '';
+        try {
+            const b = el.getBoundingClientRect();
+            const attr = (n) => (typeof el.getAttribute === 'function' && el.getAttribute(n)) || '';
+            key = [el.tagName, el.id, attr('name'), attr('type'),
+                Math.round(b.width), Math.round(b.height),
+                (el.textContent || '').trim().slice(0, 32)].join('|');
+        } catch (_e) { /* ignore */ }
+        let h = 0x811c9dc5; // FNV-1a
+        for (let i = 0; i < key.length; i++) {
+            h ^= key.charCodeAt(i);
+            h = Math.imul(h, 0x01000193);
+        }
+        return h >>> 0;
+    };
+
+    /// The session's habitual spot on this target, with a little motor noise so
+    /// repeated clicks are not pixel-identical, kept inside the middle half.
+    const _aimAt = (el, r) => {
+        if (!_aim) return null;
+        const p = _aim(_targetSalt(el), r.left, r.top, r.width, r.height);
+        if (!p || !Number.isFinite(p[0]) || !Number.isFinite(p[1])) return null;
+        const settle = (v, lo, span) => Math.min(lo + span * 0.75,
+            Math.max(lo + span * 0.25, v + (_rand() - 0.5) * span * 0.08));
+        return [settle(p[0], r.left, r.width), settle(p[1], r.top, r.height)];
+    };
+
     /// A point inside the visible box that the element actually receives.
     const _pickPoint = (el) => {
         const r = _visibleRect(el);
         if (!r) return null;
         const [vw, vh] = _viewport();
         const cands = [
-            // Off-centre first: people do not land on the exact centroid.
+            // Off-centre first: people do not land on the exact centroid, and
+            // the same person lands around the same spot on the same control.
+            _aimAt(el, r),
             [r.left + r.width * (0.35 + _rand() * 0.3), r.top + r.height * (0.35 + _rand() * 0.3)],
             [r.left + r.width * 0.5, r.top + r.height * 0.5],
             [r.left + r.width * 0.25, r.top + r.height * 0.5],
@@ -335,6 +373,7 @@
             [r.left + r.width * 0.5, r.top + r.height * 0.75],
         ];
         for (const c of cands) {
+            if (!c) continue;
             const x = Math.round(c[0]);
             const y = Math.round(c[1]);
             if (x < 0 || y < 0 || x >= vw || y >= vh) continue;

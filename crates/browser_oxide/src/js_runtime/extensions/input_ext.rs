@@ -25,12 +25,16 @@ use serde::Serialize;
 ///      don't produce identical event streams.
 pub struct BehaviorRngState {
     rng: StdRng,
+    /// The page session's seed, kept for the behaviour that must be *stable*
+    /// within the session rather than drawn fresh from the stream.
+    seed: u64,
 }
 
 impl BehaviorRngState {
     pub fn new(seed: u64) -> Self {
         Self {
             rng: StdRng::seed_from_u64(seed),
+            seed,
         }
     }
     pub fn from_env_or_random() -> Self {
@@ -56,6 +60,34 @@ impl Default for BehaviorRngState {
 pub fn op_behavior_random(s: &mut OpState) -> f64 {
     let s = s.borrow_mut::<BehaviorRngState>();
     s.rng.random::<f64>()
+}
+
+/// Where to aim a click inside a target box: the session's habitual spot for
+/// this target (`salt`), inside the middle half of the box — see
+/// [`BehaviorProfile::aim_point`]. Stable for the page session, so repeated
+/// clicks on one control land around one place rather than anywhere.
+#[op2]
+#[serde]
+pub fn op_behavior_aim_point(
+    s: &mut OpState,
+    salt: u32,
+    left: f64,
+    top: f64,
+    width: f64,
+    height: f64,
+) -> (f64, f64) {
+    let profile = BehaviorProfile {
+        seed: s.borrow::<BehaviorRngState>().seed,
+        ..BehaviorProfile::default()
+    };
+    let (x, y) = profile.aim_point(
+        u64::from(salt),
+        left as f32,
+        top as f32,
+        width as f32,
+        height as f32,
+    );
+    (f64::from(x), f64::from(y))
 }
 
 /// Generate a humanlike mouse path from (x1,y1) to (x2,y2).
@@ -194,6 +226,7 @@ deno_core::extension!(
         op_human_mouse_path,
         op_human_typing_delays,
         op_human_keystroke_schedule,
-        op_behavior_random
+        op_behavior_random,
+        op_behavior_aim_point
     ],
 );
