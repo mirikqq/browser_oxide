@@ -20,6 +20,7 @@ pub mod paint;
 pub mod protocol;
 pub mod stealth;
 pub mod style;
+pub mod text;
 pub mod workers;
 
 pub mod challenge;

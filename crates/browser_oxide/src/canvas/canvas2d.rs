@@ -1118,7 +1118,6 @@ impl Canvas2D {
         let Some((data, idx, run)) = text::shape_run(text, &self.state.font, &self.os_name) else {
             return;
         };
-        let size_px = self.state.font.size_px;
         let Some(typeface) = FontMgr::new().new_from_data(data, Some(idx as usize)) else {
             // Robustness fallback: legacy swash raster + manual composite.
             let color = self.state.fill_style.color();
@@ -1143,6 +1142,17 @@ impl Canvas2D {
             }
             return;
         };
+        self.draw_glyph_run(typeface, &run, x, y);
+    }
+
+    fn draw_glyph_run(
+        &mut self,
+        typeface: skia_safe::Typeface,
+        run: &crate::text::ShapedRun,
+        x: f32,
+        y: f32,
+    ) {
+        let size_px = self.state.font.size_px;
         let mut font = Font::from_typeface(typeface, Some(size_px));
         // Chrome 2D canvas: grayscale AA (never LCD), subpixel glyph
         // positioning, hinting disabled (resolution-independent text).
@@ -1168,6 +1178,29 @@ impl Canvas2D {
             canvas.restore();
         });
         self.mark_drawn();
+    }
+
+    /// Fill `text` in the given face, not the one `font` names. The face is not
+    /// looked up in the font database, so it is how painting draws a character
+    /// the database has no face for. The size, fill and transform are the current
+    /// ones.
+    pub fn fill_text_with_face(
+        &mut self,
+        text: &str,
+        x: f32,
+        y: f32,
+        data: &'static [u8],
+        index: u32,
+    ) {
+        let run = crate::text::shaper::shape(text, data, index, self.state.font.size_px);
+        if let Some(typeface) = FontMgr::new().new_from_data(data, Some(index as usize)) {
+            self.draw_glyph_run(typeface, &run, x, y);
+        }
+    }
+
+    /// Width of `text` in the given face at the current size.
+    pub fn measure_text_with_face(&self, text: &str, data: &'static [u8], index: u32) -> f64 {
+        crate::text::shaper::shape(text, data, index, self.state.font.size_px).width as f64
     }
 
     /// Stroke text at `(x, y)` (alphabetic baseline). Builds a Path2D

@@ -36,7 +36,7 @@ ignore = [
   { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15: unmaintained proc-macro, pulled in by v8. No drop-in upgrade (pastey is a soft fork). Re-evaluate on next deno_core bump." },
   { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3: unmaintained, pulled in by deno_core. Not a security issue; the bincode team stopped development. Re-evaluate on next deno_core bump or a community fork." },
   # Text-shaping stack. Unlike the entries above these are DIRECT dependencies:
-  # `rustybuzz` is the HarfBuzz port that `canvas::text::shaper` uses, and it
+  # `rustybuzz` is the HarfBuzz port that `text::shaper` uses, and it
   # pulls `ttf-parser`. Both are "unmaintained" notices, not vulnerabilities —
   # no CVE, no unsound API. There is no drop-in replacement for either in the
   # pure-Rust shaping ecosystem; the alternative is binding native HarfBuzz,

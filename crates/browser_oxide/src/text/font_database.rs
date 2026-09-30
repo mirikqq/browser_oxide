@@ -28,21 +28,20 @@ pub struct FontDatabase {
 /// Noto Sans Regular handles Cyrillic / Greek / extended Latin
 /// coverage so measurements of Russian / Greek strings don't fall off
 /// the Liberation glyph set.
-const LIBERATION_SANS_REGULAR: &[u8] = include_bytes!("../fonts/LiberationSans-Regular.ttf");
-const LIBERATION_SANS_BOLD: &[u8] = include_bytes!("../fonts/LiberationSans-Bold.ttf");
-const LIBERATION_SANS_ITALIC: &[u8] = include_bytes!("../fonts/LiberationSans-Italic.ttf");
-const LIBERATION_SANS_BOLD_ITALIC: &[u8] = include_bytes!("../fonts/LiberationSans-BoldItalic.ttf");
-const LIBERATION_SERIF_REGULAR: &[u8] = include_bytes!("../fonts/LiberationSerif-Regular.ttf");
-const LIBERATION_SERIF_BOLD: &[u8] = include_bytes!("../fonts/LiberationSerif-Bold.ttf");
-const LIBERATION_SERIF_ITALIC: &[u8] = include_bytes!("../fonts/LiberationSerif-Italic.ttf");
-const LIBERATION_SERIF_BOLD_ITALIC: &[u8] =
-    include_bytes!("../fonts/LiberationSerif-BoldItalic.ttf");
-const LIBERATION_MONO_REGULAR: &[u8] = include_bytes!("../fonts/LiberationMono-Regular.ttf");
-const LIBERATION_MONO_BOLD: &[u8] = include_bytes!("../fonts/LiberationMono-Bold.ttf");
-const LIBERATION_MONO_ITALIC: &[u8] = include_bytes!("../fonts/LiberationMono-Italic.ttf");
-const LIBERATION_MONO_BOLD_ITALIC: &[u8] = include_bytes!("../fonts/LiberationMono-BoldItalic.ttf");
-const DEJAVU_SANS: &[u8] = include_bytes!("../fonts/DejaVuSans.ttf");
-const NOTO_SANS_REGULAR: &[u8] = include_bytes!("../fonts/NotoSans-Regular.ttf");
+const LIBERATION_SANS_REGULAR: &[u8] = include_bytes!("fonts/LiberationSans-Regular.ttf");
+const LIBERATION_SANS_BOLD: &[u8] = include_bytes!("fonts/LiberationSans-Bold.ttf");
+const LIBERATION_SANS_ITALIC: &[u8] = include_bytes!("fonts/LiberationSans-Italic.ttf");
+const LIBERATION_SANS_BOLD_ITALIC: &[u8] = include_bytes!("fonts/LiberationSans-BoldItalic.ttf");
+const LIBERATION_SERIF_REGULAR: &[u8] = include_bytes!("fonts/LiberationSerif-Regular.ttf");
+const LIBERATION_SERIF_BOLD: &[u8] = include_bytes!("fonts/LiberationSerif-Bold.ttf");
+const LIBERATION_SERIF_ITALIC: &[u8] = include_bytes!("fonts/LiberationSerif-Italic.ttf");
+const LIBERATION_SERIF_BOLD_ITALIC: &[u8] = include_bytes!("fonts/LiberationSerif-BoldItalic.ttf");
+const LIBERATION_MONO_REGULAR: &[u8] = include_bytes!("fonts/LiberationMono-Regular.ttf");
+const LIBERATION_MONO_BOLD: &[u8] = include_bytes!("fonts/LiberationMono-Bold.ttf");
+const LIBERATION_MONO_ITALIC: &[u8] = include_bytes!("fonts/LiberationMono-Italic.ttf");
+const LIBERATION_MONO_BOLD_ITALIC: &[u8] = include_bytes!("fonts/LiberationMono-BoldItalic.ttf");
+const DEJAVU_SANS: &[u8] = include_bytes!("fonts/DejaVuSans.ttf");
+const NOTO_SANS_REGULAR: &[u8] = include_bytes!("fonts/NotoSans-Regular.ttf");
 
 /// Number of faces we bundle and advertise via `document.fonts.size`.
 /// Keep in sync with the `load_font_data` calls in `init_bundled`.

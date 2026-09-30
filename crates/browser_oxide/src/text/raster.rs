@@ -63,8 +63,8 @@ pub fn rasterize_glyph(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canvas::text::font_database::FontDatabase;
-    use crate::canvas::text::shaper;
+    use crate::text::font_database::FontDatabase;
+    use crate::text::shaper;
 
     fn shape_single(ch: &str, size_px: f32) -> (shaper::Glyph, &'static [u8], u32) {
         let db = FontDatabase::get();

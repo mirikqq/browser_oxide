@@ -5,7 +5,28 @@
 //! same information canvas `measureText` reports (widths + bounding
 //! box) and what `fillText` needs to position individual glyphs.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use rustybuzz::{Face as RustybuzzFace, UnicodeBuffer};
+
+thread_local! {
+    static FACES: RefCell<HashMap<(usize, u32), Option<&'static RustybuzzFace<'static>>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// The parsed face of a font file, parsed once per thread. Parsing reads the
+/// font's table directory, which costs more than shaping a word does.
+pub fn face(data: &'static [u8], index: u32) -> Option<&'static RustybuzzFace<'static>> {
+    FACES.with(|faces| {
+        *faces
+            .borrow_mut()
+            .entry((data.as_ptr() as usize, index))
+            .or_insert_with(|| {
+                RustybuzzFace::from_slice(data, index).map(|f| &*Box::leak(Box::new(f)))
+            })
+    })
+}
 
 /// A single glyph emitted by the shaper, pre-scaled to pixel units.
 #[derive(Debug, Clone)]
@@ -56,11 +77,11 @@ impl ShapedRun {
 
 /// Shape `text` using the given font face at `size_px`. Panics never —
 /// an invalid face or empty text yields an empty `ShapedRun`.
-pub fn shape(text: &str, face_data: &[u8], face_index: u32, size_px: f32) -> ShapedRun {
+pub fn shape(text: &str, face_data: &'static [u8], face_index: u32, size_px: f32) -> ShapedRun {
     if text.is_empty() {
         return ShapedRun::empty();
     }
-    let Some(face) = RustybuzzFace::from_slice(face_data, face_index) else {
+    let Some(face) = face(face_data, face_index) else {
         return ShapedRun::empty();
     };
     let upem = face.units_per_em() as f32;
@@ -73,7 +94,7 @@ pub fn shape(text: &str, face_data: &[u8], face_index: u32, size_px: f32) -> Sha
     buffer.push_str(text);
     buffer.guess_segment_properties();
 
-    let glyph_buffer = rustybuzz::shape(&face, &[], buffer);
+    let glyph_buffer = rustybuzz::shape(face, &[], buffer);
     let infos = glyph_buffer.glyph_infos();
     let positions = glyph_buffer.glyph_positions();
 
@@ -158,7 +179,7 @@ pub fn shape(text: &str, face_data: &[u8], face_index: u32, size_px: f32) -> Sha
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canvas::text::font_database::FontDatabase;
+    use crate::text::font_database::FontDatabase;
 
     fn arial_14px() -> (&'static [u8], u32) {
         let db = FontDatabase::get();

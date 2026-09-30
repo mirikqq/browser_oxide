@@ -1,0 +1,10 @@
+Fallback-only faces (drawn for characters no other bundled face has; never
+registered with the font database, so invisible to document.fonts / FontFace).
+
+Source: https://github.com/google/fonts, commit 9710da1eacb3be272583c3224dcb70f9da6eadbb
+License: SIL Open Font License 1.1 (LICENSE-NotoSansThai, LICENSE-NotoSansDevanagari)
+
+NotoSansThai.ttf        ofl/notosansthai/NotoSansThai[wdth,wght].ttf
+  218652 bytes  sha256 5a1c559bb539583c8a1fd99d1c5b9491e5e14478c9cd2bd0970d5c3096cc9ef8
+NotoSansDevanagari.ttf  ofl/notosansdevanagari/NotoSansDevanagari[wdth,wght].ttf
+  641944 bytes  sha256 14ec4af41f27482216d1c2229f417ff9b1425e1babb014e57d1d40d03229853e
