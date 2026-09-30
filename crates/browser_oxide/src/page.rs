@@ -52,6 +52,19 @@ pub struct DevviewFrameSnapshot {
     pub html: String,
 }
 
+/// One frame met while walking the frame tree for devview: where to run code
+/// for it (`event_loop`, and `realm` in it — 0 for an isolate's own document)
+/// and what devview knows it by.
+struct DevviewFrameVisit<'a> {
+    event_loop: &'a mut BrowserEventLoop,
+    realm: u32,
+    path: &'a [u32],
+    parent_path: &'a [u32],
+    generation: u64,
+    slot: Option<usize>,
+    css_rect: [f64; 4],
+}
+
 #[derive(serde::Deserialize)]
 struct DevviewCanvasNode {
     canvas_index: usize,
@@ -550,9 +563,15 @@ impl Drop for Page {
             let mut state = op_state.borrow_mut();
             crate::js_runtime::extensions::worker_ext::drain_owned_workers(&mut state);
         }
-        // Drop children (newer isolates) before parent (older isolate)
-        // V8 requires reverse drop order
-        while self.children.pop().is_some() {}
+        // Drop children (newer isolates) before parent (older isolate) —
+        // V8 requires reverse drop order. `pop()` alone only reverses
+        // direct siblings; a child can itself have nested children with
+        // even higher generations, so route through `bury_frame`, which
+        // flattens the whole subtree and destroys it in true creation
+        // order (see its doc comment in iframe.rs).
+        for child in std::mem::take(&mut self.children) {
+            iframe::bury_frame(child);
+        }
     }
 }
 
@@ -587,7 +606,12 @@ const IMG_SCAN: &str = "(function(){var ns=null;try{var y=Object.getOwnPropertyS
 /// longer, and this still has to end.
 const HUMAN_INPUT_TIMEOUT: Duration = Duration::from_secs(30);
 
-const NS_RESOLVE: &str = "(function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()";
+/// How long a construction or navigation spends settling the frame tree
+/// before it returns (see `Page::settle_frames`). Building a frame runs its
+/// document to idle on its own clock; this only bounds the rounds after.
+const FRAME_SETTLE_BUDGET: Duration = Duration::from_secs(2);
+
+pub(crate) const NS_RESOLVE: &str = "(function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})()";
 
 /// Tell the DOM which script the host is about to run.
 ///
@@ -794,7 +818,9 @@ impl Page {
             .replace_dom(dom, stylesheets, Vec::new());
 
         // Drop old iframe children
-        self.children.clear();
+        for child in std::mem::take(&mut self.children) {
+            iframe::bury_frame(child);
+        }
 
         // Update URL (URL-state setup, not a real navigation).
         self.url = url.to_string();
@@ -1036,61 +1062,54 @@ impl Page {
         // widget (2-4s), and most JS-heavy first-paint flows.
         event_loop.run_until_idle(Duration::from_secs(8)).await?;
 
-        // Process <iframe srcdoc="..."> elements
-        // Parse srcdoc HTML and execute scripts within an isolated scope
-        let iframes = {
-            let dom_ref = event_loop.runtime_mut().inner();
-            let state = dom_ref.op_state();
-            let state = state.borrow();
-            let dom_state = state.borrow::<crate::js_runtime::state::DomState>();
-            iframe::find_iframes(&dom_state.dom)
-        };
-        for iframe_info in &iframes {
-            if let Some(srcdoc) = &iframe_info.srcdoc {
-                // Execute srcdoc scripts in an isolated function scope
-                let node_id = iframe_info.node_id.to_raw();
-                let _escaped = srcdoc.replace('\\', "\\\\").replace('`', "\\`");
-                let setup_js = format!(
-                    r#"(() => {{
-                        const _iframeEl = (() => {{
-                            const nodeId = {node_id};
-                            // Find iframe element and set up its contentDocument
-                            const el = document.querySelectorAll('iframe')[0]; // simplified
-                            if (el && el.contentWindow) {{
-                                el.contentWindow._srcdocLoaded = true;
-                            }}
-                        }})();
-                    }})()"#,
-                );
-                event_loop.execute_script(&setup_js).ok();
-            }
-        }
+        // No in-isolate pass over srcdoc frames here. One used to touch the
+        // first `<iframe>`'s `contentWindow` to set a flag nothing read, and
+        // touching it built the parent-side realm for that frame — which ran
+        // the srcdoc's scripts a second time, next to the `ChildIframe` built
+        // below.
+        // Frames are built by `settle_frames` below: same-origin ones as realms
+        // of this isolate, cross-origin ones as isolates of their own.
+        let children = Vec::new();
+        let _ = &p;
 
-        // Create child Pages for iframes with srcdoc
-        let mut children = Vec::new();
-        let iframes = {
-            let dom_ref = event_loop.runtime_mut().inner();
-            let state = dom_ref.op_state();
-            let state = state.borrow();
-            let dom_state = state.borrow::<crate::js_runtime::state::DomState>();
-            iframe::find_iframes(&dom_state.dom)
-        };
-        for info in &iframes {
-            if let Some(srcdoc) = &info.srcdoc {
-                match iframe::ChildIframe::from_srcdoc(info.node_id, srcdoc, &p).await {
-                    Ok(child) => children.push(child),
-                    Err(e) => tracing::warn!(error = %e, "iframe srcdoc error"),
-                }
-            }
-        }
-
-        Ok(Self {
+        let mut page = Self {
             event_loop,
             url: url.to_string(),
             children,
             client: Some(client.clone()),
             solvers: std::sync::Arc::from(Vec::<std::sync::Arc<dyn crate::ChallengeSolver>>::new()),
-        })
+        };
+        // `src` frames and anything nested are built here: this page hosts
+        // its frames, so their parent-side realms run nothing.
+        page.settle_frames(FRAME_SETTLE_BUDGET).await;
+        Ok(page)
+    }
+
+    /// Same-origin frames: every frame realm, as `(realm id, parent realm id,
+    /// <iframe> node id in the parent's document)`. The page is realm 0; a
+    /// frame nested in a frame names that frame's realm as its parent.
+    /// Cross-origin frames are isolates of their own — see
+    /// [`Self::child_iframe`].
+    pub fn frame_realms(&mut self) -> Vec<(u32, u32, u32)> {
+        self.event_loop.runtime_mut().frame_realms()
+    }
+
+    /// The realm of the same-origin frame whose `<iframe>` is `node` in realm
+    /// `parent`'s document (0: the page's).
+    pub fn frame_realm_for(&mut self, parent: u32, node: u32) -> Option<u32> {
+        self.frame_realms()
+            .into_iter()
+            .find(|(_, p, n)| *p == parent && *n == node)
+            .map(|(id, _, _)| id)
+    }
+
+    /// Evaluate `js` in same-origin frame realm `realm` (0: the page).
+    pub fn evaluate_in_frame_realm(
+        &mut self,
+        realm: u32,
+        js: &str,
+    ) -> Result<String, deno_core::error::AnyError> {
+        self.event_loop.runtime_mut().execute_in_realm(realm, js)
     }
 
     /// Get a child iframe by index.
@@ -1118,6 +1137,7 @@ impl Page {
                 .children
                 .iter()
                 .enumerate()
+                .filter(|(_, c)| c.parent_realm == 0)
                 .map(|(i, c)| (i, c.node_id))
                 .collect();
             ids.into_iter()
@@ -1136,6 +1156,40 @@ impl Page {
                 child.set_frame_geometry(x, y, w, h);
             }
         }
+        // Isolates embedded in frame realms: laid out in the realm's document,
+        // offset by where that realm's own frame sits.
+        let nested: Vec<(usize, u32, u32)> = self
+            .children
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.parent_realm != 0)
+            .map(|(i, c)| (i, c.parent_realm, c.node_id.to_raw()))
+            .collect();
+        for (i, realm, node) in nested {
+            let offset = self
+                .event_loop
+                .runtime_mut()
+                .execute_in_realm(
+                    realm,
+                    &format!("(function(){{var f=(({NS_RESOLVE})||{{}}).frame;return f?f.x+','+f.y:'0,0';}})()"),
+                )
+                .unwrap_or_else(|_| "0,0".into());
+            let mut parts = offset.split(',').map(|v| v.parse::<f64>().unwrap_or(0.0));
+            let (ox, oy) = (parts.next().unwrap_or(0.0), parts.next().unwrap_or(0.0));
+            let rect = self.event_loop.runtime_mut().with_realm_dom(realm, |d| {
+                let r = d
+                    .layout_engine
+                    .get_bounding_rect(&d.dom, crate::dom::node::NodeId::from_raw(node));
+                (r.x, r.y, r.width, r.height)
+            });
+            if let Some((x, y, w, h)) = rect {
+                if w > 0.0 && h > 0.0 {
+                    if let Some(child) = self.children.get_mut(i) {
+                        child.set_frame_geometry(ox + x, oy + y, w, h);
+                    }
+                }
+            }
+        }
     }
 
     /// Get the number of child iframes.
@@ -1151,77 +1205,43 @@ impl Page {
     /// call it between event-loop turns — a widget handshake needs several
     /// round trips, so one pump is rarely enough.
     pub fn pump_iframe_messages(&mut self) -> (usize, usize) {
-        // Parent → children.
-        let outbound: Vec<String> = self
+        // The top document's origin as its own realm reports it: `location` is
+        // unforgeable, and a page that assigns to it is navigating, not
+        // relabelling itself.
+        let origin = self
             .event_loop
-            .execute_script(&format!(
-                "JSON.stringify({NS_RESOLVE}.frames.takeChildMessages())"
-            ))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        let mut to_children = 0usize;
-        for pair in outbound.chunks(2) {
-            let (Some(id), Some(json)) = (pair.first(), pair.get(1)) else {
-                continue;
-            };
-            let Ok(node_id) = id.parse::<u32>() else {
-                continue;
-            };
-            let Some(child) = self
-                .children
-                .iter_mut()
-                .find(|c| c.node_id.to_raw() == node_id)
-            else {
-                continue;
-            };
-            // Deliver as a real MessageEvent so listeners registered the normal way
-            // (addEventListener('message') / onmessage) see it. `source` is the
-            // embedder's window — a frame that answers via `event.source` must be
-            // able to reach back.
-            let js = format!(
-                "(function(){{var m={json};\
-                 var ro=(globalThis.location&&globalThis.location.origin)||'null';\
-                 if(m.targetOrigin&&m.targetOrigin!=='*'&&m.targetOrigin!==ro)return;\
-                 var ev=new MessageEvent('message',\
-                   {{data:m.data,origin:m.origin,source:globalThis.parent||null}});\
-                 globalThis.dispatchEvent(ev);}})()"
+            .execute_script("String(location.origin)")
+            .unwrap_or_else(|_| iframe::origin_of(&self.url));
+        let (mut to_children, mut to_parent) = iframe::pump_frame_messages(
+            &mut iframe::ParentDoc::Loop(&mut self.event_loop),
+            &origin,
+            &mut self.children,
+            0,
+        );
+        // Cross-origin frames inside same-origin frames: their embedder is a
+        // frame realm of this isolate.
+        let mut realms: Vec<u32> = self
+            .children
+            .iter()
+            .map(|c| c.parent_realm)
+            .filter(|r| *r != 0)
+            .collect();
+        realms.sort_unstable();
+        realms.dedup();
+        for realm in realms {
+            let realm_origin = self
+                .event_loop
+                .runtime_mut()
+                .execute_in_realm(realm, "String(location.origin)")
+                .unwrap_or_else(|_| "null".into());
+            let (d, u) = iframe::pump_frame_messages(
+                &mut iframe::ParentDoc::Realm(&mut self.event_loop, realm),
+                &realm_origin,
+                &mut self.children,
+                realm,
             );
-            if child.event_loop.execute_script(&js).is_ok() {
-                to_children += 1;
-            }
-        }
-
-        // Children → parent. The sending frame's node id travels with each message:
-        // the embedder replies with `event.source.postMessage(...)`, and without a
-        // source it has no handle on the frame that spoke to it. hCaptcha's widget
-        // ends its handshake with `site-setup` and then waits for exactly that
-        // reply, so a null source stalls the challenge with no error anywhere.
-        let mut to_parent = 0usize;
-        let mut inbound: Vec<(u32, String)> = Vec::new();
-        for child in self.children.iter_mut() {
-            let node_id = child.node_id.to_raw();
-            if let Ok(raw) = child.event_loop.execute_script(&format!(
-                "JSON.stringify({NS_RESOLVE}.frames.takeParentMessages())"
-            )) {
-                if let Ok(list) = serde_json::from_str::<Vec<String>>(&raw) {
-                    inbound.extend(list.into_iter().map(|j| (node_id, j)));
-                }
-            }
-        }
-        for (node_id, json) in inbound {
-            let js = format!(
-                "(function(){{var m={json};\
-                 var ro=(globalThis.location&&globalThis.location.origin)||'null';\
-                 if(m.targetOrigin&&m.targetOrigin!=='*'&&m.targetOrigin!==ro)return;\
-                 var src=null;\
-                 try{{src={NS_RESOLVE}.frames.windowForNode({node_id});}}catch(_){{}}\
-                 var ev=new MessageEvent('message',{{data:m.data,origin:m.origin,source:src}});\
-                 globalThis.dispatchEvent(ev);}})()"
-            );
-            if self.event_loop.execute_script(&js).is_ok() {
-                to_parent += 1;
-            }
+            to_children += d;
+            to_parent += u;
         }
         for child in &mut self.children {
             let (nested_down, nested_up) = child.pump_descendant_messages();
@@ -1273,7 +1293,12 @@ impl Page {
             .iter()
             .map(|c| {
                 let id = c.node_id.to_raw();
-                (id, in_tree.iter().position(|&seen| seen == id))
+                let slot = if c.parent_realm == 0 {
+                    in_tree.iter().position(|&seen| seen == id)
+                } else {
+                    None
+                };
+                (id, slot)
             })
             .collect()
     }
@@ -1296,6 +1321,46 @@ impl Page {
         n
     }
 
+    /// Let the frame tree catch up with the document: load every frame the
+    /// document gained (script-inserted ones included) — a same-origin one
+    /// into a realm of this isolate, a cross-origin one into an isolate of
+    /// its own — give the isolates a slice of their event loops, and carry
+    /// `postMessage` across to them, repeated while that still moves
+    /// something, within `budget`.
+    ///
+    /// A frame's document runs nowhere until it is loaded here, so the page
+    /// settles its frames itself — after construction and navigation, in
+    /// [`Self::evaluate_async`], and while humanized input runs. A no-op for a
+    /// page without a network context.
+    pub async fn settle_frames(&mut self, budget: Duration) {
+        if self.client.is_none() {
+            return;
+        }
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            // Boxed, like every frame build: building a frame awaits a fetch
+            // and a whole document's run, and inlined here that future would
+            // sit inside every navigation's and constructor's own — on the
+            // caller's stack, which V8 needs too.
+            let built = Box::pin(self.materialize_new_iframes()).await.unwrap_or(0);
+            if self.children.is_empty() {
+                return;
+            }
+            self.drive_children(Duration::from_millis(20)).await;
+            let (down, up) = self.pump_iframe_messages();
+            if up > 0 {
+                // Let the parent's handlers answer before the next round.
+                let _ = self
+                    .event_loop
+                    .run_until_idle(Duration::from_millis(20))
+                    .await;
+            }
+            if (built == 0 && down == 0 && up == 0) || std::time::Instant::now() >= deadline {
+                return;
+            }
+        }
+    }
+
     /// Materialize iframes that appeared since the last check, using the page's own
     /// session client.
     ///
@@ -1306,19 +1371,25 @@ impl Page {
     /// waits on — after a click, long after navigation returned. A driver that
     /// clicks and types therefore has to ask for this itself.
     ///
+    /// The page now does this itself whenever it settles its frames (see
+    /// [`Self::settle_frames`]); drivers that run the event loop directly can
+    /// still call it.
+    ///
     /// Returns the number of iframes newly materialized, or `None` when the page has
-    /// no network context (built via `from_html`).
+    /// no network context (built via `from_html_fast`).
     pub async fn materialize_new_iframes(&mut self) -> Option<usize> {
         let client = self.client.clone()?;
         let url = self.url.clone();
+        // A page built without a stealth profile still has its client's.
         let profile = {
             let op_state = self.event_loop.runtime_mut().op_state();
             let state = op_state.borrow();
             state
                 .try_borrow::<crate::js_runtime::extensions::stealth_ext::StealthState>()
                 .and_then(|s| s.profile.clone())
-        }?;
-        let mut n = self.rematerialize_iframes(&url, &client, &profile).await;
+        }
+        .unwrap_or_else(|| client.profile().clone());
+        let mut n = Box::pin(self.rematerialize_iframes(&url, &client, &profile)).await;
         for child in &mut self.children {
             n += child.materialize_descendants(&client, &profile).await;
         }
@@ -1353,95 +1424,203 @@ impl Page {
     /// number of newly materialized iframes. Idempotent: re-running
     /// only picks up iframes injected since the last call.
     ///
-    /// Caller MUST gate this on a challenge-origin flag (it is invoked
-    /// only inside the challenge poll) so it never runs for a benign
-    /// nav ⇒ zero regression risk, same narrow-gating
-    /// discipline as `started_as_dd/cf/seccpt_challenge`.
+    /// A frame whose document could not be built (fetch error, CSP) is not
+    /// retried until its browsing context is invalidated — this runs on
+    /// every [`Self::settle_frames`] now, not only in the challenge poll.
     pub async fn rematerialize_iframes(
         &mut self,
         base_url: &str,
         client: &crate::net::HttpClient,
         profile: &crate::stealth::StealthProfile,
     ) -> usize {
-        // Snapshot the current DOM's iframes (scoped borrow, dropped
-        // before any await / before touching self.children).
-        let iframes = {
-            let dom_ref = self.event_loop.runtime_mut().inner();
-            let state = dom_ref.op_state();
-            let state = state.borrow();
-            let dom_state = state.borrow::<crate::js_runtime::state::DomState>();
-            iframe::find_iframes(&dom_state.dom)
-        };
-        // Apply the browsing-context lifecycle the DOM recorded since the last
-        // pass. Dropping the realm is all that is needed for both cases: a frame
-        // still in the tree is rebuilt below from its current attributes, and one
-        // that left the tree is not found by the scan and so stays gone.
-        let invalidated: Vec<u32> = {
-            let dom_ref = self.event_loop.runtime_mut().inner();
-            let state = dom_ref.op_state();
-            let mut state = state.borrow_mut();
-            let dom_state = state.borrow_mut::<crate::js_runtime::state::DomState>();
-            std::mem::take(&mut dom_state.invalidated_frames)
-        };
-        let live: Vec<u32> = iframes.iter().map(|i| i.node_id.to_raw()).collect();
-        self.children.retain(|child| {
-            let id = child.node_id.to_raw();
-            live.contains(&id) && !invalidated.contains(&id)
-        });
+        Box::pin(crate::frames::settle_document(
+            &mut self.event_loop,
+            &mut self.children,
+            base_url,
+            client,
+            profile,
+        ))
+        .await
+    }
 
-        let already: Vec<_> = self.children.iter().map(|c| c.node_id).collect();
-        let mut materialized = 0usize;
-        for info in &iframes {
-            if already.contains(&info.node_id) {
-                continue; // already a real child context — not script-new
-            }
-            if let Some(srcdoc) = &info.srcdoc {
-                match iframe::ChildIframe::from_srcdoc(info.node_id, srcdoc, profile).await {
-                    Ok(mut child) => {
-                        // Store the raw attribute, not the resolved document: the
-                        // staleness check above compares against what the DOM holds.
-                        child.source = srcdoc.clone();
-                        self.children.push(child);
-                        materialized += 1;
-                    }
-                    Err(e) => tracing::warn!(error = %e, "rematerialize srcdoc error"),
-                }
-            } else if let Some(src) = &info.src {
-                if src.is_empty() || src.starts_with("javascript:") {
-                    continue; // blank/JS frames are handled at build time
-                }
-                if let Some(full_src) = Self::resolve_url(base_url, src) {
-                    match iframe::ChildIframe::from_url(
-                        info.node_id,
-                        &full_src,
-                        base_url,
-                        client,
-                        Some(profile),
-                    )
-                    .await
-                    {
-                        Ok(mut child) => {
-                            child.source = src.clone();
-                            self.children.push(child);
-                            materialized += 1;
-                        }
-                        Err(e) => tracing::warn!(
-                            src = %full_src, error = %e,
-                            "rematerialize src-iframe error (CSP-blocked or fetch failed)"
-                        ),
-                    }
-                }
-            }
+    // ---- Devview over the frame tree -------------------------------------
+    //
+    // A frame's document is either a realm of the isolate its embedder lives
+    // in (same-origin, F4) or an isolate of its own (`ChildIframe`). Devview
+    // addresses a frame by the chain of `<iframe>` node ids down to it; each
+    // hop is resolved in the document it is in, as a realm frame of that
+    // document or an isolate embedded in it.
+
+    /// A realm frame's generation for devview: unique per realm (ids are never
+    /// reused in a runtime), and in a range no `ChildIframe` generation reaches.
+    fn devview_realm_generation(realm: u32) -> u64 {
+        (1u64 << 48) | u64::from(realm)
+    }
+
+    /// Run `js` in realm `realm` (0: the isolate's own document) of `event_loop`.
+    fn devview_doc_exec(
+        event_loop: &mut BrowserEventLoop,
+        realm: u32,
+        js: &str,
+    ) -> Result<String, deno_core::error::AnyError> {
+        if realm == 0 {
+            event_loop.execute_script(js)
+        } else {
+            event_loop.runtime_mut().execute_in_realm(realm, js)
         }
-        materialized
+    }
+
+    fn devview_doc_dom<R>(
+        event_loop: &mut BrowserEventLoop,
+        realm: u32,
+        f: impl FnOnce(&mut crate::js_runtime::state::DomState) -> R,
+    ) -> Option<R> {
+        if realm == 0 {
+            let op_state = event_loop.runtime_mut().op_state();
+            let mut state = op_state.borrow_mut();
+            state
+                .try_borrow_mut::<crate::js_runtime::state::DomState>()
+                .map(f)
+        } else {
+            event_loop.runtime_mut().with_realm_dom(realm, f)
+        }
+    }
+
+    /// Visit every frame under document `realm` of `event_loop` (whose
+    /// isolates are `children`), depth first. `path` is that document's own
+    /// frame path.
+    fn devview_walk(
+        event_loop: &mut BrowserEventLoop,
+        children: &mut [iframe::ChildIframe],
+        realm: u32,
+        path: &[u32],
+        visit: &mut dyn FnMut(DevviewFrameVisit<'_>),
+    ) {
+        let slots: Vec<u32> = Self::devview_doc_exec(
+            event_loop,
+            realm,
+            &format!(
+                "(function(){{var ns={NS_RESOLVE};if(!ns||!ns.frames)return '';\
+                 var f=document.querySelectorAll('iframe'),out=[];\
+                 for(var i=0;i<f.length;i++)out.push(ns.frames.nodeIdOf(f[i]));\
+                 return out.join(',');}})()"
+            ),
+        )
+        .unwrap_or_default()
+        .trim_matches('"')
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .collect();
+        let realm_frames: Vec<(u32, u32)> = event_loop
+            .runtime_mut()
+            .frame_realms()
+            .into_iter()
+            .filter(|(_, p, _)| *p == realm)
+            .map(|(id, _, node)| (id, node))
+            .collect();
+        let isolates: Vec<usize> = children
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.parent_realm == realm)
+            .map(|(i, _)| i)
+            .collect();
+        let mut nodes: Vec<u32> = realm_frames.iter().map(|(_, n)| *n).collect();
+        nodes.extend(isolates.iter().map(|i| children[*i].node_id.to_raw()));
+        let rects: std::collections::HashMap<u32, [f64; 4]> =
+            Self::devview_doc_dom(event_loop, realm, |d| {
+                nodes
+                    .iter()
+                    .map(|n| {
+                        let r = d
+                            .layout_engine
+                            .get_bounding_rect(&d.dom, crate::dom::node::NodeId::from_raw(*n));
+                        (*n, [r.x, r.y, r.width, r.height])
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let slot_of = |node: u32| slots.iter().position(|n| *n == node);
+        for (frame, node) in realm_frames {
+            let mut p = path.to_vec();
+            p.push(node);
+            visit(DevviewFrameVisit {
+                event_loop: &mut *event_loop,
+                realm: frame,
+                path: &p,
+                parent_path: path,
+                generation: Self::devview_realm_generation(frame),
+                slot: slot_of(node),
+                css_rect: rects.get(&node).copied().unwrap_or([0.0; 4]),
+            });
+            Self::devview_walk(event_loop, children, frame, &p, visit);
+        }
+        for i in isolates {
+            let child = &mut children[i];
+            let node = child.node_id.to_raw();
+            let mut p = path.to_vec();
+            p.push(node);
+            let generation = child.generation;
+            let iframe::ChildIframe {
+                event_loop: child_loop,
+                children: grandchildren,
+                ..
+            } = child;
+            visit(DevviewFrameVisit {
+                event_loop: &mut *child_loop,
+                realm: 0,
+                path: &p,
+                parent_path: path,
+                generation,
+                slot: slot_of(node),
+                css_rect: rects.get(&node).copied().unwrap_or([0.0; 4]),
+            });
+            Self::devview_walk(child_loop, grandchildren, 0, &p, visit);
+        }
+    }
+
+    /// The frame at `path` under document `realm` of `event_loop`, with its
+    /// devview generation.
+    fn devview_resolve<'a>(
+        event_loop: &'a mut BrowserEventLoop,
+        children: &'a mut [iframe::ChildIframe],
+        realm: u32,
+        path: &[u32],
+    ) -> Option<(&'a mut BrowserEventLoop, u32, u64)> {
+        let (node, rest) = path.split_first()?;
+        let frame_realm = event_loop
+            .runtime_mut()
+            .frame_realms()
+            .into_iter()
+            .find(|(_, p, n)| *p == realm && n == node)
+            .map(|(id, _, _)| id);
+        if let Some(frame) = frame_realm {
+            if rest.is_empty() {
+                return Some((event_loop, frame, Self::devview_realm_generation(frame)));
+            }
+            return Self::devview_resolve(event_loop, children, frame, rest);
+        }
+        let child = children
+            .iter_mut()
+            .find(|c| c.parent_realm == realm && c.node_id.to_raw() == *node)?;
+        let generation = child.generation;
+        let iframe::ChildIframe {
+            event_loop: child_loop,
+            children: grandchildren,
+            ..
+        } = child;
+        if rest.is_empty() {
+            return Some((child_loop, 0, generation));
+        }
+        Self::devview_resolve(child_loop, grandchildren, 0, rest)
     }
 
     fn devview_canvas_manifest_for(
         event_loop: &mut BrowserEventLoop,
+        realm: u32,
         frame_path: FramePath,
         generation: u64,
     ) -> Vec<DevviewCanvasMeta> {
-        let Ok(json) = event_loop.execute_script(DEVVIEW_CANVAS_MANIFEST_JS) else {
+        let Ok(json) = Self::devview_doc_exec(event_loop, realm, DEVVIEW_CANVAS_MANIFEST_JS) else {
             return Vec::new();
         };
         let Ok(nodes) = serde_json::from_str::<Vec<DevviewCanvasNode>>(&json) else {
@@ -1476,175 +1655,66 @@ impl Page {
             .collect()
     }
 
-    fn devview_canvas_manifest_children(
-        children: &mut [iframe::ChildIframe],
-        parent_path: &[u32],
-        out: &mut Vec<DevviewCanvasMeta>,
-    ) {
-        for child in children {
-            let mut path = parent_path.to_vec();
-            path.push(child.node_id.to_raw());
-            out.extend(Self::devview_canvas_manifest_for(
-                &mut child.event_loop,
-                path.clone(),
-                child.generation,
-            ));
-            Self::devview_canvas_manifest_children(&mut child.children, &path, out);
-        }
-    }
-
     /// Full canvas manifest for Devview. This bypasses page-visible canvas
     /// serialization and therefore never applies fingerprint jitter.
     #[doc(hidden)]
     pub fn devview_canvas_manifest(&mut self) -> Vec<DevviewCanvasMeta> {
-        let mut out = Self::devview_canvas_manifest_for(&mut self.event_loop, Vec::new(), 0);
-        Self::devview_canvas_manifest_children(&mut self.children, &[], &mut out);
+        let mut out = Self::devview_canvas_manifest_for(&mut self.event_loop, 0, Vec::new(), 0);
+        Self::devview_walk(&mut self.event_loop, &mut self.children, 0, &[], &mut |f| {
+            out.extend(Self::devview_canvas_manifest_for(
+                f.event_loop,
+                f.realm,
+                f.path.to_vec(),
+                f.generation,
+            ));
+        });
         out
-    }
-
-    fn devview_frame_slots(event_loop: &mut BrowserEventLoop) -> Vec<u32> {
-        event_loop
-            .execute_script(&format!(
-                "(function(){{var ns={NS_RESOLVE};if(!ns||!ns.frames)return '';\
-                 var f=document.querySelectorAll('iframe'),out=[];\
-                 for(var i=0;i<f.length;i++)out.push(ns.frames.nodeIdOf(f[i]));\
-                 return out.join(',');}})()"
-            ))
-            .unwrap_or_default()
-            .trim_matches('"')
-            .split(',')
-            .filter_map(|value| value.trim().parse().ok())
-            .collect()
-    }
-
-    fn devview_frame_snapshots_in(
-        event_loop: &mut BrowserEventLoop,
-        children: &mut [iframe::ChildIframe],
-        parent_path: &[u32],
-        serialize_js: &str,
-        out: &mut Vec<DevviewFrameSnapshot>,
-    ) {
-        let slots = Self::devview_frame_slots(event_loop);
-        let rects: std::collections::HashMap<u32, [f64; 4]> = {
-            let op_state = event_loop.runtime_mut().op_state();
-            let mut state = op_state.borrow_mut();
-            let Some(dom_state) = state.try_borrow_mut::<crate::js_runtime::state::DomState>()
-            else {
-                return;
-            };
-            children
-                .iter()
-                .map(|child| {
-                    let rect = dom_state
-                        .layout_engine
-                        .get_bounding_rect(&dom_state.dom, child.node_id);
-                    (
-                        child.node_id.to_raw(),
-                        [rect.x, rect.y, rect.width, rect.height],
-                    )
-                })
-                .collect()
-        };
-        for child in children {
-            let mut path = parent_path.to_vec();
-            path.push(child.node_id.to_raw());
-            let html = child.evaluate(serialize_js).unwrap_or_default();
-            out.push(DevviewFrameSnapshot {
-                frame_path: path.clone(),
-                parent_path: parent_path.to_vec(),
-                slot: slots
-                    .iter()
-                    .position(|node_id| *node_id == child.node_id.to_raw()),
-                generation: child.generation,
-                css_rect: rects
-                    .get(&child.node_id.to_raw())
-                    .copied()
-                    .unwrap_or([0.0; 4]),
-                html,
-            });
-            Self::devview_frame_snapshots_in(
-                &mut child.event_loop,
-                &mut child.children,
-                &path,
-                serialize_js,
-                out,
-            );
-        }
     }
 
     #[doc(hidden)]
     pub fn devview_frame_snapshots(&mut self, serialize_js: &str) -> Vec<DevviewFrameSnapshot> {
         let mut out = Vec::new();
-        Self::devview_frame_snapshots_in(
-            &mut self.event_loop,
-            &mut self.children,
-            &[],
-            serialize_js,
-            &mut out,
-        );
+        Self::devview_walk(&mut self.event_loop, &mut self.children, 0, &[], &mut |f| {
+            let html =
+                Self::devview_doc_exec(f.event_loop, f.realm, serialize_js).unwrap_or_default();
+            out.push(DevviewFrameSnapshot {
+                frame_path: f.path.to_vec(),
+                parent_path: f.parent_path.to_vec(),
+                slot: f.slot,
+                generation: f.generation,
+                css_rect: f.css_rect,
+                html,
+            });
+        });
         out
-    }
-
-    fn devview_canvas_png_in(
-        children: &mut [iframe::ChildIframe],
-        path: &[u32],
-        generation: u64,
-        canvas_id: i32,
-        revision: u64,
-    ) -> Option<String> {
-        let (node, rest) = path.split_first()?;
-        let child = children
-            .iter_mut()
-            .find(|child| child.node_id.to_raw() == *node)?;
-        if rest.is_empty() {
-            if child.generation != generation {
-                return None;
-            }
-            let op_state = child.event_loop.runtime_mut().op_state();
-            let state = op_state.borrow();
-            return state
-                .try_borrow::<crate::js_runtime::extensions::canvas_ext::CanvasState>()?
-                .devview_png(canvas_id, revision);
-        }
-        Self::devview_canvas_png_in(&mut child.children, rest, generation, canvas_id, revision)
     }
 
     /// Lossless full-resolution PNG for the exact revision requested by
     /// Devview. A mismatched revision asks the caller to refresh its manifest.
     #[doc(hidden)]
     pub fn devview_canvas_png(&mut self, key: &DevviewCanvasKey, revision: u64) -> Option<String> {
-        if !key.frame_path.is_empty() {
-            return Self::devview_canvas_png_in(
+        let event_loop = if key.frame_path.is_empty() {
+            if key.generation != 0 {
+                return None;
+            }
+            &mut self.event_loop
+        } else {
+            let (event_loop, _, generation) = Self::devview_resolve(
+                &mut self.event_loop,
                 &mut self.children,
+                0,
                 &key.frame_path,
-                key.generation,
-                key.canvas_id,
-                revision,
-            );
-        }
-        if key.generation != 0 {
-            return None;
-        }
-        let op_state = self.event_loop.runtime_mut().op_state();
+            )?;
+            if generation != key.generation {
+                return None;
+            }
+            event_loop
+        };
+        let op_state = event_loop.runtime_mut().op_state();
         let state = op_state.borrow();
         state
             .try_borrow::<crate::js_runtime::extensions::canvas_ext::CanvasState>()?
             .devview_png(key.canvas_id, revision)
-    }
-
-    fn devview_frame_in<'a>(
-        children: &'a mut [iframe::ChildIframe],
-        path: &[u32],
-    ) -> Option<&'a mut iframe::ChildIframe> {
-        let (node, rest) = path.split_first()?;
-        let child = children
-            .iter_mut()
-            .find(|child| child.node_id.to_raw() == *node)?;
-        if rest.is_empty() {
-            Some(child)
-        } else {
-            Self::devview_frame_in(&mut child.children, rest)
-        }
     }
 
     #[doc(hidden)]
@@ -1654,16 +1724,43 @@ impl Page {
         generation: u64,
         js: &str,
     ) -> Result<String, deno_core::error::AnyError> {
-        let child = Self::devview_frame_in(&mut self.children, path)
-            .ok_or_else(|| deno_core::error::AnyError::msg("frame path is stale"))?;
-        if child.generation != generation {
+        let (event_loop, realm, current) =
+            Self::devview_resolve(&mut self.event_loop, &mut self.children, 0, path)
+                .ok_or_else(|| deno_core::error::AnyError::msg("frame path is stale"))?;
+        if current != generation {
             return Err(deno_core::error::AnyError::msg("frame generation is stale"));
         }
-        child.evaluate(js)
+        Self::devview_doc_exec(event_loop, realm, js)
+    }
+
+    /// [`Self::devview_evaluate_in_frame`] with the frame's own privileged
+    /// capabilities — see [`Self::evaluate_privileged`]. Each frame has its own
+    /// minter, so an event meant for a frame's document is marked by that
+    /// frame's, and `source` must evaluate to a function.
+    pub fn devview_evaluate_privileged_in_frame(
+        &mut self,
+        path: &[u32],
+        generation: u64,
+        source: &str,
+    ) -> Result<String, deno_core::error::AnyError> {
+        let (event_loop, realm, current) =
+            Self::devview_resolve(&mut self.event_loop, &mut self.children, 0, path)
+                .ok_or_else(|| deno_core::error::AnyError::msg("frame path is stale"))?;
+        if current != generation {
+            return Err(deno_core::error::AnyError::msg("frame generation is stale"));
+        }
+        if realm == 0 {
+            event_loop.runtime_mut().call_privileged(source)
+        } else {
+            event_loop
+                .runtime_mut()
+                .call_privileged_in_realm(realm, source)
+        }
     }
 
     fn devview_trace_from(
         event_loop: &mut BrowserEventLoop,
+        realm: u32,
         frame_path: &[u32],
         generation: u64,
         clear: bool,
@@ -1674,7 +1771,7 @@ impl Page {
              var out=t.dump(2000);{}return out;}})()",
             if clear { "t.clear();" } else { "" }
         );
-        if let Ok(raw) = event_loop.execute_script(&js) {
+        if let Ok(raw) = Self::devview_doc_exec(event_loop, realm, &js) {
             for line in raw.lines().filter(|line| !line.trim().is_empty()) {
                 if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) {
                     if let Some(object) = value.as_object_mut() {
@@ -1689,25 +1786,13 @@ impl Page {
         }
     }
 
-    fn devview_trace_children(
-        children: &mut [iframe::ChildIframe],
-        parent_path: &[u32],
-        clear: bool,
-        out: &mut Vec<String>,
-    ) {
-        for child in children {
-            let mut path = parent_path.to_vec();
-            path.push(child.node_id.to_raw());
-            Self::devview_trace_from(&mut child.event_loop, &path, child.generation, clear, out);
-            Self::devview_trace_children(&mut child.children, &path, clear, out);
-        }
-    }
-
     #[doc(hidden)]
     pub fn devview_trace_jsonl(&mut self, clear: bool) -> String {
         let mut out = Vec::new();
-        Self::devview_trace_from(&mut self.event_loop, &[], 0, clear, &mut out);
-        Self::devview_trace_children(&mut self.children, &[], clear, &mut out);
+        Self::devview_trace_from(&mut self.event_loop, 0, &[], 0, clear, &mut out);
+        Self::devview_walk(&mut self.event_loop, &mut self.children, 0, &[], &mut |f| {
+            Self::devview_trace_from(f.event_loop, f.realm, f.path, f.generation, clear, &mut out);
+        });
         out.join("\n")
     }
 
@@ -1740,7 +1825,13 @@ impl Page {
         js: &str,
         timeout: Duration,
     ) -> Result<IdleReason, deno_core::error::AnyError> {
-        self.event_loop.execute_and_run(js, timeout).await
+        let started = std::time::Instant::now();
+        let reason = self.event_loop.execute_and_run(js, timeout).await?;
+        // What `js` did to the frame tree — a frame appended, a message
+        // posted to one — lands within the same call.
+        self.settle_frames(timeout.saturating_sub(started.elapsed()))
+            .await;
+        Ok(reason)
     }
 
     /// Get the page title (document.title).
@@ -1797,7 +1888,7 @@ impl Page {
         selector: &str,
     ) -> Result<String, deno_core::error::AnyError> {
         let selector = serde_json::to_string(selector)?;
-        self.run_human_input(&format!("ns.input.clickSelector({selector})"))
+        self.run_human_input(&format!("h.clickSelector({selector})"))
             .await
     }
 
@@ -1811,61 +1902,116 @@ impl Page {
     ) -> Result<String, deno_core::error::AnyError> {
         let selector = serde_json::to_string(selector)?;
         let text = serde_json::to_string(text)?;
-        self.run_human_input(&format!("ns.input.typeSelector({selector}, {text})"))
+        self.run_human_input(&format!("h.typeSelector({selector}, {text})"))
             .await
     }
 
-    /// Run one humanized-input call (`call`, an expression over `ns`, the
-    /// engine's symbol-keyed namespace) to completion and return its result.
+    /// Run one humanized-input call (`call`, an expression over `h`, the
+    /// humanized-input API) to completion and return its result.
     ///
-    /// These used to evaluate synchronously against a `__browserOxide` global
-    /// that no longer exists, so every call failed with a ReferenceError; and a
-    /// synchronous evaluate cannot wait for input that unfolds over timers
-    /// anyway. The result is parked on the namespace — never on `window` — and
-    /// read back once the loop has run.
+    /// The API is a privileged capability held in Rust, not a namespace
+    /// property: every routine on it mints trusted events, so a page that could
+    /// reach it could forge input. The call's promise is followed from Rust
+    /// too, rather than parked on a JS object the page could overwrite.
     async fn run_human_input(&mut self, call: &str) -> Result<String, deno_core::error::AnyError> {
-        let installed = self.evaluate(&format!(
-            "String(!!(({NS_RESOLVE})||{{}}).input && typeof ({NS_RESOLVE}).input.clickSelector === 'function')"
-        ))?;
-        if installed != "true" {
-            self.evaluate(include_str!("js/humanize.js"))?;
+        self.install_humanize()?;
+        let source = format!(
+            "(function (caps) {{
+               var h = caps.human;
+               if (!h) throw new Error('humanized input is not installed');
+               return Promise.resolve({call});
+             }})"
+        );
+        let outcome = match self.event_loop.runtime_mut().start_privileged(&source) {
+            Ok(pending) => self.settle_privileged(&pending, HUMAN_INPUT_TIMEOUT).await,
+            Err(e) => Err(e),
+        };
+        // A click that lands on a submit button (or a link) can flip
+        // `nav_pending` via the activation it triggers — this call never
+        // follows that navigation itself, so if nothing else clears the flag it
+        // stays stuck, short-circuiting every later `run_until_idle`/
+        // `evaluate_async` on this Page to the ~150 ms nav tail regardless of
+        // what they're actually waiting on. This is the only place that
+        // reaction happens, so it must clear its own trigger before returning.
+        self.event_loop.reset_nav_pending();
+        match outcome? {
+            Some(result) => result.map_err(deno_core::error::AnyError::msg),
+            None => Err(deno_core::error::AnyError::msg(
+                "humanized input did not finish in time",
+            )),
         }
-        self.evaluate(&format!(
-            r#"(() => {{
-                const ns = {NS_RESOLVE};
-                if (!ns || !ns.input || typeof ns.input.clickSelector !== 'function') {{
-                    throw new Error('humanized input is not installed');
-                }}
-                ns.__humanInput = {{ done: false }};
-                Promise.resolve({call}).then(
-                    (r) => {{ ns.__humanInput = {{ done: true, value: String(r) }}; }},
-                    (e) => {{ ns.__humanInput = {{ done: true, error: String(e && e.message || e) }}; }},
-                );
-            }})()"#
-        ))?;
-        let deadline = std::time::Instant::now() + HUMAN_INPUT_TIMEOUT;
+    }
+
+    /// Drive the event loop until `pending` (a privileged call's result)
+    /// settles. `None` when `timeout` passes first.
+    async fn settle_privileged(
+        &mut self,
+        pending: &deno_core::v8::Global<deno_core::v8::Value>,
+        timeout: Duration,
+    ) -> Result<Option<Result<String, String>>, deno_core::error::AnyError> {
+        use crate::js_runtime::privileged::Settled;
+        let deadline = std::time::Instant::now() + timeout;
         loop {
-            let state = self.evaluate(&format!(
-                "JSON.stringify((({NS_RESOLVE})||{{}}).__humanInput || null)"
-            ))?;
-            let state: serde_json::Value = serde_json::from_str(&state).unwrap_or_default();
-            if state["done"] == true {
-                let _ = self.evaluate(&format!(
-                    "(() => {{ const ns = {NS_RESOLVE}; if (ns) delete ns.__humanInput; }})()"
-                ));
-                if let Some(error) = state["error"].as_str() {
-                    return Err(deno_core::error::AnyError::msg(error.to_string()));
-                }
-                return Ok(state["value"].as_str().unwrap_or_default().to_string());
+            match self.event_loop.runtime_mut().privileged_settled(pending) {
+                Settled::Fulfilled(value) => return Ok(Some(Ok(value))),
+                Settled::Rejected(error) => return Ok(Some(Err(error))),
+                Settled::Pending => {}
             }
             let now = std::time::Instant::now();
             if now >= deadline {
-                return Err(deno_core::error::AnyError::msg(
-                    "humanized input did not finish in time",
-                ));
+                return Ok(None);
             }
-            self.evaluate_async("0", (deadline - now).min(Duration::from_millis(250)))
+            self.event_loop
+                .run_until_idle((deadline - now).min(Duration::from_millis(250)))
                 .await?;
+            // A click can open a widget whose frame the next step waits on.
+            self.settle_frames(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Install the humanized-input routines into the current document, if
+    /// they are not already there. [`Self::navigate`] does this itself; a page
+    /// built another way ([`Self::from_html`], [`Self::navigate_pure`]) gets
+    /// them on the first [`Self::human_click`]/[`Self::human_type`], or here.
+    pub fn install_humanize(&mut self) -> Result<(), deno_core::error::AnyError> {
+        self.event_loop.runtime_mut().install_humanize().map(|_| ())
+    }
+
+    /// Evaluate engine-side code with the privileged capabilities.
+    ///
+    /// For drivers that compose their own input — a drag, a raw keystroke — and
+    /// need what [`Self::human_click`] uses internally. `source` must evaluate
+    /// to a function; it is called with one argument, the capability object:
+    ///
+    /// - `markTrusted(event)` marks a synthesized event `isTrusted`;
+    /// - `human`, once installed, is the humanized-input API
+    ///   (`clickElement`, `typeElement`, `moveTo`, `pointerStep`, …);
+    /// - `inputApi` is the bridge to the Rust behaviour generators.
+    ///
+    /// The object exists only as this argument — it is never reachable from the
+    /// page — so `source` must not store it anywhere the page can read.
+    /// Returns the result stringified, like [`Self::evaluate`].
+    pub fn evaluate_privileged(
+        &mut self,
+        source: &str,
+    ) -> Result<String, deno_core::error::AnyError> {
+        self.event_loop.runtime_mut().call_privileged(source)
+    }
+
+    /// [`Self::evaluate_privileged`] for a function that returns a promise:
+    /// drives the event loop until it settles or `timeout` passes, and returns
+    /// the fulfilled value (a rejection's message as the error).
+    pub async fn evaluate_privileged_async(
+        &mut self,
+        source: &str,
+        timeout: Duration,
+    ) -> Result<String, deno_core::error::AnyError> {
+        let pending = self.event_loop.runtime_mut().start_privileged(source)?;
+        match self.settle_privileged(&pending, timeout).await? {
+            Some(result) => result.map_err(deno_core::error::AnyError::msg),
+            None => Err(deno_core::error::AnyError::msg(
+                "privileged call did not settle in time",
+            )),
         }
     }
 
@@ -1935,6 +2081,22 @@ impl Page {
                 log.contexts.extend(c.contexts);
                 log.exceptions.extend(c.exceptions);
             }
+        }
+        // Same-origin frames are realms of this isolate. deno_core offers no
+        // way to announce an extra context to its inspector, so the tap never
+        // hears of them; the engine knows them, and lists them itself (with
+        // negative ids, which no inspector-assigned id can be).
+        for (realm, _, _) in self.frame_realms() {
+            let origin = self
+                .evaluate_in_frame_realm(realm, "String(location.origin)")
+                .unwrap_or_default();
+            log.contexts
+                .push(crate::js_runtime::inspect::ContextRecord {
+                    id: -i64::from(realm),
+                    origin,
+                    name: format!("frame realm {realm}"),
+                    destroyed: false,
+                });
         }
         Some(log)
     }
@@ -2310,6 +2472,10 @@ impl Page {
             solvers,
         )
         .await?;
+        let mut page = page;
+        // Frames the page's scripts inserted after load are built here, not
+        // only when the navigation happened to start as a challenge.
+        page.settle_frames(FRAME_SETTLE_BUDGET).await;
         Ok(page)
     }
 
@@ -2330,7 +2496,7 @@ impl Page {
 
         // Iteration 0 uses provided HTML — no headers means no CSP
         // (this entry point is for tests that hand us synthetic HTML).
-        Self::navigate_loop_internal(
+        let mut page = Self::navigate_loop_internal(
             html.to_string(),
             url.to_string(),
             profile,
@@ -2344,7 +2510,9 @@ impl Page {
             false,
             Self::default_solvers(),
         )
-        .await
+        .await?;
+        page.settle_frames(FRAME_SETTLE_BUDGET).await;
+        Ok(page)
     }
 
     /// Reset all cross-navigation JS state on this Page so its V8 isolate
@@ -2465,6 +2633,10 @@ impl Page {
                 call('__resetPageGlobals');
             })();"#,
         );
+        // The outgoing document's humanized-input routines close over its
+        // `document.body`; the next document installs its own. The privileged
+        // capabilities themselves are the isolate's and stay armed.
+        self.event_loop.runtime_mut().reset_humanize();
         // Reap Workers the OUTGOING page spawned but never terminated. The
         // warm path reuses this isolate across navs, so — unlike the cold
         // `Page::drop` path, which already calls this — orphan Workers would
@@ -2482,7 +2654,9 @@ impl Page {
         // Drop the previous document's iframe isolates. Children are newer
         // isolates than this Page's, so clearing here keeps V8's
         // reverse-creation-order drop requirement satisfied.
-        self.children.clear();
+        for child in std::mem::take(&mut self.children) {
+            iframe::bury_frame(child);
+        }
     }
 
     /// Navigate this *warm* Page to a new URL by reusing its V8 isolate
@@ -2841,7 +3015,9 @@ impl Page {
         self.event_loop
             .runtime_mut()
             .replace_dom(dom, stylesheets, external_css);
-        self.children.clear();
+        for child in std::mem::take(&mut self.children) {
+            iframe::bury_frame(child);
+        }
         self.url = resp_url.clone();
         self.set_module_base_url(&resp_url);
         for (u, sz, t) in all_timings {
@@ -2889,7 +3065,7 @@ impl Page {
 
         // Init scripts, before anything the page ships.
         for script in init_scripts {
-            if let Err(e) = self.event_loop.execute_script(script) {
+            if let Err(e) = self.event_loop.runtime_mut().run_init_script(script) {
                 tracing::warn!(error = %e, "warm init script error");
             }
         }
@@ -3067,12 +3243,10 @@ impl Page {
         }
         wmark!("scripts executed");
 
-        // Re-install `humanize.js` on the fresh DOM. The previous page's
-        // humanize closure captured the old `document.body`; its setInterval
-        // has been cancelled by the generation bump, so we install fresh.
-        let _ = self
-            .event_loop
-            .execute_script(include_str!("js/humanize.js"));
+        // Install the humanized-input routines on the fresh DOM, unless an
+        // init script already did (`reset_for_reuse` dropped the previous
+        // document's, whose timers the generation bump has cancelled).
+        let _ = self.event_loop.runtime_mut().install_humanize();
         if std::env::var_os("BROWSER_OXIDE_STRICT_API").is_some() {
             let _ = self
                 .event_loop
@@ -3146,6 +3320,12 @@ impl Page {
         self.event_loop.runtime_mut().cancel_terminate_execution();
         drop(_build_watcher);
         wmark!("drain done [READY]");
+
+        // The warm path used to build no frames at all: a pooled document's
+        // frames ran, if anywhere, in their parent-side realms. The page hosts
+        // its frames now, so it builds them.
+        self.settle_frames(FRAME_SETTLE_BUDGET).await;
+        wmark!("frames settled");
 
         Ok(())
     }
@@ -4497,7 +4677,7 @@ impl Page {
 
     /// Build a page with external script fetching.
     /// Resolve a potentially-relative URL against a base URL.
-    fn resolve_url(base: &str, relative: &str) -> Option<String> {
+    pub(crate) fn resolve_url(base: &str, relative: &str) -> Option<String> {
         // Defence against the iphey.com regression: a JS-side
         // `location.href = 'about:blank'` (or `'data:...'`, `'javascript:'`,
         // etc.) can reach Rust as the literal `https://host/about:blank` if
@@ -5364,54 +5544,10 @@ impl Page {
             }
         }
 
-        // Process iframes (srcdoc and src)
-        let mut children = Vec::new();
-        let iframes = {
-            let dom_ref = event_loop.runtime_mut().inner();
-            let state = dom_ref.op_state();
-            let state = state.borrow();
-            let dom_state = state.borrow::<crate::js_runtime::state::DomState>();
-            iframe::find_iframes(&dom_state.dom)
-        };
-        for info in &iframes {
-            if let Some(srcdoc) = &info.srcdoc {
-                match iframe::ChildIframe::from_srcdoc(info.node_id, srcdoc, profile).await {
-                    Ok(child) => children.push(child),
-                    Err(e) => tracing::warn!(error = %e, "iframe srcdoc error"),
-                }
-            } else if let Some(src) = &info.src {
-                if !src.is_empty() && !src.starts_with("javascript:") {
-                    if let Some(full_src) = Self::resolve_url(url, src) {
-                        match iframe::ChildIframe::from_url(
-                            info.node_id,
-                            &full_src,
-                            url,
-                            client,
-                            Some(profile),
-                        )
-                        .await
-                        {
-                            Ok(child) => children.push(child),
-                            Err(e) => {
-                                tracing::warn!(src = %full_src, error = %e, "iframe src error")
-                            }
-                        }
-                    }
-                } else if src.starts_with("javascript:") {
-                    // javascript:; or similar — create a blank frame so it can be written to
-                    match iframe::ChildIframe::from_srcdoc(
-                        info.node_id,
-                        "<!DOCTYPE html><html><body></body></html>",
-                        profile,
-                    )
-                    .await
-                    {
-                        Ok(child) => children.push(child),
-                        Err(e) => tracing::warn!(error = %e, "iframe javascript blank error"),
-                    }
-                }
-            }
-        }
+        // Frames are built by `settle_frames` after construction: same-origin
+        // ones as realms of this isolate, cross-origin ones as isolates of
+        // their own.
+        let children = Vec::new();
 
         // Cancel the build-phase watcher's terminate so the runtime is
         // usable for the drain phase (and downstream execute_script calls).
@@ -5421,19 +5557,24 @@ impl Page {
         event_loop.runtime_mut().cancel_terminate_execution();
         mark!("post-drain summary + iframes + watcher cleanup [DONE]");
 
-        Ok(Self {
+        let mut page = Self {
             event_loop,
             url: url.to_string(),
             children,
             client: Some(client.clone()),
             solvers: std::sync::Arc::from(Vec::<std::sync::Arc<dyn crate::ChallengeSolver>>::new()),
-        })
+        };
+        // Nested frames, and frames the drain above inserted.
+        page.settle_frames(FRAME_SETTLE_BUDGET).await;
+        Ok(page)
     }
 
     /// Consume the page and return the DOM.
     pub fn take_dom(mut self) -> Dom {
         // Drop children first (V8 reverse order requirement)
-        self.children.clear();
+        for child in std::mem::take(&mut self.children) {
+            iframe::bury_frame(child);
+        }
         // Use ManuallyDrop to prevent the Drop impl from running
         let page = std::mem::ManuallyDrop::new(self);
         // SAFETY: `page` is `ManuallyDrop`, so its destructor will not

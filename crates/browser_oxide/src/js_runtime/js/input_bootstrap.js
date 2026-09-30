@@ -8,8 +8,8 @@
 // loudest mouse tell for behavioural classifiers — the very thing the humanize
 // module exists to avoid.
 //
-// The handle lives on the engine's symbol-keyed namespace, and `humanize.js`
-// deletes it as soon as it has captured it in a closure (same discipline as the
+// The handle is published on the engine's symbol-keyed namespace only for the
+// engine to lift into Rust once the bootstraps finish (same discipline as the
 // trusted-event minter in event_bootstrap.js).
 ((globalThis) => {
     const ops = (typeof Deno !== "undefined" && Deno.core && Deno.core.ops) || null;
@@ -43,6 +43,17 @@
                 return [];
             }
         },
+        /// Rich per-char schedule: [{key, code, down_ms, up_ms}, …] — the
+        /// real `KeyboardEvent.key`/`.code` pair (digit/space/etc. aware,
+        /// not just letters) plus cumulative keydown/keyup timing from the
+        /// same bigram-aware LogNormal model as `typingDelays`.
+        keystrokeSchedule(text, wpm) {
+            try {
+                return ops.op_human_keystroke_schedule(text, wpm || 65);
+            } catch (_) {
+                return [];
+            }
+        },
         /// Seeded RNG shared with the rest of the behaviour layer.
         random() {
             try {
@@ -56,6 +67,12 @@
     try {
         const ns = (function(){try{var s=Object.getOwnPropertySymbols(globalThis, 1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})();
         if (ns) {
+            // `api` closes over `ops`, which stays valid for the isolate's
+            // whole life. Like `event_bootstrap.js`'s trust minter it is
+            // lifted off the namespace into a Rust-held handle as soon as
+            // the bootstraps finish (`js_runtime/privileged.rs`) and reaches
+            // `humanize.js` only as a call argument — on every navigation,
+            // warm ones included.
             Object.defineProperty(ns, "inputApi", {
                 value: api,
                 configurable: true,

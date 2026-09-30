@@ -326,7 +326,12 @@ fn integrate_x(strokes: &[Stroke], t: f32) -> f32 {
             if dt <= 0.0 {
                 return 0.0;
             }
-            let z = (dt.ln() - s.mu) / (s.sigma * std::f32::consts::SQRT_2);
+            // `dt` is milliseconds (the sampling clock); mu/sigma are
+            // calibrated in log-seconds (Plamondon 1995), so dt must be
+            // converted to seconds before the CDF or the z-score saturates
+            // within under 1 ms of onset and the cursor teleports.
+            let dt_s = dt / 1000.0;
+            let z = (dt_s.ln() - s.mu) / (s.sigma * std::f32::consts::SQRT_2);
             let cdf = 0.5 * (1.0 + erf(z));
             s.amplitude * cdf * s.theta.cos()
         })
@@ -341,7 +346,8 @@ fn integrate_y(strokes: &[Stroke], t: f32) -> f32 {
             if dt <= 0.0 {
                 return 0.0;
             }
-            let z = (dt.ln() - s.mu) / (s.sigma * std::f32::consts::SQRT_2);
+            let dt_s = dt / 1000.0;
+            let z = (dt_s.ln() - s.mu) / (s.sigma * std::f32::consts::SQRT_2);
             let cdf = 0.5 * (1.0 + erf(z));
             s.amplitude * cdf * s.theta.sin()
         })
@@ -667,6 +673,34 @@ mod tests {
         for w in pts.windows(2) {
             let dt = w[1].t_ms - w[0].t_ms;
             assert!((dt - 8.0).abs() < 1e-3, "gap {} not 8 ms", dt);
+        }
+    }
+
+    #[test]
+    fn mouse_trajectory_does_not_teleport_at_onset() {
+        // Regression: `integrate_{x,y}` fed `dt` in milliseconds into a CDF
+        // calibrated in log-seconds, so the erf saturated within under 1 ms
+        // of stroke onset — nearly the whole displacement landed in the
+        // first sample. A real ballistic movement spends its first 16 ms
+        // (two 8 ms samples) accelerating, covering only a small fraction
+        // of the total path.
+        for seed in 0..20u64 {
+            let p = BehaviorProfile {
+                seed,
+                ..BehaviorProfile::default()
+            };
+            let from = (10.0, 20.0);
+            let to = (700.0, 450.0);
+            let pts = mouse_trajectory(from, to, 40.0, &p);
+            assert!(pts.len() > 4, "seed {seed}: trajectory too short");
+            let total_dist = ((to.0 - from.0).powi(2) + (to.1 - from.1).powi(2)).sqrt();
+            let p2 = pts[2]; // t = 16 ms
+            let early_dist = ((p2.x - from.0).powi(2) + (p2.y - from.1).powi(2)).sqrt();
+            let fraction = early_dist / total_dist;
+            assert!(
+                fraction <= 0.15,
+                "seed {seed}: {fraction:.3} of the path covered by 16 ms — teleport at onset"
+            );
         }
     }
 

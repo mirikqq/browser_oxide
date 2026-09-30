@@ -6,7 +6,61 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+- **Page script could mint `isTrusted` events.** The engine namespace hides
+  from `Object.getOwnPropertySymbols(window)` only when called with one
+  argument, and it carried `input.mark` (the trusted-event minter) plus the
+  humanized-input routines, all of which mint trust. The minter, the
+  behaviour bridge and the input API now live in Rust-held handles
+  (`js_runtime/privileged.rs`), lifted off the namespace before any init or
+  page script runs and handed to engine code only as a call argument.
+
 ### Fixed
+- **Warm-reused pages lost trusted input from their second navigation on**
+  (pool, `navigate_warm_with_init`, devview): the minter was a single-use
+  handle the first `humanize.js` install consumed. The Rust-held capabilities
+  last for the isolate's lifetime.
+- **Delivered `MessageEvent`s were untrusted** — frame-to-frame `postMessage`
+  in both directions, `window.postMessage`, `MessageChannel` ports and Worker
+  messages. They are trusted, as in Chrome.
+- **A `srcdoc` frame's origin was `"null"`** instead of its parent's, both as
+  `location.origin` and as the `event.origin` of its messages, and a parent
+  posting to it with its own origin as `targetOrigin` was dropped. Message
+  origins and `targetOrigin` checks now use the engine's record of each
+  frame's origin, not the value the sending realm wrote into its queue.
+- **Same-origin frames are realms of the page's isolate (F4).** A
+  same-origin frame — `srcdoc`, `about:blank`, or a `src` on the page's origin
+  — is a full document in a `v8::Context` of the page's own isolate, running
+  the same bootstraps against a `DomState` of its own (`js_runtime/realms.rs`;
+  ops follow the calling realm through per-realm op wrappers). Its window is
+  reached synchronously — `contentWindow.foo`, `contentDocument` — keeps its
+  identity when the frame's document loads into it, shares the page's
+  storage, and posts messages with the right `source` and `origin`. Frames
+  nest; a frame navigating itself navigates the frame, not the page.
+  Cross-origin frames stay isolates of their own (`ChildIframe`), nested ones
+  included. This replaces the thin `contentWindow` realm the page used to
+  build next to the frame's real document — which ran the frame's scripts a
+  second time and answered messages in its place — and ~1,000 lines of its
+  mirror-constructor machinery. A relative `src` is no longer treated as
+  cross-origin; a cross-origin frame's window is one object for its life; a
+  script a frame inserts runs in that frame.
+- **`pointer-events` was not inherited** in computed style, so the text inside
+  a floating `<label style="pointer-events:none">` still caught hit-tests and
+  humanized input refused the field underneath as covered ("нет видимой
+  точки").
+- **Frames inserted after load were never built** by an ordinary navigation —
+  cold ones only built them inside the challenge poll, warm (pooled) ones
+  never did. Pages now settle their frame tree themselves
+  (`Page::settle_frames`): after construction and navigation, in
+  `evaluate_async` and during humanized input. A frame that fails to load is
+  not refetched until its `src`/`srcdoc` changes.
+- CDP `Input.dispatchMouseEvent`/`dispatchKeyEvent`/`insertText` events are
+  trusted, as Chrome's own input pipeline's are.
+- devview: frames were not driven and messages not pumped while a humanized
+  action ran; an action that did not finish in 10 s left "запущено" as its
+  last status; `[trusted]` reported whether a minter was found rather than
+  what the events were; the frame-click and unknown-action paths still
+  spliced request values into JS source.
 - **`getHours()` disagreed with `Intl` under any non-host timezone.** The
   profile's zone was a JS override of `Intl.DateTimeFormat`,
   `getTimezoneOffset` and the `toString` family, while the local getters, the
@@ -38,6 +92,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and the `Intl` natives are no longer wrapped.
 
 ### Added
+- Frame realms: `Page::frame_realms`, `frame_realm_for`,
+  `evaluate_in_frame_realm`; `BrowserJsRuntime::create_frame_realm(_for)`,
+  `execute_in_realm(_named)`, `replace_realm_document`,
+  `call_privileged_in_realm`, `destroy_frame_realm`.
+- `Page::install_humanize`, `Page::evaluate_privileged` /
+  `evaluate_privileged_async` and `ChildIframe::evaluate_privileged`: drivers
+  that compose their own input get the capability object (`markTrusted`,
+  `human`, `inputApi`) as a function argument. `humanize.js` is now a function
+  expression taking that object; evaluating it as a plain script no longer
+  installs anything (init-script lists that contain it keep working).
 - `stealth::presets::{all, by_name, select, default_profile}` — the preset
   catalog, and profile selection from `BROWSER_OXIDE_STEALTH_*`. Catalog tests
   check every preset validates and declares a stack `net::tls` can build.

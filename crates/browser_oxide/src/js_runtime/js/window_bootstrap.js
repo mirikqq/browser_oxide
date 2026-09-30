@@ -9,6 +9,12 @@
         } catch (_e) {}
         return null;
     })();
+    // The trusted-event minter, taken while the bootstraps still hold it (the
+    // engine lifts it off the namespace once they finish). Everything this
+    // file delivers on the platform's behalf — a `postMessage` to this
+    // window, a Worker's `message`/`error` — is a trusted event in Chrome.
+    const _engineMarkTrusted = (_boNs && typeof _boNs.markTrusted === 'function')
+        ? _boNs.markTrusted : null;
     const _idl = (_boNs && _boNs.idl) || {
         own: (obj) => obj,
         read: () => undefined,
@@ -1318,6 +1324,28 @@
         origin: "null",
     };
 
+    // The origin an `about:srcdoc`/`about:blank` document inherits from the
+    // document that created it. A literal `about:` URL parses to an opaque
+    // origin, which is right for a top-level `about:blank` and wrong for a
+    // frame: Chrome gives a srcdoc frame its parent's origin, and a widget
+    // posting to it with `targetOrigin: location.origin` relies on exactly
+    // that. Set by the engine when it builds such a frame, through a
+    // capability it lifts off the namespace before any page script runs.
+    let _inheritedOrigin = null;
+    try {
+        if (_boNs) {
+            Object.defineProperty(_boNs, 'inheritOrigin', {
+                value: function (origin) {
+                    _inheritedOrigin = origin == null ? null : String(origin);
+                    if (/^about:(srcdoc|blank)$/i.test(_locationData.href)) {
+                        _locationData.origin = _inheritedOrigin || 'null';
+                    }
+                },
+                configurable: true, enumerable: false, writable: false,
+            });
+        }
+    } catch (_) { /* ignore */ }
+
     function _parseLocationUrl(url) {
         const s = String(url);
         // Special-scheme URLs (about:, data:, javascript:, blob:, mailto:,
@@ -1340,7 +1368,8 @@
             _locationData.pathname = '';
             _locationData.search = '';
             _locationData.hash = '';
-            _locationData.origin = 'null';
+            _locationData.origin = (_inheritedOrigin && /^about:(srcdoc|blank)$/i.test(s))
+                ? _inheritedOrigin : 'null';
             return;
         }
         try {
@@ -2110,6 +2139,7 @@
                 : globalThis.Event;
         let ev;
         try { ev = new Ctor(type, init); } catch (_e) { ev = Object.assign({ type }, init); }
+        if (_engineMarkTrusted) _engineMarkTrusted(ev);
         let dispatched = false;
         try { dispatched = target.dispatchEvent(ev) !== undefined; } catch (_e) {}
         if (!dispatched) {
@@ -4067,6 +4097,41 @@
         globalThis.close = ({ close() {} }).close;
         _maskFunction(globalThis.close, "close");
 
+        // Messages to a frame whose document has not loaded yet. A widget
+        // loader appends its frame and posts to it in the same task; Chrome
+        // would hand that message to the initial about:blank, where it is
+        // lost. Held here instead and delivered once the frame's document is
+        // in (the engine calls `documentLoaded`), which is what such loaders
+        // are written to expect. Null while nothing is awaited.
+        let _awaitingDoc = null;
+        const _deliverMessage = (cloned, senderOrigin, sender) => {
+            Promise.resolve().then(() => {
+                const event = new MessageEvent("message", {
+                    data: cloned,
+                    origin: senderOrigin,
+                    source: sender,
+                });
+                if (_engineMarkTrusted) _engineMarkTrusted(event);
+                globalThis.dispatchEvent(event);
+            });
+        };
+        try {
+            if (_boNs) {
+                Object.defineProperty(_boNs, "awaitDocument", {
+                    value: () => { if (!_awaitingDoc) _awaitingDoc = []; },
+                    configurable: true, enumerable: false, writable: false,
+                });
+                Object.defineProperty(_boNs, "documentLoaded", {
+                    value: () => {
+                        const held = _awaitingDoc;
+                        _awaitingDoc = null;
+                        if (held) for (const m of held) _deliverMessage(m[0], m[1], m[2]);
+                    },
+                    configurable: true, enumerable: false, writable: false,
+                });
+            }
+        } catch (_) { /* ignore */ }
+
         globalThis.postMessage = ({
         postMessage(message, targetOrigin, transfer) {
             const recipientOrigin = globalThis.location?.origin || "null";
@@ -4083,15 +4148,22 @@
                 // DataCloneError — propagate as-is (matches Chrome)
                 throw e;
             }
-            // Fire message event asynchronously
-            Promise.resolve().then(() => {
-                const event = new MessageEvent("message", {
-                    data: cloned,
-                    origin: recipientOrigin,
-                    source: globalThis,
-                });
-                globalThis.dispatchEvent(event);
-            });
+            // The sender: the window whose code is running — this one, or a
+            // same-origin frame realm (or the page) calling into it. The event
+            // names it as `source` and carries its origin, so a frame can
+            // answer its embedder through `event.source`.
+            let sender = globalThis;
+            try {
+                const w = ops.op_incumbent_window && ops.op_incumbent_window();
+                if (w) sender = w;
+            } catch (_) { /* keep this window */ }
+            let senderOrigin = recipientOrigin;
+            try { senderOrigin = String(sender.location.origin); } catch (_) {}
+            if (_awaitingDoc) {
+                if (_awaitingDoc.length < 64) _awaitingDoc.push([cloned, senderOrigin, sender]);
+                return;
+            }
+            _deliverMessage(cloned, senderOrigin, sender);
         }
         }).postMessage;
         _maskFunction(globalThis.postMessage, "postMessage");

@@ -87,11 +87,18 @@ async fn same_srcdoc_replacement_gets_a_new_generation() {
     )
     .await
     .unwrap();
-    let first = page.child_iframe(0).unwrap().generation;
+    let generation = |page: &mut Page| {
+        page.devview_frame_snapshots("1")
+            .into_iter()
+            .find(|f| f.frame_path.len() == 1)
+            .expect("frame")
+            .generation
+    };
+    let first = generation(&mut page);
     page.evaluate("document.getElementById('f').setAttribute('srcdoc', document.getElementById('f').getAttribute('srcdoc'))")
         .unwrap();
     page.materialize_new_iframes().await.unwrap();
-    let second = page.child_iframe(0).unwrap().generation;
+    let second = generation(&mut page);
     assert_ne!(first, second);
 }
 

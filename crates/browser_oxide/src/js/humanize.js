@@ -39,27 +39,24 @@
 // (a JS-constructed MouseEvent ordinarily reports `isTrusted=false`). Trust
 // lives in a module-private WeakSet in event_bootstrap.js, NOT a per-event
 // own property, so it is both correctly-shaped and unforgeable by page JS.
-(function humanize() {
+//
+// This file is a function expression, not a script: the engine calls it with
+// its capability object (`js_runtime/privileged.rs`) and keeps the returned
+// API in Rust. Neither the minter, the behaviour bridge nor the API is ever
+// put on a JS object the page can reach — the engine namespace is not such
+// an object, whatever its symbol key suggests: `getOwnPropertySymbols` shows
+// it to any caller that passes a second argument.
+(function humanize(caps) {
     const body = document.body || document.documentElement;
-    if (!body) return;
+    if (!body) return undefined;
 
-    // Capture the privileged trusted-event minter published by
-    // event_bootstrap.js and revoke the global handle immediately, so page
-    // scripts (which run after this init script) can never reach it. We mark
-    // our synthesized input events trusted via this closure-held function
-    // instead of the old `Object.defineProperty(ev,'isTrusted',{value:true})`
-    // — which created a detectable OWN data property AND was overridable.
     const _boNsTop = (function(){try{var s=Object.getOwnPropertySymbols(globalThis, 1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})();
-    const _markTrusted = (_boNsTop && typeof _boNsTop.markTrusted === 'function')
-        ? _boNsTop.markTrusted
-        : null;
-    try { if (_boNsTop) delete _boNsTop.markTrusted; } catch (_) {}
 
-    // Same discipline for the behaviour-generator bridge: capture, then revoke.
-    // Without it `Deno.core.ops` is already gone by the time this script runs and
-    // every path degenerates to linear interpolation.
-    const _bo = (_boNsTop && _boNsTop.inputApi) || null;
-    try { if (_boNsTop) delete _boNsTop.inputApi; } catch (_) {}
+    const _markTrusted = (caps && typeof caps.markTrusted === 'function') ? caps.markTrusted : null;
+
+    // The behaviour-generator bridge. Without it every path degenerates to
+    // linear interpolation — `Deno.core.ops` is gone by the time this runs.
+    const _bo = (caps && caps.inputApi) || null;
 
     // v0.1.0-parity Fix 6 — seeded random for two-level per-session
     // determinism. Symbol-keyed slot is installed by stealth_bootstrap.js
@@ -382,6 +379,38 @@
         return null;
     };
 
+    /// Why `_pickPoint` found nothing, in words a driver can act on: the box
+    /// the engine laid out, the viewport, and what hit-testing finds on top at
+    /// the box's centre. A bare "clipped, zero-sized or covered" left the
+    /// driver guessing which of the three it was.
+    const _whyNoPoint = (el) => {
+        const d = (n) => {
+            if (!n || !n.tagName) return String(n);
+            let s = n.tagName.toLowerCase();
+            if (n.id) s += '#' + n.id;
+            const c = typeof n.className === 'string' ? n.className.trim() : '';
+            if (c) s += '.' + c.split(/\s+/).slice(0, 3).join('.');
+            return s;
+        };
+        let r;
+        try { r = el.getBoundingClientRect(); } catch (e) { return 'нет прямоугольника: ' + e; }
+        const [vw, vh] = _viewport();
+        const box = `[${Math.round(r.left)},${Math.round(r.top)} ${Math.round(r.width)}×${Math.round(r.height)}]`;
+        if (!(r.width > 0 && r.height > 0)) return `нулевого размера ${box}`;
+        if (r.right <= 0 || r.bottom <= 0 || r.left >= vw || r.top >= vh) {
+            return `вне экрана ${box}, вьюпорт ${vw}×${vh}`;
+        }
+        const x = Math.round(Math.max(0, Math.min(vw - 1, r.left + r.width / 2)));
+        const y = Math.round(Math.max(0, Math.min(vh - 1, r.top + r.height / 2)));
+        let top = null;
+        try { top = document.elementFromPoint(x, y); } catch (_e) { /* ignore */ }
+        let stack = '';
+        try {
+            stack = (document.elementsFromPoint(x, y) || []).slice(0, 4).map(d).join(' > ');
+        } catch (_e) { /* ignore */ }
+        return `перекрыт: в (${x},${y}) сверху ${d(top)} (стопка: ${stack}), элемент ${d(el)} ${box}`;
+    };
+
     /// Scroll the element into view the way a person does — in steps, through
     /// the same wheel/scroll pair the page would see from a real wheel.
     const _bringIntoView = async (el) => {
@@ -408,17 +437,11 @@
         // movementX/Y and screenX/Y stay integral — Chrome reports those as longs.
         const mx = prev && Number.isFinite(prev[0]) ? Math.round(cx - prev[0]) : 0;
         const my = prev && Number.isFinite(prev[1]) ? Math.round(cy - prev[1]) : 0;
-        const mouseEv = new MouseEvent('mousemove', {
-            bubbles: true, cancelable: true, view: window,
-            clientX: cx, clientY: cy,
-            screenX: _screenXOf(cx), screenY: _screenYOf(cy),
-            movementX: mx, movementY: my,
-            button: 0, buttons: 0,
-        });
-        _dispatch(_hitTarget(cx, cy), mouseEv);
-        // PointerEvent paired emission. Pointer events were added in Chrome
-        // 55 and are the modern primary pointer input event; modern sensors
-        // and newer fingerprinters listen here in addition to legacy mousemove.
+        // PointerEvent before its compatibility MouseEvent — that is Chrome's
+        // real dispatch order (Pointer Events spec ties every mouse event to
+        // a "corresponding" pointer event that fires first), and pointer
+        // events were added in Chrome 55, so modern sensors and
+        // fingerprinters watch this one in addition to legacy mousemove.
         try {
             const PE = (typeof PointerEvent === 'function') ? PointerEvent : null;
             if (PE) {
@@ -435,6 +458,14 @@
                 _dispatch(_hitTarget(cx, cy), pEv);
             }
         } catch (_) {}
+        const mouseEv = new MouseEvent('mousemove', {
+            bubbles: true, cancelable: true, view: window,
+            clientX: cx, clientY: cy,
+            screenX: _screenXOf(cx), screenY: _screenYOf(cy),
+            movementX: mx, movementY: my,
+            button: 0, buttons: 0,
+        });
+        _dispatch(_hitTarget(cx, cy), mouseEv);
         _akRecMouse(cx, cy, 0, 0); // 0 = move, button 0 = left
         return true;
     }
@@ -472,7 +503,17 @@
             } catch (_) {}
             _dispatch(target, new MouseEvent(down ? 'mousedown' : 'mouseup', base));
             if (!down) {
-                try { _dispatch(target, new MouseEvent('click', base)); } catch (_) {}
+                // `click`/`auxclick`/`contextmenu` are `PointerEvent`s per
+                // spec (with `MouseEvent`'s usual integer coordinates,
+                // since `PointerEvent extends MouseEvent` but only its own
+                // coordinate accessors stay fractional).
+                try {
+                    const PE = (typeof PointerEvent === 'function') ? PointerEvent : MouseEvent;
+                    _dispatch(target, new PE('click', Object.assign({
+                        pointerType: 'mouse', pointerId: 1, isPrimary: true,
+                        pressure: 0, width: 1, height: 1, detail: 1,
+                    }, base)));
+                } catch (_) {}
             }
             _akRecMouse(cx, cy, down ? 'down' : 'click', 0);
         }
@@ -664,11 +705,8 @@
                 movementX: 1, movementY: 0,
                 button: 0, buttons: 0,
             };
-            const mev = new MouseEvent('mousemove', evOpts);
-            if (_markTrusted) _markTrusted(mev);
-            try { window.dispatchEvent(mev); } catch (_) {}
-            try { document.dispatchEvent(mev); } catch (_) {}
-            try { body.dispatchEvent(mev); } catch (_) {}
+            // Pointer before its compatibility mouse event — same ordering
+            // as `_fireMove` (Chrome's real dispatch order).
             const PE = (typeof PointerEvent === 'function') ? PointerEvent : null;
             if (PE) {
                 const pev = new PE('pointermove', {
@@ -682,6 +720,11 @@
                 try { document.dispatchEvent(pev); } catch (_) {}
                 try { body.dispatchEvent(pev); } catch (_) {}
             }
+            const mev = new MouseEvent('mousemove', evOpts);
+            if (_markTrusted) _markTrusted(mev);
+            try { window.dispatchEvent(mev); } catch (_) {}
+            try { document.dispatchEvent(mev); } catch (_) {}
+            try { body.dispatchEvent(mev); } catch (_) {}
         } catch (_) {}
         try { _boNs.input._lastPos = [lastX, lastY]; } catch (_) {}
     })();
@@ -786,6 +829,11 @@
 
     async function _humanClick(el) {
         if (!el) return 'нет элемента';
+        // Disabled form controls receive no pointer events at all in
+        // Chrome — mousedown/up/click never fire, not even cancelable ones
+        // a listener could act on. `disabled` is undefined (falsy) on
+        // elements that don't reflect it.
+        if (el.disabled) return 'элемент отключён (disabled) — клика не будет';
         if (_isHidden(el)) return 'элемент скрыт — клика не будет';
 
         let pick = _pickPoint(el);
@@ -795,7 +843,7 @@
             await _bringIntoView(el);
             pick = _pickPoint(el);
         }
-        if (!pick) return 'нет видимой точки: элемент обрезан, нулевого размера или перекрыт';
+        if (!pick) return 'нет видимой точки: ' + _whyNoPoint(el);
         const [cx, cy, w] = pick;
 
         await _travelTo(cx, cy, w);
@@ -819,30 +867,23 @@
 
         if (PE) _fireAt(target, PE, 'pointerover', { ...base, buttons: 0, ...pointer, pressure: 0 });
         _fireAt(target, MouseEvent, 'mouseover', { ...base, buttons: 0 });
+        if (PE) _fireAt(target, PE, 'pointermove', { ...base, buttons: 0, ...pointer, pressure: 0 });
         _fireAt(target, MouseEvent, 'mousemove', { ...base, buttons: 0 });
 
         // Settle before pressing — real pointers rest briefly on the target.
         await _sleep(40 + _rand() * 90);
 
         if (PE) _fireAt(target, PE, 'pointerdown', { ...base, ...pointer, pressure: 0.5 });
-        _fireAt(target, MouseEvent, 'mousedown', base);
-        // Moving focus must take it away from wherever it was. Real browsers fire
-        // blur/focusout on the outgoing element, and form libraries (react-hook-form
-        // among them) commit the field value on that event — without it the form
-        // validates an empty field right after you watched the text get typed in.
-        try {
-            var prev = document.activeElement;
-            if (prev && prev !== el && prev !== document.body) {
-                _fireAt(prev, FocusEvent, 'focusout', { bubbles: true, relatedTarget: el });
-                _fireAt(prev, FocusEvent, 'blur', { bubbles: false, relatedTarget: el });
-                if (typeof prev.blur === 'function') prev.blur();
-            }
-        } catch (_) {}
-        try { if (typeof el.focus === 'function') el.focus(); } catch (_) {}
-        try {
-            _fireAt(el, FocusEvent, 'focus', { bubbles: false });
-            _fireAt(el, FocusEvent, 'focusin', { bubbles: true });
-        } catch (_) {}
+        const mousedownNotCancelled = _fireAt(target, MouseEvent, 'mousedown', base);
+        // Moving focus on mousedown is a *default action*: it only runs if the
+        // event wasn't cancelled, and `Element.focus()` (dom_bootstrap.js)
+        // already does the whole prev-blur/new-focus dance itself — the old
+        // and new `blur`/`focusout`/`focus`/`focusin` pairs, in spec order,
+        // gated on the target actually being focusable. Firing another copy
+        // of those events by hand here just double-dispatched all four.
+        if (mousedownNotCancelled) {
+            try { if (typeof el.focus === 'function') el.focus(); } catch (_) {}
+        }
         try { _akRecMouse(cx, cy, 'down', 0); } catch (_) {}
 
         // Press duration. Human mouse clicks cluster around 60-140 ms.
@@ -850,7 +891,13 @@
 
         if (PE) _fireAt(target, PE, 'pointerup', { ...base, buttons: 0, ...pointer, pressure: 0 });
         _fireAt(target, MouseEvent, 'mouseup', { ...base, buttons: 0 });
-        const notCancelled = _fireAt(target, MouseEvent, 'click', { ...base, cancelable: true, buttons: 0 });
+        // `click` is a `PointerEvent` per spec — integer coordinates like any
+        // `MouseEvent`, but the constructor and its `getCoalescedEvents` etc.
+        // are the pointer ones.
+        const ClickCtor = PE || MouseEvent;
+        const notCancelled = _fireAt(target, ClickCtor, 'click', {
+            ...base, ...pointer, cancelable: true, buttons: 0, pressure: 0,
+        });
         try { _akRecMouse(cx, cy, 'click', 0); } catch (_) {}
         // The click event alone is not a click: a real browser then runs the
         // target's activation behaviour, which is what submits a form. This path
@@ -864,15 +911,57 @@
     /// Type into a field key by key, on the clock, with per-character timings from
     /// the bigram-aware model. Setting `.value` in one shot leaves no keystroke
     /// telemetry at all, which is as loud as a bad mouse path.
+    // Legacy `keyCode`/`which` — deprecated but still read by keystroke-
+    // dynamics sensors and older form libraries. Exact for letters, digits
+    // and the handful of named keys typing reaches; everything else falls
+    // back to the character's own code point (imperfect for punctuation on
+    // non-US layouts, but closer than the 0 every field saw before). A full
+    // per-layout table is tracked separately (F1.7), not this quick fix.
+    function _legacyKeyCode(ch) {
+        if (ch >= 'a' && ch <= 'z') return ch.toUpperCase().charCodeAt(0);
+        if (ch >= 'A' && ch <= 'Z') return ch.charCodeAt(0);
+        if (ch >= '0' && ch <= '9') return ch.charCodeAt(0);
+        if (ch === ' ') return 32;
+        if (ch === '\n') return 13;
+        if (ch === '\t') return 9;
+        return ch.charCodeAt(0);
+    }
+    function _localCode(ch) {
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')) return 'Key' + ch.toUpperCase();
+        if (ch >= '0' && ch <= '9') return 'Digit' + ch;
+        if (ch === ' ') return 'Space';
+        if (ch === '\n') return 'Enter';
+        if (ch === '\t') return 'Tab';
+        return 'Unidentified';
+    }
+
     async function _humanType(el, text) {
         if (!el) return 'нет элемента';
-        const str = String(text == null ? '' : text);
-        await _humanClick(el);
+        // A failed click (hidden, disabled, no visible point) must not be
+        // followed by typing anyway — that was silently ignoring exactly
+        // the guards `_humanClick` just enforced.
+        const clickResult = await _humanClick(el);
+        if (!/^клик ок/.test(clickResult)) return clickResult;
+        if (el.readOnly) return 'поле только для чтения (readonly) — ввода не будет';
 
-        let delays = [];
+        let str = String(text == null ? '' : text);
+        const already = String(el.value || '').length;
+        const cap = Number.isFinite(el.maxLength) && el.maxLength >= 0 ? el.maxLength : Infinity;
+        if (already + str.length > cap) str = str.slice(0, Math.max(0, cap - already));
+        if (!str) return 'введено 0 символов (maxlength)';
+
+        let schedule = [];
         try {
-            if (_bo) delays = _bo.typingDelays(str, 0) || [];
+            if (_bo && typeof _bo.keystrokeSchedule === 'function') {
+                schedule = _bo.keystrokeSchedule(str, 0) || [];
+            }
         } catch (_) {}
+        let delays = [];
+        if (!schedule.length) {
+            try {
+                if (_bo) delays = _bo.typingDelays(str, 0) || [];
+            } catch (_) {}
+        }
 
         const setValue = (v) => {
             // React attaches a `_valueTracker` to controlled inputs and compares against
@@ -888,37 +977,59 @@
             const d = Object.getOwnPropertyDescriptor(el.constructor.prototype, 'value');
             if (d && d.set) d.set.call(el, v); else el.value = v;
         };
-        setValue('');
+        const base = String(el.value || '');
         for (let i = 0; i < str.length; i++) {
             const ch = str[i];
+            const slot = schedule[i];
+            const key = (slot && slot.key) || ch;
+            const code = (slot && slot.code) || _localCode(ch);
             await _sleep(delays[i] != null ? delays[i] : 60 + _rand() * 90);
-            const opts = { bubbles: true, cancelable: true, key: ch, code: 'Key' + ch.toUpperCase() };
-            _fireAt(el, KeyboardEvent, 'keydown', opts);
-            setValue(str.slice(0, i + 1));
-            _fireAt(el, InputEvent || Event, 'input', { bubbles: true, data: ch, inputType: 'insertText' });
+            const kOpts = {
+                bubbles: true, cancelable: true, key, code,
+                keyCode: _legacyKeyCode(ch), which: _legacyKeyCode(ch),
+            };
+            try { _akRecKey(code, 0); } catch (_) {}
+            // Sequence per spec: keydown → keypress → beforeinput → the
+            // actual edit → input → keyup. Each of the first three is
+            // cancelable, and Chrome suppresses everything after a
+            // cancelled one — including the edit itself.
+            const keydownOk = _fireAt(el, KeyboardEvent, 'keydown', kOpts);
+            if (keydownOk) {
+                const keypressOk = _fireAt(el, KeyboardEvent, 'keypress', {
+                    ...kOpts, charCode: _legacyKeyCode(ch),
+                });
+                if (keypressOk) {
+                    const IE = InputEvent || Event;
+                    const beforeOk = _fireAt(el, IE, 'beforeinput', {
+                        bubbles: true, cancelable: true, data: ch, inputType: 'insertText',
+                    });
+                    if (beforeOk) {
+                        setValue(base + str.slice(0, i + 1));
+                        _fireAt(el, IE, 'input', { bubbles: true, data: ch, inputType: 'insertText' });
+                    }
+                }
+            }
             // Key dwell: the hold time of the key itself, inside the inter-key gap.
             await _sleep(25 + _rand() * 45);
-            _fireAt(el, KeyboardEvent, 'keyup', opts);
+            _fireAt(el, KeyboardEvent, 'keyup', kOpts);
+            try { _akRecKey(code, 1); } catch (_) {}
             try { _akEvents.counters.key++; } catch (_) {}
         }
         _fireAt(el, Event, 'change', { bubbles: true });
         return 'введено ' + str.length + ' символов';
     }
 
-    try {
-        _akEvents.clickElement = _humanClick;
-        _akEvents.clickSelector = (sel) => _humanClick(document.querySelector(sel));
-        _akEvents.typeElement = _humanType;
-        _akEvents.typeSelector = (sel, text) => _humanType(document.querySelector(sel), text);
-        _akEvents.moveTo = (x, y) => _travelTo(x, y, 30);
-        _akEvents.pointerStep = _pointerStep;
-        // The trusted-event minter, for drivers that build their own event
-        // sequences. A drag cannot be expressed through `clickElement`, and an
-        // untrusted `pointerdown` is worth little to a widget that checks
-        // `isTrusted`. Safe to expose: the namespace is symbol-keyed and the
-        // page cannot reach it, which is the same reason the global was revoked.
-        if (_markTrusted) _akEvents.mark = (ev) => { try { _markTrusted(ev); } catch (_) {} };
-    } catch (_) {}
+    // The input API, returned to the engine rather than published: every
+    // routine here mints trusted events, so whoever holds it can forge input.
+    // Drivers that build their own event sequences get the minter itself from
+    // the same capability object (`caps.markTrusted`), not from here.
+    const _api = Object.create(null);
+    _api.clickElement = _humanClick;
+    _api.clickSelector = (sel) => _humanClick(document.querySelector(sel));
+    _api.typeElement = _humanType;
+    _api.typeSelector = (sel, text) => _humanType(document.querySelector(sel), text);
+    _api.moveTo = (x, y) => _travelTo(x, y, 30);
+    _api.pointerStep = _pointerStep;
 
     // Ambient motion is opt-in, and off by default.
     //
@@ -938,18 +1049,18 @@
             _scheduleAmbient();
         }, 5000 + _rand() * 4000);
     };
-    try {
-        _akEvents.setAmbient = function (on) {
-            const next = !!on;
-            if (next === _ambientOn) return;
-            _ambientOn = next;
-            if (next) {
-                runCycle();
-                _scheduleAmbient();
-            } else if (_ambientTimer !== null) {
-                clearTimeout(_ambientTimer);
-                _ambientTimer = null;
-            }
-        };
-    } catch (_) {}
-})();
+    _api.setAmbient = function (on) {
+        const next = !!on;
+        if (next === _ambientOn) return;
+        _ambientOn = next;
+        if (next) {
+            runCycle();
+            _scheduleAmbient();
+        } else if (_ambientTimer !== null) {
+            clearTimeout(_ambientTimer);
+            _ambientTimer = null;
+        }
+    };
+
+    return _api;
+})

@@ -83,8 +83,9 @@ async fn a_child_frame_is_its_own_realm() {
         .await;
 
     let log = page.inspect_snapshot().expect("тап включён");
-    // Two realms means the frame really got its own isolate rather than sharing
-    // the page's — the distinction the whole frame lifecycle rests on.
+    // Two realms means the frame really got a realm of its own rather than
+    // running in the page's — the distinction the whole frame lifecycle rests
+    // on. A same-origin frame is a realm of the page's isolate (F4).
     assert!(
         log.contexts.len() >= 2,
         "фрейм должен быть отдельным реалмом, реалмов: {} — {}",

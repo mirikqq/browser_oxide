@@ -30,9 +30,10 @@
     //     old design keyed trust off `Symbol.for('__bo_trusted__')` — the
     //     GLOBAL symbol registry — so any page could re-derive the symbol and
     //     forge a trusted event (`new Event('x', {[Symbol.for(...)]: true})`).
-    // Only our privileged init scripts mint trust, via `_markTrusted`, handed
-    // off below through a temp global they capture-and-delete before any page
-    // script runs. There is no in-band (options/symbol) path from page JS.
+    // Only engine code mints trust, via `_markTrusted`: the bootstraps that
+    // deliver platform events use it directly, and it is handed off below to
+    // a Rust-held capability (`js_runtime/privileged.rs`) before any init or
+    // page script runs. There is no in-band (options/symbol) path from page JS.
     const _trustedEvents = new WeakSet();
     const _markTrusted = (ev) => {
         try { if (ev && typeof ev === 'object') _trustedEvents.add(ev); } catch (_) {}
@@ -194,8 +195,15 @@
             _st.screenY = options.screenY || 0;
             _st.clientX = options.clientX || 0;
             _st.clientY = options.clientY || 0;
-            _st.pageX = options.pageX || this.clientX;
-            _st.pageY = options.pageY || this.clientY;
+            // `pageX`/`pageY` are viewport coordinates plus scroll offset —
+            // they only equal `clientX`/`clientY` at scroll position (0, 0).
+            // A page scrolled before a synthetic click/move landed every
+            // event at the top-of-document coordinate regardless of how far
+            // down the target actually was.
+            const _scrollX = (typeof window !== "undefined" && window.scrollX) || 0;
+            const _scrollY = (typeof window !== "undefined" && window.scrollY) || 0;
+            _st.pageX = options.pageX != null ? options.pageX : this.clientX + _scrollX;
+            _st.pageY = options.pageY != null ? options.pageY : this.clientY + _scrollY;
             _st.button = options.button || 0;
             _st.buttons = options.buttons || 0;
             _st.ctrlKey = !!options.ctrlKey;
@@ -245,7 +253,28 @@
         }
         getModifierState(key) { return false; }
     }
-    _evFields(MouseEvent.prototype, ["altKey", "button", "buttons", "clientX", "clientY", "ctrlKey", "metaKey", "movementX", "movementY", "pageX", "pageY", "relatedTarget", "screenX", "screenY", "shiftKey"]);
+    _evFields(MouseEvent.prototype, ["altKey", "button", "buttons", "ctrlKey", "metaKey", "relatedTarget", "shiftKey"]);
+    // Chrome's `MouseEvent` coordinate fields are `long` in the IDL — an
+    // instance built with a fractional value (as every synthetic pointer
+    // sample here is) reads back floored (`std::floor` in Chromium's
+    // `mouse_event.h`). `PointerEvent`'s are `double`, sub-pixel, matching
+    // real hi-res pointer hardware — see the override on its own prototype
+    // below. Both read the same underlying state; only the getter differs.
+    const _COORD_FIELDS = ["clientX", "clientY", "screenX", "screenY", "pageX", "pageY", "movementX", "movementY"];
+    const _evFieldsFloored = (proto, names) => {
+        for (const name of names) {
+            if (Object.prototype.hasOwnProperty.call(proto, name)) continue;
+            const get = Object.getOwnPropertyDescriptor({
+                get [name]() {
+                    const v = _evGet(this, name, undefined);
+                    return typeof v === "number" ? Math.floor(v) : v;
+                },
+            }, name).get;
+            if (typeof _maskFunction === "function") _maskFunction(get, "get " + name);
+            Object.defineProperty(proto, name, { get, enumerable: true, configurable: true });
+        }
+    };
+    _evFieldsFloored(MouseEvent.prototype, _COORD_FIELDS);
 
     class KeyboardEvent extends UIEvent {
         constructor(type, options = {}) {
@@ -315,6 +344,10 @@
         getPredictedEvents() { return []; }
     }
     _evFields(PointerEvent.prototype, ["altitudeAngle", "azimuthAngle", "height", "isPrimary", "persistentDeviceId", "pointerId", "pointerType", "pressure", "tangentialPressure", "tiltX", "tiltY", "twist", "width"]);
+    // Own (non-floored) accessors, shadowing the ones `_evFieldsFloored`
+    // installed on `MouseEvent.prototype` above — `PointerEvent`'s
+    // coordinate fields are `double`, sub-pixel.
+    _evFields(PointerEvent.prototype, _COORD_FIELDS);
 
     class WheelEvent extends MouseEvent {
         constructor(type, options = {}) {
@@ -937,11 +970,14 @@
     // the Node prototype chain — do not reassign it here or the
     // `document instanceof EventTarget` check will break.
 
-    // Privileged handoff of the trusted-event minter (behavioral E1/E2). Our
-    // init scripts (humanize.js) capture this into a closure and `delete` it
-    // synchronously at their top — before any page script runs. It lives on the
-    // engine's symbol-keyed namespace rather than a named global, so a page
-    // loaded without humanize never shows it among window's properties.
+    // Privileged handoff of the trusted-event minter (behavioral E1/E2). It
+    // sits on the namespace only until the bootstraps finish: the engine then
+    // lifts it into a Rust-held handle (`js_runtime/privileged.rs`) and deletes
+    // it here, before any init or page script runs, and hands it to engine code
+    // only as a call argument. The namespace cannot hold it any longer than
+    // that — `Object.getOwnPropertySymbols(window, 1)` reveals the namespace to
+    // any caller — and does not need to: the Rust side keeps the handle for
+    // the isolate's lifetime, so a warm navigation has it as well.
     try {
         if (_boNs) {
             Object.defineProperty(_boNs, 'markTrusted', {
@@ -950,6 +986,12 @@
                 enumerable: false,
                 writable: false,
             });
+            // dom_bootstrap.js ran first and left a one-shot slot for the
+            // minter (cross-realm MessageEvent delivery); fill it and close it.
+            if (typeof _boNs.adoptTrustedMinter === 'function') {
+                _boNs.adoptTrustedMinter(_markTrusted);
+            }
+            delete _boNs.adoptTrustedMinter;
         }
     } catch (_) { /* ignore */ }
 
@@ -1127,6 +1169,8 @@
                 if (_PortClosed.get(port)) return;
                 try {
                     const ev = new MessageEvent('message', { data, bubbles: false, cancelable: false });
+                    // A delivered port message is a trusted event in Chrome.
+                    _markTrusted(ev);
                     // dispatchEvent fires both addEventListener handlers AND the
                     // on-property (deno_core's EventTarget auto-promotes
                     // `onmessage`). Calling the on-property explicitly too would

@@ -98,6 +98,33 @@ js_runtime/
 
 **Concurrent pages** — Each page gets its own V8 Isolate. Isolates are independent and can run on different tokio tasks. No shared mutable state between pages.
 
+## Frames
+
+A page's frames follow Chrome's agent model:
+
+- **Same-origin frames** (`srcdoc`, `about:blank`, a `src` on the page's
+  origin) are *realms* of the page's isolate (`js_runtime/realms.rs`): each a
+  `v8::Context` running the same bootstraps as the page against a `DomState`
+  of its own, so `iframe.contentWindow.foo` and `contentDocument` work
+  synchronously. A realm is created with the initial `about:blank` on first
+  `contentWindow` access (or when the page loads the frame), and loading the
+  frame's document replaces the document while keeping the window, as the HTML
+  spec does. Frames nest.
+- **Cross-origin frames** are isolates of their own (`iframe::ChildIframe`),
+  behind a cross-origin `WindowProxy` whose only open surface is
+  `postMessage`; the page's message pump carries messages across.
+
+Ops are shared by every realm, and which document they act on follows the
+realm that calls them: each realm's `Deno.core.ops` wraps every op to switch
+the active `DomState` first (`js/realm_prelude.js`, `op_realm_switch`).
+Engine code that reads `DomState` goes through `BrowserJsRuntime::op_state()`,
+which puts the page's own document back first. Storage is the page's for
+every frame realm (they are all same-origin with it).
+
+The page loads its frames itself (`Page::settle_frames`) — after construction
+and navigation, in `evaluate_async` and during humanized input — including
+frames its scripts insert later.
+
 ## Global Object Surface
 
 The JS global must match what anti-bot scripts expect from Chrome. The full surface includes 50+ navigator properties, window properties, and API constructors. See [STEALTH.md](STEALTH.md) for the exhaustive list.

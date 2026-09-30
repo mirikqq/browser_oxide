@@ -36,6 +36,21 @@
         fields: () => {},
     };
 
+    // The trusted-event minter, for the MessageEvents this file delivers across
+    // frame realms (a real `postMessage` delivery is trusted). It is created in
+    // event_bootstrap.js, which runs after this file, and handed over through a
+    // one-shot slot that event_bootstrap.js deletes as soon as it has used it —
+    // still during bootstrap, before any page script exists to race for it.
+    let _domMarkTrusted = null;
+    try {
+        Object.defineProperty(_boNs, 'adoptTrustedMinter', {
+            value: function (fn) {
+                if (_domMarkTrusted === null && typeof fn === 'function') _domMarkTrusted = fn;
+            },
+            configurable: true, enumerable: false, writable: false,
+        });
+    } catch (_) { /* ignore */ }
+
     // `_ADOPT` separates the two callers: the page constructs a new node, while
     // `_wrapNodeWithType` adopts one that already exists in the arena.
     const _ADOPT = Symbol("adopt");
@@ -348,6 +363,23 @@
         return globalThis.__jsCookies;
     }
 
+    // An `<iframe>` whose document is the initial `about:blank` — no `srcdoc`,
+    // and a `src` that is absent, empty or `about:blank` — gets its `load`
+    // *during* the insertion that connects it, before `appendChild` returns
+    // (HTML "process the iframe attributes", initial insertion). Nothing is
+    // fetched, so nothing else would ever fire it: the host only loads frames
+    // that have a document to load. Scripts that build a scratch frame and wait
+    // for its `load` before using it hung here forever.
+    function _fireInitialBlankLoad(frame) {
+        try {
+            if (frame.hasAttribute('srcdoc')) return;
+            const src = frame.getAttribute('src');
+            if (src !== null && src.trim() !== '' && src.trim().toLowerCase() !== 'about:blank') return;
+            if (!frame.isConnected) return;
+            frame.dispatchEvent(new Event('load'));
+        } catch (_) { /* ignore */ }
+    }
+
     function _onNodeInsertedInner(child, sync = true) {
         // 1. Dynamic script loading
         const childTag = (child.tagName || child.nodeName || "").toLowerCase();
@@ -361,6 +393,8 @@
         if (childTag === 'script' && _inertScripts.has(_getNodeId(child))) {
             return; // "already started" — parsed from markup, never executes
         }
+
+        if (childTag === 'iframe') _fireInitialBlankLoad(child);
 
         const childSrc = (childTag === 'script') ? (child.src || child.getAttribute?.('src')) : null;
 
@@ -1032,6 +1066,43 @@
     /// checkedness flags so it falls back to its markup default again.
     let _clearDirtyValue = null;
 
+    /// Whether `.focus()` should do anything. Chrome gates focus on the
+    /// element being in the focus-navigation sequence: an explicit
+    /// `tabindex`, a natural form control (not disabled), a link/area with
+    /// `href`, an embedded browsing context, or `contenteditable`. `<body>`/
+    /// `<html>` are always allowed — they're the fallback focus target.
+    /// Layout-based gating (display:none, zero-size, `inert`) is geometry
+    /// work, not covered here.
+    function _isFocusable(el) {
+        if (!el) return false;
+        if (el === document.body || el === document.documentElement) return true;
+        try {
+            if (el.hasAttribute && el.hasAttribute("tabindex")) {
+                const idx = parseInt(el.getAttribute("tabindex"), 10);
+                if (!Number.isNaN(idx)) return true;
+            }
+        } catch (_) { /* ignore */ }
+        const tag = (el.tagName || "").toLowerCase();
+        const disabled = (() => {
+            try { return !!(el.hasAttribute && el.hasAttribute("disabled")); } catch (_) { return false; }
+        })();
+        switch (tag) {
+            case "input": case "select": case "textarea": case "button":
+                return !disabled;
+            case "a": case "area":
+                try { return el.hasAttribute("href"); } catch (_) { return false; }
+            case "iframe": case "embed": case "object":
+                return true;
+            default:
+                break;
+        }
+        try {
+            const ce = el.getAttribute && el.getAttribute("contenteditable");
+            if (ce != null && ce !== "false") return true;
+        } catch (_) { /* ignore */ }
+        return false;
+    }
+
     // pointerId → the element currently capturing it.
     const _pointerCaptures = new Map();
     const _firePointerCapture = (el, type, pointerId) => {
@@ -1116,6 +1187,13 @@
             }
             ops.op_dom_set_inner_html(_getNodeId(this), String(val));
             _markScriptsAlreadyStarted(this);
+            // Every frame in the new markup is newly inserted.
+            if (this.isConnected) {
+                // A snapshot: a `load` handler may change the markup again.
+                for (const frame of Array.from(this.getElementsByTagName("iframe"))) {
+                    _fireInitialBlankLoad(frame);
+                }
+            }
         }
         get outerHTML() { return ops.op_dom_get_outer_html(_getNodeId(this)); }
         set outerHTML(val) {
@@ -1226,7 +1304,15 @@
         // Layout APIs (wired to taffy via layout_ext ops)
         getBoundingClientRect() {
             const r = ops.op_layout_get_bounding_rect(_getNodeId(this));
-            return new DOMRect(r.x, r.y, r.width, r.height);
+            // The layout tree reports the box's position in DOCUMENT
+            // coordinates; `getBoundingClientRect` is VIEWPORT-relative —
+            // the two only coincide at scroll position (0, 0). Without this,
+            // any element below the first screenful reported a `top` far
+            // past the actual viewport, so hit-testing and "is it visible"
+            // checks against it always missed.
+            const sx = (typeof globalThis.scrollX === "number") ? globalThis.scrollX : 0;
+            const sy = (typeof globalThis.scrollY === "number") ? globalThis.scrollY : 0;
+            return new DOMRect(r.x - sx, r.y - sy, r.width, r.height);
         }
         getClientRects() { return [this.getBoundingClientRect()]; }
         get offsetWidth() { return ops.op_layout_get_offset_width(_getNodeId(this)); }
@@ -1561,6 +1647,11 @@
         set style(v) { this.style.cssText = String(v); }
         // Interaction stubs
         click() {
+            // Disabled form controls receive no pointer events at all in
+            // Chrome — not even a cancelable `click` a listener could act
+            // on. `disabled` is `undefined` (falsy) on elements that don't
+            // reflect it, so this is a no-op everywhere else.
+            if (this.disabled) return;
             const ev = new Event("click", { bubbles: true, cancelable: true });
             const ok = this.dispatchEvent(ev);
             // Default action runs only if no listener cancelled the click.
@@ -1580,6 +1671,7 @@
         /// new one `focus`/`focusin`, and the bubbling pair comes after the
         /// non-bubbling one.
         focus() {
+            if (!_isFocusable(this)) return;
             const prev = _activeElement;
             if (prev === this) return;
             _activeElement = this;
@@ -2217,16 +2309,118 @@
         return t ? String(t).toLowerCase() : (el.tagName === 'BUTTON' ? 'submit' : '');
     }
 
-    function _runActivation(el) {
-        if (!el || el.nodeType !== 1 || el.disabled) return;
-        const tag = el.tagName;
-        if (tag !== 'BUTTON' && tag !== 'INPUT') return;
+    // A labelable element per spec (the fallback control search also skips a
+    // `<input type=hidden>`, since spec explicitly excludes it).
+    const _LABELABLE = new Set(['INPUT', 'BUTTON', 'SELECT', 'TEXTAREA', 'METER', 'PROGRESS', 'OUTPUT']);
+    function _isLabelableCandidate(el) {
+        if (!_LABELABLE.has(el.tagName)) return false;
+        if (el.tagName === 'INPUT' && String(el.getAttribute('type') || '').toLowerCase() === 'hidden') return false;
+        return true;
+    }
+    // `HTMLLabelElement.control`: the `for`-referenced element if it resolves
+    // to a labelable one, else the first labelable descendant — never both.
+    function _labelControl(label) {
+        const forId = label.getAttribute('for');
+        if (forId) {
+            const doc = label.ownerDocument || document;
+            const target = doc.getElementById(forId);
+            return (target && _isLabelableCandidate(target)) ? target : null;
+        }
+        const all = label.querySelectorAll('input, button, select, textarea, meter, progress, output');
+        for (let i = 0; i < all.length; i++) {
+            if (_isLabelableCandidate(all[i])) return all[i];
+        }
+        return null;
+    }
+
+    function _submitOrReset(el) {
         const type = _buttonType(el);
         if (type !== 'submit' && type !== 'reset' && type !== 'image') return;
         const form = el.form;
         if (!form) return;
         if (type === 'reset') form.reset();
         else form.requestSubmit(el);
+    }
+
+    /// The activation behaviour a real browser runs after an uncancelled
+    /// click, per element kind. `Element.prototype.click()` and humanize's
+    /// synthetic click (`_boNs.activate`, since it dispatches its own
+    /// pointer/mouse sequence and never reaches `click()`) both funnel
+    /// through here — the single place this needs to be correct.
+    function _runActivation(el) {
+        if (!el || el.nodeType !== 1 || el.disabled) return;
+        const tag = el.tagName;
+
+        if (tag === 'INPUT') {
+            const type = String(el.getAttribute('type') || 'text').toLowerCase();
+            if (type === 'checkbox') {
+                el.checked = !el.checked;
+                el.indeterminate = false;
+                try { el.dispatchEvent(new Event('input', { bubbles: true })); } catch (_) {}
+                try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch (_) {}
+                return;
+            }
+            if (type === 'radio') {
+                if (el.checked) return;
+                const name = el.getAttribute('name');
+                if (name) {
+                    const scope = el.form || el.ownerDocument || document;
+                    const group = scope.querySelectorAll('input[type="radio"]');
+                    for (let i = 0; i < group.length; i++) {
+                        const other = group[i];
+                        if (other !== el && other.form === el.form && other.getAttribute('name') === name) {
+                            other.checked = false;
+                        }
+                    }
+                }
+                el.checked = true;
+                el.indeterminate = false;
+                try { el.dispatchEvent(new Event('input', { bubbles: true })); } catch (_) {}
+                try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch (_) {}
+                return;
+            }
+            _submitOrReset(el);
+            return;
+        }
+        if (tag === 'BUTTON') {
+            _submitOrReset(el);
+            return;
+        }
+        if (tag === 'LABEL') {
+            const control = _labelControl(el);
+            // Real browsers skip the forward when the click's own target was
+            // already the control (nested inside the label) — that control
+            // already ran its own activation from the same click.
+            //
+            // Known gap: this goes through `control.click()`, which always
+            // dispatches an untrusted synthetic event — this file has no
+            // access to humanize.js's trust minter. A real browser's
+            // forwarded click on the control is trusted when the label's own
+            // click was. The control's `checked` state still ends up
+            // correct either way; only `isTrusted` on the secondary event
+            // is wrong.
+            if (control && !control.disabled) control.click();
+            return;
+        }
+        if (tag === 'A') {
+            if (el.hasAttribute('download')) return;
+            const raw = el.getAttribute('href');
+            if (raw == null) return;
+            const resolved = el.href; // HTMLHyperlinkElementUtils — resolved against base
+            if (!resolved || resolved.indexOf('javascript:') === 0) return;
+            try { globalThis.location.href = resolved; } catch (_) {}
+            return;
+        }
+        if (tag === 'SUMMARY') {
+            const details = el.parentElement;
+            // Only the FIRST summary child is the disclosure widget — a
+            // second one inside the same <details> is inert per spec.
+            if (details && details.tagName === 'DETAILS' && details.firstElementChild === el) {
+                if (details.hasAttribute('open')) details.removeAttribute('open');
+                else details.setAttribute('open', '');
+                try { details.dispatchEvent(new Event('toggle')); } catch (_) {}
+            }
+        }
     }
 
     // Shared with `humanize.js`, which dispatches its own pointer/mouse sequence
@@ -2868,6 +3062,7 @@
             if (!this.#pointInViewport(x, y)) return [];
             x = +x; y = +y;
             const hits = [];
+            const layers = new Map();
             let all;
             try { all = this.querySelectorAll('*'); } catch (_e) { return []; }
             for (let i = 0; i < all.length; i++) {
@@ -2883,25 +3078,46 @@
                 try { r = el.getBoundingClientRect(); } catch (_e) { continue; }
                 if (!r || r.width <= 0 || r.height <= 0) continue;
                 if (x < r.left || x >= r.right || y < r.top || y >= r.bottom) continue;
-                let z = 0;
-                let positioned = 0;
-                if (st) {
-                    positioned = st.position && st.position !== 'static' ? 1 : 0;
-                    const zi = parseInt(st.zIndex, 10);
-                    if (positioned && isFinite(zi)) z = zi;
-                }
-                hits.push({ el, z, positioned, order: i });
+                const layer = this.#paintLayer(el, layers);
+                hits.push({ el, z: layer.z, positioned: layer.positioned, order: i });
             }
-            // Painting order, approximated by the three rules that decide it in
-            // practice: a higher `z-index` wins, a positioned box paints over a
-            // static one, and otherwise whatever comes later in the document is
-            // on top — which also puts a descendant above its ancestor, since it
-            // always comes after it. Sorting by tree depth instead let a deeply
-            // nested box on an untouched part of the page beat an overlay that
-            // was appended over it.
+            // Painting order, approximated by the rules that decide it in
+            // practice: a higher `z-index` wins, a positioned layer paints over
+            // static content, and otherwise whatever comes later in the document
+            // is on top — which also puts a descendant above its ancestor, since
+            // it always comes after it. Sorting by tree depth instead let a
+            // deeply nested box on an untouched part of the page beat an overlay
+            // that was appended over it.
+            //
+            // The layer is the nearest positioned ancestor-or-self's, not the
+            // element's own: a static element paints inside the layer of the
+            // positioned box that contains it. Ranking every positioned box over
+            // every static one put a `position: relative` wrapper above its own
+            // `<input>` — how every Material UI text field is built — and every
+            // click on the field hit the wrapper instead.
             hits.sort((a, b) =>
                 (b.z - a.z) || (b.positioned - a.positioned) || (b.order - a.order));
             return hits.map((h) => h.el);
+        }
+        /// `{z, positioned}` of the layer `el` paints in: that of its nearest
+        /// positioned ancestor-or-self, or the root layer's when there is none.
+        #paintLayer(el, cache) {
+            const seen = [];
+            let n = el, found = { z: 0, positioned: 0 };
+            while (n && n.nodeType === 1) {
+                if (cache.has(n)) { found = cache.get(n); break; }
+                seen.push(n);
+                let st = null;
+                try { st = getComputedStyle(n); } catch (_e) { /* ignore */ }
+                if (st && st.position && st.position !== 'static') {
+                    const zi = parseInt(st.zIndex, 10);
+                    found = { z: isFinite(zi) ? zi : 0, positioned: 1 };
+                    break;
+                }
+                n = n.parentNode;
+            }
+            for (const s of seen) cache.set(s, found);
+            return found;
         }
         elementFromPoint(x, y) {
             if (!this.#pointInViewport(x, y)) return null;
@@ -3497,6 +3713,13 @@
             if (v) this.setAttribute('checked', '');
             else this.removeAttribute('checked');
         },
+        enumerable: true, configurable: true,
+    });
+    // Purely a script-set flag, no content-attribute backing (per spec) —
+    // and always false again once the checkbox is activated by a click.
+    Object.defineProperty(HTMLInputElement.prototype, 'indeterminate', {
+        get() { return !!_vs(this).indeterminate; },
+        set(v) { _vs(this).indeterminate = !!v; },
         enumerable: true, configurable: true,
     });
     // <textarea> keeps the same rule with its child text as the default.
@@ -4117,235 +4340,16 @@
     // reveals monkey-patching; an `undefined` contentWindow reveals a headless
     // browser that doesn't support iframes.
     //
-    // We install `contentWindow` and `contentDocument` as GETTERS on
-    // HTMLIFrameElement.prototype so EVERY iframe — whether parsed from HTML
-    // or created via document.createElement — returns a valid window-shaped
-    // Proxy that falls through to globalThis for any unknown property. The
-    // per-iframe state is cached in a WeakMap keyed by the element.
+    // `contentWindow` and `contentDocument` are GETTERS on
+    // HTMLIFrameElement.prototype, so every iframe — parsed or created — gets a
+    // real window: a same-origin frame is a realm of this isolate with its own
+    // document and the full platform (`realms.rs`), reached synchronously; a
+    // cross-origin one is behind the cross-origin proxy (`_xoWindowProxy`),
+    // its document an isolate of its own. Per-iframe state is cached in a
+    // WeakMap keyed by the element.
 
     const _iframeState = new WeakMap();
 
-    // Build a mirror realm: fresh constructors that mimic the parent's shape
-    // but are reference-distinct, so cross-realm probes like
-    //   iframe.contentWindow.Navigator !== Navigator
-    //   iframe.contentWindow.Navigator.prototype !== Navigator.prototype
-    // hold true while own-property-names lists remain identical. Each
-    // mirrored function carries _nativeTag so Function.prototype.toString
-    // produces "function NAME() { [native code] }" cross-realm.
-    const _MIRRORED_CONSTRUCTORS = [
-        "Navigator", "Window", "Document", "HTMLDocument",
-        "EventTarget", "Node", "Element", "HTMLElement",
-        "HTMLDivElement", "HTMLSpanElement", "HTMLBodyElement",
-        "HTMLAnchorElement", "HTMLImageElement", "HTMLInputElement",
-        "HTMLFormElement", "HTMLButtonElement", "HTMLSelectElement",
-        "HTMLTextAreaElement", "HTMLCanvasElement", "HTMLScriptElement",
-        "HTMLIFrameElement", "Event", "CustomEvent", "MouseEvent",
-        "KeyboardEvent", "MessageEvent", "Array", "Object", "Function",
-        "String", "Number", "Boolean", "Promise", "Error", "TypeError",
-        "RangeError", "Map", "Set", "WeakMap", "WeakSet", "Date",
-        "RegExp", "Symbol",
-    ];
-
-    // Capture the native-tag Symbol from the parent realm. stealth_bootstrap.js
-    // exposes it as globalThis._nativeTag. We capture explicitly so the
-    // freshToString and _mkNativeFn don't accidentally see undefined when
-    // bare-identifier scope chain is shadowed by the IIFE parameter.
-    const _NATIVE_TAG_SYMBOL = globalThis._nativeTag || Symbol.for('__browser_oxide_native__');
-
-    function _mkNativeFn(name) {
-        const fn = function() {};
-        try {
-            Object.defineProperty(fn, "name", { value: name, configurable: true });
-            Object.defineProperty(fn, _NATIVE_TAG_SYMBOL, { value: name, configurable: true });
-            // Per-instance toString returning native shape — used when the
-            // patched Function.prototype.toString is bypassed by direct
-            // .toString() calls. Mirrors stealth_bootstrap's _maskFunction.
-            const ts = function toString() { return "function " + name + "() { [native code] }"; };
-            Object.defineProperty(ts, _NATIVE_TAG_SYMBOL, { value: "toString", configurable: true });
-            Object.defineProperty(ts, "name", { value: "toString", configurable: true });
-            Object.defineProperty(fn, "toString", { value: ts, configurable: true });
-        } catch (_) {}
-        return fn;
-    }
-
-    // Constructors where `new w.X(...)` is genuinely "Illegal constructor"
-    // in real Chrome (DOM interfaces with no exposed constructor). Calls
-    // to `new` on these throw `TypeError: Illegal constructor`.
-    // Constructors NOT in this set are real callable types — for those we
-    // delegate `new` to the parent realm's constructor via `Reflect.construct`
-    // so e.g. `new iframe.contentWindow.Function("return 1")` returns a
-    // function in the iframe realm, matching real Chrome. Some scripts use
-    // `new w.Function(...)` to materialize a fresh-realm function; if we
-    // throw where real Chrome succeeds, that differs from real Chrome.
-    const _ILLEGAL_CONSTRUCTORS = new Set([
-        "Navigator", "Window", "Document", "HTMLDocument",
-        "Node", "Element", "HTMLElement",
-        "HTMLDivElement", "HTMLSpanElement", "HTMLBodyElement",
-        "HTMLAnchorElement", "HTMLImageElement", "HTMLInputElement",
-        "HTMLFormElement", "HTMLButtonElement", "HTMLSelectElement",
-        "HTMLTextAreaElement", "HTMLCanvasElement", "HTMLScriptElement",
-        "HTMLIFrameElement",
-    ]);
-
-    function _mkMirroredConstructor(parentCtor, name, freshGrandparentProto) {
-        // Fresh constructor function — different identity than parent's.
-        // For DOM-interface types real Chrome throws on `new`; for genuine
-        // callable types (Function/Array/Map/Date/Event/...) we delegate to
-        // the parent constructor via Reflect.construct so the result lives
-        // in our fresh realm (via fresh.prototype = freshProto below).
-        const isIllegal = _ILLEGAL_CONSTRUCTORS.has(name);
-        const fresh = isIllegal
-            ? function() {
-                throw new TypeError("Failed to construct '" + name + "': Illegal constructor");
-            }
-            : function(...args) {
-                try {
-                    return Reflect.construct(parentCtor, args, fresh);
-                } catch (e) {
-                    // Symbol() throws on `new`; re-throw with the parent's
-                    // exact shape (don't reword) so feature-detection that
-                    // catches "Symbol is not a constructor" still matches.
-                    throw e;
-                }
-            };
-        try {
-            Object.defineProperty(fresh, "name", { value: name, configurable: true });
-            Object.defineProperty(fresh, _NATIVE_TAG_SYMBOL, { value: name, configurable: true });
-            const ts = function toString() { return "function " + name + "() { [native code] }"; };
-            Object.defineProperty(ts, _NATIVE_TAG_SYMBOL, { value: "toString", configurable: true });
-            Object.defineProperty(ts, "name", { value: "toString", configurable: true });
-            Object.defineProperty(fresh, "toString", { value: ts, configurable: true });
-        } catch (_) {}
-
-        // Build a fresh prototype mirroring own-property-names of parent's prototype.
-        // Each method/getter/setter is a fresh function with native toString shape.
-        let parentProto = null;
-        try { parentProto = parentCtor && parentCtor.prototype; } catch (_) {}
-        // The fresh prototype's own __proto__ must point at the FRESH grandparent
-        // prototype (built earlier in _buildRemoteRealm's topological pass),
-        // NOT at the parent realm's grandparent. Crossing realms here makes
-        // a prototype-chain walk traverse the parent realm's full chain on
-        // top of the fresh chain, multiplying its work O(N) → O(N²+).
-        const freshProto = Object.create(freshGrandparentProto || Object.prototype);
-
-        if (parentProto) {
-            const propNames = Object.getOwnPropertyNames(parentProto);
-            for (const propName of propNames) {
-                if (propName === "constructor") continue;
-                let desc;
-                try { desc = Object.getOwnPropertyDescriptor(parentProto, propName); } catch (_) { continue; }
-                if (!desc) continue;
-                const newDesc = {
-                    configurable: desc.configurable !== false,
-                    enumerable: !!desc.enumerable,
-                };
-                if (desc.get || desc.set) {
-                    if (desc.get) newDesc.get = _mkNativeFn("get " + propName);
-                    if (desc.set) newDesc.set = _mkNativeFn("set " + propName);
-                } else {
-                    newDesc.writable = desc.writable !== false;
-                    if (typeof desc.value === "function") {
-                        // Function-valued props: replace with our fresh native-shape stub
-                        // (so cross-realm Function.prototype.toString.call(this) returns
-                        // "function NAME() { [native code] }").
-                        newDesc.value = _mkNativeFn(propName);
-                    } else {
-                        newDesc.value = desc.value;
-                    }
-                }
-                try { Object.defineProperty(freshProto, propName, newDesc); } catch (_) {}
-            }
-        }
-
-        try {
-            Object.defineProperty(freshProto, "constructor", {
-                value: fresh, writable: true, enumerable: false, configurable: true,
-            });
-            Object.defineProperty(fresh, "prototype", {
-                value: freshProto, writable: false, enumerable: false, configurable: false,
-            });
-        } catch (_) {}
-        return fresh;
-    }
-
-    // For each mirrored constructor name, find the nearest ancestor in
-    // _MIRRORED_CONSTRUCTORS by walking the real prototype chain. Returns
-    // an array of names in topological order (ancestors before descendants)
-    // and a name -> direct-parent-name map.
-    function _topoSortMirrored(names) {
-        const realCtors = {};
-        for (const n of names) {
-            try {
-                const c = globalThis[n];
-                if (typeof c === "function") realCtors[n] = c;
-            } catch (_) {}
-        }
-        const directParent = {};
-        for (const n of names) {
-            const ctor = realCtors[n];
-            if (!ctor) { directParent[n] = null; continue; }
-            let proto = null;
-            try { proto = Object.getPrototypeOf(ctor.prototype); } catch (_) {}
-            let parentName = null;
-            let guard = 0;
-            while (proto && guard++ < 32) {
-                for (const m of names) {
-                    const mc = realCtors[m];
-                    if (mc && mc.prototype === proto) { parentName = m; break; }
-                }
-                if (parentName) break;
-                try { proto = Object.getPrototypeOf(proto); } catch (_) { break; }
-            }
-            directParent[n] = parentName;
-        }
-        const ordered = [];
-        const remaining = new Set(names);
-        while (remaining.size > 0) {
-            let progress = false;
-            for (const n of Array.from(remaining)) {
-                const p = directParent[n];
-                if (p == null || !remaining.has(p)) {
-                    ordered.push(n);
-                    remaining.delete(n);
-                    progress = true;
-                }
-            }
-            if (!progress) {
-                // Defensive: cyclic dependency in the real prototype graph
-                // shouldn't happen, but if it does, append remaining without
-                // ordering rather than infinite-looping.
-                for (const n of remaining) ordered.push(n);
-                break;
-            }
-        }
-        return { ordered: ordered, directParent: directParent };
-    }
-
-    // Module-level cache: every iframe in this realm shares the same set of
-    // mirrored constructors. Some scripts tag function/descriptor objects on
-    // a first scope-chain walk and re-read them on a later walk; without this
-    // cache every _getIframeWindow() call rebuilt the realm and any such
-    // sentinel property set by the script was lost on the second read.
-    let _cachedRemoteRealm = null;
-
-    function _buildRemoteRealm() {
-        if (_cachedRemoteRealm) return _cachedRemoteRealm;
-        const realm = {};
-        const sorted = _topoSortMirrored(_MIRRORED_CONSTRUCTORS);
-        for (const name of sorted.ordered) {
-            try {
-                const parentCtor = globalThis[name];
-                if (typeof parentCtor !== "function") continue;
-                const parentName = sorted.directParent[name];
-                const freshGrandparentProto = parentName && realm[parentName]
-                    ? realm[parentName].prototype
-                    : Object.prototype;
-                realm[name] = _mkMirroredConstructor(parentCtor, name, freshGrandparentProto);
-            } catch (_) {}
-        }
-        _cachedRemoteRealm = realm;
-        return realm;
-    }
 
     // Monotonically-increasing ID for child realms; used as the Rust-side
     // cache key in IframeRealmStore (HashMap<u32, ...>).
@@ -4403,10 +4407,19 @@
         // `window.length` counts the document's iframes directly — see window_bootstrap.js.
     }
 
-    // Extract scheme+host+port from a URL without using new URL().
-    // Returns "null" for non-http(s) URLs (data:, about:, etc.) or empty input.
+    // The origin of a frame URL, resolved against this document: a relative
+    // `src` ("child.html", "/frame") is this document's own origin. The old
+    // regex-only version answered "null" for every relative URL, so a
+    // same-origin frame got the cross-origin proxy and `contentWindow.document`
+    // threw SecurityError. Returns "null" for non-http(s) URLs (data:, about:,
+    // etc.) or empty input.
     const _xOrigin = function(u) {
-        var m = u && u.match(/^(https?:\/\/[^/?#:]+(?::\d+)?)/i);
+        if (!u) return "null";
+        try {
+            const r = new URL(u, (globalThis.location && globalThis.location.href) || undefined);
+            return /^https?:$/.test(r.protocol) ? r.origin : "null";
+        } catch (_) { /* fall through: no URL, or no base */ }
+        var m = u.match(/^(https?:\/\/[^/?#:]+(?::\d+)?)/i);
         return m ? m[1].toLowerCase() : "null";
     };
 
@@ -4429,7 +4442,11 @@
                 } catch (_) {
                     // Structured-clone-able but not JSON-able (functions, cycles):
                     // real postMessage would clone it; we degrade to a string.
-                    json = JSON.stringify({ data: String(data), origin: '', targetOrigin: '*' });
+                    // …but never widen who may receive it.
+                    json = JSON.stringify({
+                        data: String(data), origin: '',
+                        targetOrigin: String(targetOrigin == null ? '*' : targetOrigin),
+                    });
                 }
                 try { ops.op_iframe_post_to_child(_getNodeId(el), json); } catch (_) {}
             },
@@ -4461,6 +4478,42 @@
         });
     }
 
+    // A same-origin frame is a realm of this isolate: a full document with its
+    // own DOM, running the same bootstraps as this one, reached synchronously —
+    // `contentWindow.foo`, `contentDocument.body` — as in Chrome, where
+    // same-origin frames share an agent (see `realms.rs`). Its window is
+    // created with the initial `about:blank` on first access and keeps its
+    // identity when the frame's document loads into it. `undefined` means
+    // "not a realm frame": cross-origin, or a runtime without realm support.
+    const _frameRealmWindow = (el) => {
+        if (typeof ops.op_frame_window !== "function") return undefined;
+        let srcdoc = null, src = "";
+        try {
+            srcdoc = el.getAttribute("srcdoc");
+            src = String(el.getAttribute("src") || "").trim();
+        } catch (_) { return undefined; }
+        // `srcdoc` wins over `src`; an empty, `about:blank` or `javascript:`
+        // src is the initial document, same-origin with its embedder.
+        if (srcdoc == null && src && src !== "about:blank" && !/^javascript:/i.test(src)) {
+            const here = _xOrigin((globalThis.location && globalThis.location.href) || "");
+            if (here === "null" || _xOrigin(src) !== here) return undefined;
+        }
+        let w = null;
+        try {
+            w = ops.op_frame_window(
+                _getNodeId(el),
+                String((globalThis.location && globalThis.location.origin) || "null"),
+            );
+        } catch (_) { w = null; }
+        if (!w) return undefined;
+        const st = _iframeState.get(el);
+        if (!st || st.contentWindow !== w) {
+            _iframeState.set(el, { contentWindow: w, contentDocument: null, _realm: true });
+            _registerFrame(w, el);
+        }
+        return w;
+    };
+
     function _getIframeWindow(el) {
         // A nested browsing context is created when the element is *inserted*,
         // so a freshly created `<iframe>` has none and `contentWindow` is null.
@@ -4477,50 +4530,15 @@
         try {
             if (el && !el.parentNode) return null;
         } catch (_) { /* ignore */ }
+        const _realmWin = _frameRealmWindow(el);
+        if (_realmWin !== undefined) return _realmWin;
         let state = _iframeState.get(el);
-        if (state) {
-            // Cross-origin transition: a script creates an iframe with no src, accesses
-            // contentWindow (creates child realm), then sets src to a cross-origin URL and re-accesses.
-            // When src changes to cross-origin, invalidate the cached realm and return a
-            // SecurityError proxy — exactly what real Chrome does.
-            try {
-                const _cSrc = (el && typeof el.getAttribute === "function")
-                    ? (el.getAttribute("src") || el.src || "")
-                    : (el && el.src || "");
-                if (_cSrc && _cSrc !== "about:blank" && !/^javascript:/i.test(_cSrc) && _cSrc !== "") {
-                    const _pOrig = _xOrigin((globalThis.location && globalThis.location.href) || "");
-                    const _sOrig = _xOrigin(_cSrc);
-                    if (_sOrig !== _pOrig) {
-                        const _xM = 'Blocked a frame with origin "' + _pOrig + '" from accessing a cross-origin frame.';
-                        const _xo2 = _xoWindowProxy(el, _xM);
-                        const _xoS2 = { contentWindow: _xo2, contentDocument: null, _realmId: undefined, _processedSrcdoc: '' };
-                        _iframeState.set(el, _xoS2);
-                        return _xo2;
-                    }
-                }
-            } catch (_) {}
-            // Re-run srcdoc scripts if srcdoc was set after initial contentWindow access.
-            // A script may set iframe.srcdoc = "..." before or after first contentWindow
-            // access; in either case we must execute the scripts in the child realm.
-            if (state._realmId !== undefined) {
-                let _cur = "";
-                try { _cur = el.getAttribute("srcdoc") || el.srcdoc || ""; } catch (_) {}
-                if (_cur && _cur !== state._processedSrcdoc) {
-                    state._processedSrcdoc = _cur;
-                    try {
-                        const _re = /<script[^>]*>([\s\S]*?)<\/script>/gi;
-                        let _m2;
-                        while ((_m2 = _re.exec(_cur)) !== null) {
-                            const _s2 = _m2[1];
-                            if (_s2 && _s2.trim()) {
-                                try { ops.op_eval_in_child_realm(state._realmId, _s2); } catch (_) {}
-                            }
-                        }
-                    } catch (_) {}
-                }
-            }
-            return state.contentWindow;
-        }
+        if (state && state._realm) state = undefined;
+        // A cross-origin frame's window is its proxy, one per frame for the
+        // frame's life — `contentWindow` read twice is the same object, as the
+        // `WindowProxy` is in Chrome, and so is the `event.source` of a message
+        // from it. (A same-origin frame returned its realm's window above.)
+        if (state) return state.contentWindow;
 
         // ── Cross-origin iframe detection ────────────────────
         // Some scripts create an iframe with a different origin (e.g. a
@@ -4537,7 +4555,7 @@
                 if (_srcOrigin !== _pOrigin) {
                     const _xMsg = 'Blocked a frame with origin "' + _pOrigin + '" from accessing a cross-origin frame.';
                     const _xo = _xoWindowProxy(el, _xMsg);
-                    const _xoState = { contentWindow: _xo, contentDocument: null, _realmId: undefined, _processedSrcdoc: '' };
+                    const _xoState = { contentWindow: _xo, contentDocument: null, };
                     _iframeState.set(el, _xoState);
                     _registerFrame(_xo, el);
                     return _xo;
@@ -4545,752 +4563,19 @@
             }
         } catch (_) {}
 
-        // ── Build the iframe document shell ──────────────────────────────
-        // srcdoc iframes: expose the source text for
-        // reads (`iframe.contentDocument.body.innerHTML`).
-        let _srcdoc = "";
-        try {
-            if (el && typeof el.getAttribute === "function") {
-                _srcdoc = el.getAttribute("srcdoc") || "";
-            }
-            // Also check direct JS property (set via el.srcdoc = "...") since
-            // property assignment may not update the HTML attribute in our DOM.
-            if (!_srcdoc && el && typeof el.srcdoc === "string") {
-                _srcdoc = el.srcdoc;
-            }
-        } catch (_) {}
-        // Real elements, detached from the top document — not plain objects.
-        //
-        // The mirrors used to be object literals whose `appendChild` was a no-op
-        // and whose `innerHTML` was a bare string field, so everything a frame
-        // wrote into itself vanished: the markup was stored and then nothing
-        // could find it again, `getElementById` on that same document included.
-        // A widget that builds its probes inside a blank frame — which is how
-        // most of them measure fonts, rects and SVG geometry — got an empty
-        // answer and no error to explain it.
-        const _mkHtmlMirror = (tag, inner) => {
-            const el = _document.createElement(tag);
-            if (inner) {
-                try { el.innerHTML = inner; } catch (_) { /* ignore */ }
-            }
-            return el;
-        };
-        // An `about:blank` frame is not an empty object — it is a fully formed
-        // empty document, `<html><head></head><body></body></html>`, and
-        // `contentDocument.body` is an element there, never null. Gating these on
-        // `srcdoc` handed a blank frame a document with no body at all. Scripts
-        // reach for exactly that: a blank same-origin frame is the standard way
-        // to obtain untouched native objects, and the first thing such a probe
-        // does is look at `contentDocument.body`. Finding null, it waits for a
-        // document that is already as loaded as it will ever be.
-        const _docEl = _mkHtmlMirror("html", "");
-        const _head = _mkHtmlMirror("head", "");
-        // The frame's own markup belongs in its body, and the three are linked
-        // into one tree so a selector run from the document reaches all of it.
-        const _body = _mkHtmlMirror("body", _srcdoc);
-        try {
-            _docEl.appendChild(_head);
-            _docEl.appendChild(_body);
-        } catch (_) { /* ignore */ }
-        const iframeDoc = {
-            documentElement: _docEl,
-            head: _head,
-            body: _body,
-            title: "",
-            readyState: "complete",
-            visibilityState: "visible",
-            hidden: false,
-            hasFocus() { return false; },
-            // Searched for real, against the frame's own tree. These returned
-            // nothing unconditionally, which made the document contradict
-            // itself: markup went in through `body.innerHTML` and no query on
-            // the same document could see it.
-            querySelector(sel) {
-                try { return _docEl.querySelector(sel); } catch (_) { return null; }
-            },
-            querySelectorAll(sel) {
-                try { return _docEl.querySelectorAll(sel); } catch (_) { return new NodeList([]); }
-            },
-            getElementById(id) {
-                const quoted = String(id).replace(/["\\]/g, "\\$&");
-                try { return _docEl.querySelector('[id="' + quoted + '"]'); }
-                catch (_) { return null; }
-            },
-            getElementsByTagName(tag) {
-                const t = String(tag).toLowerCase();
-                // The document's own three are not descendants of themselves.
-                // `NodeList` is built from node ids, not from node objects.
-                if (t === "html" && _docEl) return new NodeList([_getNodeId(_docEl)]);
-                if (t === "body" && _body) return new NodeList([_getNodeId(_body)]);
-                if (t === "head" && _head) return new NodeList([_getNodeId(_head)]);
-                try { return _docEl.getElementsByTagName(tag); }
-                catch (_) { return new NodeList([]); }
-            },
-            // Collections of an empty document are empty, not absent. A missing
-            // method is not a smaller document — it is a different kind of
-            // object, and the first thing a script does with one is call it:
-            // `[...doc.getElementsByClassName('x')]` threw "not a function"
-            // inside a widget's own probe frame and took its whole collector
-            // down with it.
-            getElementsByClassName(cls) {
-                try { return _docEl.getElementsByClassName(cls); }
-                catch (_) { return new NodeList([]); }
-            },
-            getElementsByName(name) {
-                const quoted = String(name).replace(/["\\]/g, "\\$&");
-                try { return _docEl.querySelectorAll('[name="' + quoted + '"]'); }
-                catch (_) { return new NodeList([]); }
-            },
-            get forms() { return new NodeList([]); },
-            get images() { return new NodeList([]); },
-            get links() { return new NodeList([]); },
-            get scripts() { return new NodeList([]); },
-            get styleSheets() { return []; },
-            get activeElement() { return _body; },
-            // Derived, not assigned: the realm's window is wired up on more
-            // than one construction path and only some of them reach the
-            // assignment site.
-            get location() {
-                const view = iframeDoc.defaultView;
-                return (view && view.location) || null;
-            },
-            nodeType: 9,
-            nodeName: "#document",
-            characterSet: "UTF-8",
-            charset: "UTF-8",
-            inputEncoding: "UTF-8",
-            contentType: "text/html",
-            compatMode: "CSS1Compat",
-            doctype: null,
-            referrer: "",
-            cookie: "",
-            createElement(tag) { return _document.createElement(tag); },
-            createElementNS(ns, tag) { return _document.createElementNS(ns, tag); },
-            createEvent(type) { return _document.createEvent(type); },
-            createRange() { return _document.createRange(); },
-            createTextNode(text) { return _document.createTextNode(text); },
-            createComment(text) { return _document.createComment(text); },
-            createDocumentFragment() { return _document.createDocumentFragment(); },
-            createAttribute(name) { return _document.createAttribute(name); },
-            importNode(node, deep) { return _document.importNode(node, deep); },
-            adoptNode(node) { return _document.adoptNode(node); },
-            elementFromPoint() { return null; },
-            elementsFromPoint() { return []; },
-            getSelection() { return null; },
-            write(html) { return _document.write(html); },
-            writeln(html) { return _document.writeln(html); },
-            open() { return _document.open(); },
-            close() { return _document.close(); },
-            // A document is an EventTarget. Listeners are kept here rather than
-            // forwarded to the parent document, which would let a frame's
-            // handlers fire on the top page's events.
-            addEventListener(type, fn) {
-                if (typeof fn !== "function") return;
-                (_docListeners[type] || (_docListeners[type] = [])).push(fn);
-            },
-            removeEventListener(type, fn) {
-                const list = _docListeners[type];
-                if (!list) return;
-                const at = list.indexOf(fn);
-                if (at >= 0) list.splice(at, 1);
-            },
-            dispatchEvent(ev) {
-                const list = ev && _docListeners[ev.type];
-                if (list) {
-                    for (const fn of list.slice()) {
-                        try { fn.call(iframeDoc, ev); } catch (_) { /* ignore */ }
-                    }
-                }
-                return true;
-            },
-        };
-        const _docListeners = Object.create(null);
-
-        // ── Screen mirror ─────────────────────────────────────────────────
-        const _parentScreen = globalThis.screen || {};
-        const _iframeScreen = {
-            availWidth:  _parentScreen.availWidth  || 1920,
-            availHeight: _parentScreen.availHeight || 1080,
-            width:       _parentScreen.width       || 1920,
-            height:      _parentScreen.height      || 1080,
-            availLeft:   _parentScreen.availLeft   || 0,
-            availTop:    _parentScreen.availTop    || 0,
-            colorDepth:  _parentScreen.colorDepth  || 24,
-            pixelDepth:  _parentScreen.pixelDepth  || 24,
-            orientation: _parentScreen.orientation,
-        };
-        if (!/Firefox\/|Gecko\/20100101/.test(
-            (typeof navigator !== "undefined" && navigator.userAgent) || ""
-        )) {
-            _iframeScreen.isExtended = false;
-        }
-
-        // ── Obtain the child window object ───────────────────────────────
-        // PRIMARY PATH: genuine v8::Context child realm.
-        // op_create_child_realm returns the child global:
-        //   - Real, realm-distinct native intrinsics (Object/Function/… ≠ parent)
-        //   - constructor.name === "Window" (set up in Rust)
-        //   - Genuine-native Function.prototype.toString in child realm
-        //   - self/window/globalThis/frames self-refs (set in Rust)
-        // Matches real Chrome, where contentWindow is a genuine realm rather
-        // than a Proxy or a parent alias.
-        const _realmId = _nextRealmId++;
-        let cw = null;
-        try {
-            const _got = ops.op_create_child_realm(_realmId);
-            if (_got && typeof _got === "object") cw = _got;
-        } catch (_) {}
-
-        if (cw) {
-            // ── Populate child realm with DOM/FP properties ───────────────
-            // CRITICAL: use op_set_child_realm_prop for properties that must be
-            // visible to code running INSIDE the child realm (e.g. srcdoc
-            // script eval). Direct `cw.x = v` from parent JS goes to the global PROXY's
-            // own dict; code inside the realm reads from the INNER global.
-            // op_set_child_realm_prop enters the child ContextScope and calls
-            // child_global.set() which forwards via [[Set]] to the inner global.
-            const _sp = (k, v) => {
-                try { ops.op_set_child_realm_prop(_realmId, k, v); } catch (_) {}
-            };
-
-            // iframeDoc back-reference to default view (set before _sp calls)
-            try { iframeDoc.defaultView = cw; } catch (_) {}
-            // ...and the URL trio, which only make sense once the realm's own
-            // location exists. A document with no `URL` is not something a
-            // browser can produce.
-            try {
-                const href = (cw.location && cw.location.href) || "about:blank";
-                iframeDoc.URL = href;
-                iframeDoc.documentURI = href;
-                iframeDoc.baseURI = href;
-            } catch (_) { /* ignore */ }
-
-            // Document
-            _sp("document", iframeDoc);
-
-            // Location stub — about:blank inherits the parent origin per HTML spec.
-            // Some scripts read document.domain (= hostname) and
-            // location.origin; empty values differ from real Chrome.
-            const _pLoc = globalThis.location || {};
-            _sp("location", {
-                href: "about:blank",
-                origin: _pLoc.origin || "null",
-                pathname: "/",
-                hash: "", search: "",
-                host: _pLoc.host || "",
-                hostname: _pLoc.hostname || "",
-                port: _pLoc.port || "",
-                protocol: _pLoc.protocol || "https:",
-                assign() {}, replace() {}, reload() {},
-                toString() { return "about:blank"; },
-            });
-
-            // Parent / top / name
-            _sp("parent", globalThis);
-            _sp("top", globalThis);
-            _sp("name", "");
-
-            // Screen mirror (some scripts read these from inside child realm)
-            _sp("screen", _iframeScreen);
-            _sp("availWidth",  _iframeScreen.availWidth);
-            _sp("availHeight", _iframeScreen.availHeight);
-
-            // Viewport dimensions
-            _sp("innerWidth",   globalThis.innerWidth  || 1920);
-            _sp("innerHeight",  globalThis.innerHeight || 1080);
-            _sp("outerWidth",   globalThis.outerWidth  || 1920);
-            _sp("outerHeight",  globalThis.outerHeight || 1080);
-            _sp("scrollX", 0); _sp("scrollY", 0);
-            _sp("pageXOffset", 0); _sp("pageYOffset", 0);
-            // Window state properties some scripts expect to be present.
-            _sp("closed", false);
-            _sp("name", "");
-            _sp("status", "");
-            _sp("defaultStatus", "");
-            _sp("screenTop", globalThis.screenTop || 0);
-            _sp("screenLeft", globalThis.screenLeft || 0);
-            _sp("screenX", globalThis.screenX || 0);
-            _sp("screenY", globalThis.screenY || 0);
-            // history stub — basic object so `.toString()` doesn't throw.
-            _sp("history", { length: 0, state: null, scrollRestoration: "auto",
-                back() {}, forward() {}, go() {}, pushState() {}, replaceState() {} });
-            // Storage stubs — some scripts may call `.toString()` on these.
-            const _storageStub = Object.create(null);
-            Object.defineProperty(_storageStub, Symbol.toStringTag, { value: "Storage", configurable: true });
-            _storageStub.length = 0;
-            _storageStub.getItem = function getItem() { return null; };
-            _storageStub.setItem = function setItem() {};
-            _storageStub.removeItem = function removeItem() {};
-            _storageStub.clear = function clear() {};
-            _storageStub.key = function key() { return null; };
-            try { _sp("localStorage", _storageStub); } catch (_) {}
-            try { _sp("sessionStorage", _storageStub); } catch (_) {}
-            // indexedDB — basic stub so typeof is "object".
-            _sp("indexedDB", { open() {}, deleteDatabase() {}, databases() { return Promise.resolve([]); }, cmp() { return 0; } });
-            // visualViewport — propagate from parent (some scripts may call .toString()).
-            try { if (globalThis.visualViewport !== undefined) _sp("visualViewport", globalThis.visualViewport); } catch (_) {}
-
-            // Event handler stubs — Chrome defines all on* handlers as null (data property,
-            // enumerable:true) on the Window global. The child realm gets genuine V8 natives
-            // but NOT these Window interface additions. Some scripts iterate the parent
-            // window's enumerable properties and for each key check it in the child realm;
-            // calling .toString() on the undefined value throws, while null.toString()
-            // would throw too but with the correct Chrome-matching TypeError shape.
-            // Setting them null here makes child[key] !== undefined for all on* keys.
-            const _onHandlers = [
-                'onabort','onafterprint','onanimationcancel','onanimationend',
-                'onanimationiteration','onanimationstart','onappinstalled','onauxclick',
-                'onbeforeinput','onbeforeinstallprompt','onbeforematch','onbeforeprint',
-                'onbeforetoggle','onbeforeunload','onbeforexrselect','onblur',
-                'oncancel','oncanplay','oncanplaythrough','onchange',
-                'onclick','onclose','oncommand','oncontentvisibilityautostatechange',
-                'oncontextlost','oncontextmenu','oncontextrestored','oncuechange',
-                'ondblclick','ondrag','ondragend','ondragenter',
-                'ondragleave','ondragover','ondragstart','ondrop',
-                'ondurationchange','onemptied','onended','onfocus',
-                'onformdata','ongamepadconnected','ongamepaddisconnected','ongotpointercapture',
-                'onhashchange','oninput','oninvalid','onkeydown',
-                'onkeypress','onkeyup','onlanguagechange','onload',
-                'onloadeddata','onloadedmetadata','onloadstart','onlostpointercapture',
-                'onmessage','onmessageerror','onmousedown','onmouseenter',
-                'onmouseleave','onmousemove','onmouseout','onmouseover',
-                'onmouseup','onmousewheel','onoffline','ononline',
-                'onpagehide','onpagereveal','onpageshow','onpageswap',
-                'onpause','onplay','onplaying','onpointercancel',
-                'onpointerdown','onpointerenter','onpointerleave','onpointermove',
-                'onpointerout','onpointerover','onpointerrawupdate','onpointerup','onpopstate',
-                'onprogress','onratechange','onrejectionhandled','onreset',
-                'onresize','onscroll','onscrollend','onscrollsnapchange',
-                'onscrollsnapchanging','onsearch','onsecuritypolicyviolation','onseeked',
-                'onseeking','onselect','onselectionchange','onselectstart',
-                'onslotchange','onstalled','onstorage','onsubmit',
-                'onsuspend','ontimeupdate','ontoggle','ontransitioncancel',
-                'ontransitionend','ontransitionrun','ontransitionstart','onunhandledrejection',
-                'onunload','onvolumechange','onwaiting','onwebkitanimationend',
-                'onwebkitanimationiteration','onwebkitanimationstart','onwebkittransitionend','onwheel',
-            ];
-            for (const _oh of _onHandlers) {
-                try { _sp(_oh, null); } catch (_) {}
-            }
-
-            // Blanket-copy ALL remaining enumerable parent-window properties to child
-            // realm. Some scripts iterate parent window's enumerable props and
-            // check them in child; any that are undefined in child cause errors.
-            // Real Chrome child frames have the same complete set as parent.
-            // We skip child-specific properties (document, location, self-refs) that
-            // are already set above or will be overridden below with correct values.
-            const _basSkip = new Set([
-                'window','self','globalThis','frames','top','parent',
-                'document','location','opener',
-                'length',
-                // Carefully configured below (accessor or child-specific value):
-                'devicePixelRatio','navigator','fetch','postMessage',
-                // Already set above:
-                'screen','availWidth','availHeight','innerWidth','innerHeight',
-                'outerWidth','outerHeight','scrollX','scrollY','pageXOffset','pageYOffset',
-                'screenTop','screenLeft','screenX','screenY',
-                'closed','name','status','defaultStatus',
-                'history','localStorage','sessionStorage','indexedDB','visualViewport',
-            ]);
-            try {
-                for (const _bk of Object.keys(globalThis)) {
-                    if (_basSkip.has(_bk)) continue;
-                    // Skip numeric frame indices (not enumerable in real Chrome iframes)
-                    if (_bk.length <= 4 && /^\d+$/.test(_bk)) continue;
-                    try {
-                        const _bv = globalThis[_bk];
-                        _sp(_bk, _bv !== undefined ? _bv : null);
-                    } catch (_) {}
-                }
-            } catch (_) {}
-
-            // devicePixelRatio: define as a native-tagged accessor so that
-            // A script inspecting these sees both a proper descriptor (getter:fn,
-            // not data) AND [native code] from Function.prototype.toString.
-            // The eval runs inside the child realm so Symbol.for resolves via
-            // the isolate-level global symbol registry (same symbol as parent).
-            const _dprVal = globalThis.devicePixelRatio || 1;
-            try {
-                ops.op_eval_in_child_realm(_realmId,
-                    `(function(){var _nt=Symbol.for('__browser_oxide_native__');var _g=function(){return ${_dprVal};};Object.defineProperty(_g,_nt,{value:'get devicePixelRatio',configurable:true});Object.defineProperty(_g,'name',{value:'get devicePixelRatio',configurable:true});var _s=function(v){Object.defineProperty(this,'devicePixelRatio',{value:v,writable:true,enumerable:true,configurable:true});};Object.defineProperty(_s,_nt,{value:'set devicePixelRatio',configurable:true});Object.defineProperty(_s,'name',{value:'set devicePixelRatio',configurable:true});Object.defineProperty(globalThis,'devicePixelRatio',{get:_g,set:_s,enumerable:true,configurable:true});})();`
-                );
-            } catch (_) {
-                _sp("devicePixelRatio", _dprVal);
-            }
-
-            // ── iframe EventTarget + bidirectional postMessage (FP-E1) ───────
-            // The child v8::Context has a genuine MessageEvent but NO
-            // addEventListener/dispatchEvent: those live on the parent's
-            // EventTarget/Window prototype chain, which the own-enumerable
-            // blanket-copy above never reaches. So a framed document's
-            // `window.addEventListener('message', …)` threw (swallowed),
-            // leaving the iframe unable to receive OR answer messages. That
-            // both (a) gates real iframe-based challenge flows (which load
-            // the challenge in an <iframe> and postMessage with it) and (b)
-            // differs from real Chrome (real iframes expose these). Install a
-            // native-shaped EventTarget backed
-            // by a realm-local listener registry + a `__deliverMessage` hook the
-            // parent uses to post INTO the realm. `parent`/`top` identity is
-            // left untouched (set to globalThis above) — replies route via the
-            // delivered event's `source` (the standard postMessage pattern), so
-            // no `iframe.contentWindow.parent === window` FP invariant changes.
-            try {
-                ops.op_eval_in_child_realm(_realmId,
-                    "(function(){var _nt=Symbol.for('__browser_oxide_native__');var _L=Object.create(null);"
-                    + "function _n(fn,nm){try{Object.defineProperty(fn,'name',{value:nm,configurable:true});"
-                    + "Object.defineProperty(fn,_nt,{value:nm,configurable:true});var ts=function toString(){return 'function '+nm+'() { [native code] }'};"
-                    + "Object.defineProperty(ts,_nt,{value:'toString',configurable:true});Object.defineProperty(ts,'name',{value:'toString',configurable:true});"
-                    + "Object.defineProperty(fn,'toString',{value:ts,configurable:true});}catch(_){}return fn;}"
-                    + "function ael(type,fn){if(!(typeof fn==='function'||(fn&&typeof fn.handleEvent==='function')))return;var t=String(type);(_L[t]||(_L[t]=[])).push(fn);}"
-                    + "function rel(type,fn){var a=_L[String(type)];if(a){var i=a.indexOf(fn);if(i>=0)a.splice(i,1);}}"
-                    + "function de(ev){try{var t=ev&&ev.type;var a=_L[t];if(a)a.slice().forEach(function(h){try{(typeof h==='function'?h:h.handleEvent).call(globalThis,ev);}catch(_){}});"
-                    + "var on=globalThis['on'+t];if(typeof on==='function'){try{on.call(globalThis,ev);}catch(_){}}}catch(_){}return true;}"
-                    + "Object.defineProperty(globalThis,'addEventListener',{value:_n(ael,'addEventListener'),writable:true,configurable:true});"
-                    + "Object.defineProperty(globalThis,'removeEventListener',{value:_n(rel,'removeEventListener'),writable:true,configurable:true});"
-                    + "Object.defineProperty(globalThis,'dispatchEvent',{value:_n(de,'dispatchEvent'),writable:true,configurable:true});"
-                    + "Object.defineProperty(globalThis,'__deliverMessage',{value:function(data,origin,source){Promise.resolve().then(function(){try{de(new MessageEvent('message',{data:data,origin:origin||'',source:source||null}));}catch(_){}});},configurable:true});})();"
-                );
-            } catch (_) {}
-
-            // child→parent reply target: a Proxy over the real parent window
-            // whose ONLY override is postMessage — lands a 'message' on the MAIN
-            // window with source === this iframe's contentWindow (cw), what
-            // solvers assert (`event.source === iframe.contentWindow`). Exposed
-            // to the framed doc as the delivered event's `source`, NOT as
-            // `parent`, so the parent-identity invariant is preserved.
-            const _parentOrigin = (globalThis.location && globalThis.location.origin) || "";
-            const _rawChildOrigin = _xOrigin(el.getAttribute && el.getAttribute("src"));
-            const _childOrigin = _rawChildOrigin === "null" ? _parentOrigin : _rawChildOrigin;
-            const _postToParent = function postMessage(msg, targetOrigin) {
-                if (targetOrigin != null && targetOrigin !== "*" && String(targetOrigin) !== _parentOrigin) return;
-                Promise.resolve().then(() => {
-                    try {
-                        globalThis.dispatchEvent(new MessageEvent("message", {
-                            data: msg,
-                            origin: _childOrigin,
-                            source: cw,
-                        }));
-                    } catch (_) {}
-                });
-            };
-            let _msgSource = null;
-            try {
-                _msgSource = new Proxy(globalThis, {
-                    get(t, p) { return (p === "postMessage") ? _postToParent : Reflect.get(t, p); },
-                });
-            } catch (_) { _msgSource = { postMessage: _postToParent }; }
-            _sp("__msgSource", _msgSource);
-
-            // parent→child: cw.postMessage(...) (and the framed doc's own
-            // window.postMessage) deliver a 'message' INTO the child realm. Data
-            // crosses the realm boundary as a JSON literal; the event's source
-            // is the reply-routing proxy above.
-            const _pm = function postMessage(msg, targetOrigin) {
-                if (targetOrigin != null && targetOrigin !== "*" && String(targetOrigin) !== _childOrigin) return;
-                Promise.resolve().then(() => {
-                    try {
-                        const _dj = JSON.stringify(msg === undefined ? null : msg);
-                        const _oj = JSON.stringify(_parentOrigin);
-                        ops.op_eval_in_child_realm(_realmId,
-                            "try{globalThis.__deliverMessage((" + _dj + ")," + _oj + ",(globalThis.__msgSource||null));}catch(_){}"
-                        );
-                    } catch (_) {}
-                });
-            };
-            _sp("postMessage", _pm);
-
-            // Navigator: fresh instance proxying parent values.
-            try {
-                const _parentNav = globalThis.navigator;
-                const _nav = Object.create(Object.prototype);
-                for (const _k of [
-                    "userAgent", "platform", "language", "languages",
-                    "hardwareConcurrency", "deviceMemory", "maxTouchPoints",
-                    "vendor", "vendorSub", "product", "productSub",
-                    "appName", "appVersion", "appCodeName", "cookieEnabled",
-                    "onLine", "doNotTrack", "pdfViewerEnabled",
-                    "plugins", "mimeTypes",
-                ]) {
-                    try {
-                        const _v = _parentNav[_k];
-                        if (_v !== undefined) Object.defineProperty(_nav, _k, { value: _v, writable: true, configurable: true, enumerable: true });
-                    } catch (_) {}
-                }
-                // webdriver: `false` in modern Chrome (property present,
-                // value false; `undefined` would differ from real Chrome).
-                // Some scripts check cw.navigator.webdriver; false is the
-                // Chrome-faithful value.
-                Object.defineProperty(_nav, 'webdriver', { value: false, writable: true, configurable: true, enumerable: true });
-                _sp("navigator", _nav);
-            } catch (_) {}
-
-            // Own realm `fetch` — distinct reference (cw.fetch !== parent.fetch)
-            try {
-                const _ifetch = function fetch(...a) { return globalThis.fetch.apply(this, a); };
-                Object.defineProperty(_ifetch, "name", { value: "fetch", configurable: true });
-                Object.defineProperty(_ifetch, "length", { value: 1, configurable: true });
-                Object.defineProperty(_ifetch, _NATIVE_TAG_SYMBOL, { value: "fetch", configurable: true });
-                _sp("fetch", _ifetch);
-            } catch (_) {}
-
-            // Copy key browser APIs that some scripts read from the child realm.
-            // e.g. reading MediaSource.isTypeSupported from inside the child realm.
-            const _apisToCopy = [
-                'MediaSource', 'MediaSourceHandle', 'MediaCapabilities',
-                'MediaRecorder', 'MediaStream', 'MediaStreamTrack',
-                'HTMLVideoElement', 'HTMLAudioElement', 'HTMLMediaElement',
-                'AudioContext', 'OfflineAudioContext',
-                'RTCPeerConnection', 'RTCDataChannel',
-                'Blob', 'File', 'FileReader',
-                'URL', 'URLSearchParams',
-                'WebSocket', 'Worker',
-                'CSS', 'crypto', 'performance',
-                'structuredClone', 'queueMicrotask', 'reportError',
-                'crossOriginIsolated', 'isSecureContext', 'origin',
-                'CustomEvent', 'Event', 'EventTarget',
-                'PromiseRejectionEvent', 'ErrorEvent',
-                'MessageChannel', 'MessagePort', 'MessageEvent',
-                'MutationObserver', 'IntersectionObserver', 'ResizeObserver',
-                'PerformanceObserver',
-                'TextEncoder', 'TextDecoder',
-                'AbortController', 'AbortSignal',
-                'ReadableStream', 'WritableStream', 'TransformStream',
-                'Request', 'Response', 'Headers', 'FormData',
-                'XMLHttpRequest', 'DOMParser',
-                'Node', 'Element', 'Document',
-                'HTMLElement', 'DocumentFragment',
-                'Notification',
-                // Singleton constructors the npc/crs probes expect in child realm.
-                'Navigator', 'Location', 'History', 'Screen',
-                'Performance', 'Permissions', 'ScreenOrientation',
-                // The canvas/graphics constructor surface. Without these,
-                // an iframe child realm has `CanvasRenderingContext2D ===
-                // undefined` (all ctx2d proto methods missing on the child
-                // realm). A script that fetches such a constructor/method
-                // from the child realm gets `undefined` and then accessing a
-                // property on it throws `TypeError: Cannot read properties of
-                // undefined`, which differs from real Chrome. Real Chrome
-                // iframe realms expose the full set. Only names that are
-                // genuine main-realm globals are copied (the loop skips
-                // `undefined`), so this is Chrome-faithful, not a stub.
-                'CanvasRenderingContext2D', 'HTMLCanvasElement',
-                'OffscreenCanvas', 'ImageData', 'Path2D', 'ImageBitmap',
-                'WebGLRenderingContext', 'WebGL2RenderingContext',
-                'DOMMatrix', 'DOMMatrixReadOnly', 'DOMPoint',
-                'DOMRect', 'DOMRectReadOnly',
-            ];
-            for (const _ak of _apisToCopy) {
-                try {
-                    const _v = globalThis[_ak];
-                    if (_v !== undefined) _sp(_ak, _v);
-                } catch (_) {}
-            }
-
-            // Some scripts read MediaSource.isTypeSupported from inside the
-            // child realm. Wrap in IIFE to prevent __kms leaking into child realm globals
-            // (some scripts detect unexpected global variables).
-            // globalThis.X = Y inside an IIFE IS visible to subsequent op_eval_in_child_realm
-            // calls because they all run in the same child v8::Context.
-            try {
-                ops.op_eval_in_child_realm(_realmId,
-                    '(function(){\n' +
-                    'var __kms=new Set(["video/mp4","video/webm","audio/mp4","audio/webm",' +
-                    '"audio/mpeg","audio/aac","audio/x-m4a","audio/mp3","audio/x-wav",' +
-                    '"audio/ogg","audio/acc","audio/mp4;codecs=\\"mp4a.40.2\\"",' +
-                    '"video/mp4;codecs=\\"avc1.42E01E,mp4a.40.2\\"",' +
-                    '"video/webm;codecs=\\"vp9\\""]);\n' +
-                    'var _its=function isTypeSupported(t){if(typeof t!=="string")return false;var b=t.split(";")[0].trim();return __kms.has(t)||__kms.has(b);};\n' +
-                    'if(typeof MediaSource==="undefined"||MediaSource===undefined){\n' +
-                    'globalThis.MediaSource=function MediaSource(){throw new TypeError("Failed to construct \'MediaSource\': Illegal constructor");};\n' +
-                    '}\n' +
-                    'if(typeof MediaSource.isTypeSupported!=="function") MediaSource.isTypeSupported=_its;\n' +
-                    'if(typeof MediaRecorder==="undefined"||MediaRecorder===undefined){\n' +
-                    'globalThis.MediaRecorder=function MediaRecorder(){throw new TypeError("Failed to construct \'MediaRecorder\': Illegal constructor");};\n' +
-                    '}\n' +
-                    'if(typeof MediaRecorder.isTypeSupported!=="function") MediaRecorder.isTypeSupported=_its;\n' +
-                    '})();\n'
-                );
-            } catch (_) {}
-
-            // Align child realm globals with main window so the realms don't diverge.
-            // Chrome without COOP/COEP: SharedArrayBuffer is disabled in all frames.
-            // Our V8 child context natively has SAB; delete it to match.
-            try {
-                ops.op_eval_in_child_realm(_realmId,
-                    'if(typeof SharedArrayBuffer!=="undefined"&&typeof globalThis.SharedArrayBuffer!=="undefined")' +
-                    '{try{delete globalThis.SharedArrayBuffer;}catch(_){globalThis.SharedArrayBuffer=undefined;}}'
-                );
-            } catch (_) {}
-
-            // Execute srcdoc scripts in the child realm.
-            // Some scripts inject content via srcdoc to
-            // run code inside the iframe. A real browser executes those
-            // scripts; we extract and eval them in the child realm context.
-            if (_srcdoc) {
-                try {
-                    const _scriptRe = /<script[^>]*>([\s\S]*?)<\/script>/gi;
-                    let _m;
-                    while ((_m = _scriptRe.exec(_srcdoc)) !== null) {
-                        const _src = _m[1];
-                        if (_src && _src.trim()) {
-                            try { ops.op_eval_in_child_realm(_realmId, _src); } catch (_) {}
-                        }
-                    }
-                } catch (_) {}
-            }
-
-            // ── Same-origin src document: fetch + execute ────────
-            // Real iframe-based challenge flows
-            // point the iframe at a same-origin URL whose document
-            // runs the challenge and postMessages the result to the parent.
-            // Cross-origin src already returned a SecurityError proxy above, so
-            // any src reaching here is same-origin. Fetch the doc, reflect its
-            // URL into the child realm's location (challenge scripts read
-            // location.search for ?parentOrigin=…), and execute its scripts in
-            // document order. Bounded + best-effort: a failed/slow fetch is
-            // swallowed and the (empty) realm is returned — never hangs the nav.
-            let _iSrcUrl2 = "";
-            try {
-                const _rawSrc2 = (el && typeof el.getAttribute === "function")
-                    ? (el.getAttribute("src") || el.src || "") : (el && el.src || "");
-                if (_rawSrc2 && _rawSrc2 !== "about:blank"
-                    && !/^javascript:/i.test(_rawSrc2) && !/^data:/i.test(_rawSrc2)) {
-                    try { _iSrcUrl2 = new URL(_rawSrc2, (globalThis.location && globalThis.location.href) || undefined).href; }
-                    catch (_) { _iSrcUrl2 = _rawSrc2; }
-                }
-            } catch (_) {}
-            if (_iSrcUrl2) {
-                try {
-                    let _u2 = null;
-                    try { _u2 = new URL(_iSrcUrl2); } catch (_) {}
-                    if (_u2) {
-                        _sp("location", {
-                            href: _u2.href, origin: _u2.origin, pathname: _u2.pathname,
-                            search: _u2.search, hash: _u2.hash, host: _u2.host,
-                            hostname: _u2.hostname, port: _u2.port, protocol: _u2.protocol,
-                            assign() {}, replace() {}, reload() {},
-                            toString() { return _u2.href; },
-                        });
-                    }
-                    const _docHtml = ops.op_net_fetch_sync(_iSrcUrl2, (globalThis.location && globalThis.location.href) || "");
-                    if (_docHtml && typeof _docHtml === "string" && _docHtml.length < 5000000) {
-                        const _tagRe = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
-                        let _sm;
-                        let _guard = 0;
-                        while ((_sm = _tagRe.exec(_docHtml)) !== null && _guard++ < 64) {
-                            const _attrs = _sm[1] || "";
-                            const _inline = _sm[2] || "";
-                            const _typeM = /\btype\s*=\s*["']?([^"'\s>]+)/i.exec(_attrs);
-                            const _ty = _typeM ? _typeM[1].toLowerCase() : "";
-                            if (_ty && _ty !== "text/javascript" && _ty !== "application/javascript" && _ty !== "module") continue;
-                            const _srcM = /\bsrc\s*=\s*["']([^"']+)["']/i.exec(_attrs);
-                            if (_srcM) {
-                                let _eu = _srcM[1];
-                                try { _eu = new URL(_eu, _iSrcUrl2).href; } catch (_) {}
-                                try {
-                                    const _code = ops.op_net_fetch_sync(_eu, _iSrcUrl2);
-                                    if (_code && typeof _code === "string") {
-                                        try { ops.op_eval_in_child_realm(_realmId, _code); } catch (_) {}
-                                    }
-                                } catch (_) {}
-                            } else if (_inline && _inline.trim()) {
-                                try { ops.op_eval_in_child_realm(_realmId, _inline); } catch (_) {}
-                            }
-                        }
-                    }
-                } catch (_) {}
-            }
-
-            state = { contentWindow: cw, contentDocument: iframeDoc, _realmId: _realmId, _processedSrcdoc: _srcdoc };
-            _iframeState.set(el, state);
-            _registerFrame(cw, el);
-            return cw;
-        }
-
-        // ── FALLBACK: Proxy-based approach (if op unavailable) ───────────
-        // Keeps existing behaviour when op_create_child_realm is not accessible
-        // (e.g. worker runtime that doesn't load dom_extension).
-        const remoteRealm = _buildRemoteRealm();
-        const iframeLocals = {
-            document: iframeDoc,
-            location: { href: "about:blank" },
-            parent: globalThis,
-            top: globalThis,
-            self: null,
-            frames: [],
-            screen: _iframeScreen,
-            innerWidth:  globalThis.innerWidth  || 1920,
-            innerHeight: globalThis.innerHeight || 1080,
-            outerWidth:  globalThis.outerWidth  || 1920,
-            outerHeight: globalThis.outerHeight || 1080,
-            scrollX: 0, scrollY: 0, pageXOffset: 0, pageYOffset: 0,
-            postMessage(msg, origin) {
-                Promise.resolve().then(() => {
-                    globalThis.dispatchEvent(new MessageEvent("message", { data: msg, origin: origin || "" }));
-                });
-            },
-        };
-        try {
-            if (remoteRealm.Window && remoteRealm.Window.prototype) {
-                Object.setPrototypeOf(iframeLocals, remoteRealm.Window.prototype);
-            }
-        } catch (_) {}
-        try {
-            const _ifetch = function fetch(...a) { return globalThis.fetch.apply(this, a); };
-            Object.defineProperty(_ifetch, "name", { value: "fetch", configurable: true });
-            Object.defineProperty(_ifetch, "length", { value: 1, configurable: true });
-            Object.defineProperty(_ifetch, _NATIVE_TAG_SYMBOL, { value: "fetch", configurable: true });
-            iframeLocals.fetch = _ifetch;
-        } catch (_) {}
-        try {
-            const _dg = function () { return globalThis.devicePixelRatio || 1; };
-            const _ds = function(v) {
-                Object.defineProperty(iframeLocals, "devicePixelRatio", {
-                    value: v, writable: true, enumerable: true, configurable: true,
-                });
-            };
-            Object.defineProperty(_dg, _NATIVE_TAG_SYMBOL, { value: "get devicePixelRatio", configurable: true });
-            Object.defineProperty(_dg, "name", { value: "get devicePixelRatio", configurable: true });
-            Object.defineProperty(_ds, _NATIVE_TAG_SYMBOL, { value: "set devicePixelRatio", configurable: true });
-            Object.defineProperty(_ds, "name", { value: "set devicePixelRatio", configurable: true });
-            Object.defineProperty(iframeLocals, "devicePixelRatio", {
-                get: _dg, set: _ds, enumerable: true, configurable: true,
-            });
-        } catch (_) {}
-        const iframeWindow = new Proxy(iframeLocals, {
-            get(target, prop) {
-                if (prop in target) return target[prop];
-                if (typeof prop === "string" && prop in remoteRealm) return remoteRealm[prop];
-                try { return globalThis[prop]; } catch { return undefined; }
-            },
-            has(target, prop) {
-                return prop in target || prop in remoteRealm || prop in globalThis;
-            },
-            getOwnPropertyDescriptor(target, prop) {
-                if (prop in target) {
-                    return Object.getOwnPropertyDescriptor(target, prop);
-                }
-                if (typeof prop === "string" && prop in remoteRealm) {
-                    return { value: remoteRealm[prop], writable: true, enumerable: true, configurable: true };
-                }
-                return undefined;
-            },
-        });
-        iframeLocals.self = iframeWindow;
-        iframeLocals.window = iframeWindow;
-        iframeLocals.globalThis = iframeWindow;
-        iframeLocals.frames = iframeWindow;
-        iframeLocals.length = 0;
-        state = { contentWindow: iframeWindow, contentDocument: iframeDoc };
-        _iframeState.set(el, state);
-        _registerFrame(iframeWindow, el);
-        return iframeWindow;
+        // Same-origin frames are realms of this isolate (`_frameRealmWindow`
+        // above); one reaching here is a frame whose realm could not be built.
+        return null;
     }
     function _getIframeDocument(el) {
         // Null for the same reason `contentWindow` is: no browsing context until
         // the element is in a document.
-        if (_getIframeWindow(el) === null) return null;
+        const w = _getIframeWindow(el);
+        if (w === null) return null;
         const state = _iframeState.get(el);
+        if (state && state._realm) {
+            try { return w.document; } catch (_) { return null; }
+        }
         return state ? state.contentDocument : null;
     }
 
@@ -5326,20 +4611,6 @@
                 // script-built srcdoc frame was never given a browsing context —
                 // and the frame lifecycle hook on `setAttribute` never fired.
                 try { this.setAttribute('srcdoc', String(v)); } catch (_) { /* detached */ }
-                const _st = _iframeState.get(this);
-                if (_st && _st._realmId !== undefined && v && String(v) !== _st._processedSrcdoc) {
-                    _st._processedSrcdoc = String(v);
-                    try {
-                        const _re = /<script[^>]*>([\s\S]*?)<\/script>/gi;
-                        let _m3;
-                        while ((_m3 = _re.exec(String(v))) !== null) {
-                            const _s3 = _m3[1];
-                            if (_s3 && _s3.trim()) {
-                                try { ops.op_eval_in_child_realm(_st._realmId, _s3); } catch (_) {}
-                            }
-                        }
-                    } catch (_) {}
-                }
             },
             configurable: true,
             enumerable: true,
@@ -5548,12 +4819,29 @@
                         return null;
                     }
                 },
+                // The `<iframe>` element for a node id — a frame realm's
+                // `frameElement` (see `realms.rs`).
+                elementForNode(nodeId) {
+                    try { return _wrapNode(nodeId); } catch (_) { return null; }
+                },
                 // Inverse of `windowForNode`. Message routing keys on node ids that
                 // are otherwise invisible from script, so a frame that silently
                 // receives nothing cannot be told apart from one that was never
                 // registered without this.
                 nodeIdOf(el) {
                     try { return _getNodeId(el); } catch (_) { return -1; }
+                },
+                // A framed document's own `load` fires on ITS `window`, but
+                // the spec also requires the owning `<iframe>` element in
+                // the PARENT to get a `load` — the signal a page's own
+                // "widget ready" polling loop actually waits on
+                // (`iframe.addEventListener('load', ...)`), which nothing
+                // in this engine ever fired before.
+                fireLoad(nodeId) {
+                    try {
+                        const el = _wrapNode(nodeId);
+                        if (el) el.dispatchEvent(new Event('load'));
+                    } catch (_) { /* ignore */ }
                 },
             },
             writable: false,

@@ -63,11 +63,10 @@ async fn humanize_motion_has_finite_alias_coordinates() {
     )
     .await
     .unwrap();
-    page.evaluate(include_str!("../src/js/humanize.js"))
-        .unwrap();
+    page.install_humanize().unwrap();
     let _ = page
-        .evaluate_async(
-            r#"(async()=>{let ns=null;for(const s of Object.getOwnPropertySymbols(globalThis,1)){const v=globalThis[s];if(v&&v.__bo){ns=v;break}}if(!ns||!ns.input)throw Error('no input');await ns.input.moveTo(320,200)})()"#,
+        .evaluate_privileged_async(
+            "(function (caps) { return caps.human.moveTo(320, 200); })",
             std::time::Duration::from_secs(2),
         )
         .await;
@@ -93,8 +92,7 @@ async fn humanize_emits_full_signal_set() {
         .await
         .unwrap();
     // Manually inject humanize.js and drive enough time for it to fire.
-    let humanize = include_str!("../src/js/humanize.js");
-    page.evaluate(humanize).unwrap();
+    page.install_humanize().unwrap();
 
     // Drive the event loop until quiescent (or timeout). humanize.js
     // schedules setTimeouts up to ~3.2 s out, so a 4 s budget covers
@@ -190,20 +188,14 @@ async fn humanize_mouse_intervals_are_right_skewed() {
     let mut page = Page::from_html(HTML, Some(chrome_148_macos()))
         .await
         .unwrap();
-    let humanize = include_str!("../src/js/humanize.js");
-    page.evaluate(humanize).unwrap();
+    page.install_humanize().unwrap();
 
     // Idle cursor motion is opt-in: humanize used to start a cycle on load and
     // repeat it every ~7 s, which could drop an ambient `mousemove` between a
     // driver's own mousedown and mouseup. A driver that wants the idle stream
     // asks for it, and so does this test.
-    page.evaluate(
-        "(() => { const ns = (function () { const s = Object.getOwnPropertySymbols(globalThis, 1); \
-          for (let i = 0; i < s.length; i++) { const v = globalThis[s[i]]; if (v && v.__bo) return v; } \
-          return null; })(); \
-          ns.input.setAmbient(true); return 'on'; })()",
-    )
-    .unwrap();
+    page.evaluate_privileged("(function (caps) { caps.human.setAmbient(true); return 'on'; })")
+        .unwrap();
 
     // humanize schedules its mouse stroke on *background* (unref'd) timers so
     // it doesn't pin `run_until_idle` open on benign pages (humanize.js:73 →
@@ -266,11 +258,10 @@ async fn repeated_clicks_land_around_one_off_centre_spot() {
     )
     .await
     .unwrap();
-    page.evaluate(include_str!("../src/js/humanize.js"))
-        .unwrap();
+    page.install_humanize().unwrap();
     let _ = page
-        .evaluate_async(
-            r#"(async()=>{let ns=null;for(const s of Object.getOwnPropertySymbols(globalThis,1)){const v=globalThis[s];if(v&&v.__bo){ns=v;break}}if(!ns||!ns.input)throw Error('no input');for(let i=0;i<3;i++)await ns.input.clickSelector('button')})()"#,
+        .evaluate_privileged_async(
+            "(async function (caps) { for (let i = 0; i < 3; i++) await caps.human.clickSelector('button'); })",
             std::time::Duration::from_secs(8),
         )
         .await;

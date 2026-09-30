@@ -515,10 +515,20 @@ async fn run() {
                     }
                     // Raw keystroke forwarding, same discipline as `pointer`.
                     if raw.contains("\"key\"") {
-                        let phase = field(&raw, "phase");
-                        let key = field(&raw, "key").replace('`', "\\`");
-                        let code = field(&raw, "code").replace('`', "\\`");
-                        let sel = field(&raw, "sel").replace('`', "\\`");
+                        // JSON-encoded, not backtick-escaped: the old
+                        // `.replace('`', "\\`")` only closed off the
+                        // backtick template literal these get embedded in —
+                        // a value containing `${...}` (template-literal
+                        // interpolation) still ran as JS. `key`/`code`/`sel`
+                        // can carry page-authored content (an element's id
+                        // feeding the `:nth-of-type` fallback selector, for
+                        // one), so a page could inject script into the
+                        // generated devview command. `json_str` produces a
+                        // complete, self-quoting JS string literal.
+                        let phase = json_str(&field(&raw, "phase"));
+                        let key = json_str(&field(&raw, "key"));
+                        let code = json_str(&field(&raw, "code"));
+                        let sel = json_str(&field(&raw, "sel"));
                         let flag = |name: &str| {
                             if field(&raw, name) == "true" {
                                 "true"
@@ -537,16 +547,17 @@ async fn run() {
                             .replace("__META__", flag("meta"));
                         let idx_raw = field(&raw, "index");
                         let out = if idx_raw.is_empty() {
-                            page.evaluate(&js).unwrap_or_else(|e| format!("ошибка: {e}"))
+                            page.evaluate_privileged(&js)
+                                .unwrap_or_else(|e| format!("ошибка: {e}"))
                         } else {
                             let idx = realm_for_dom_slot(
                                 &mut page,
                                 idx_raw.parse().unwrap_or(0),
                             );
                             match page.child_iframe(idx) {
-                                Some(c) => {
-                                    c.evaluate(&js).unwrap_or_else(|e| format!("ошибка: {e}"))
-                                }
+                                Some(c) => c
+                                    .evaluate_privileged(&js)
+                                    .unwrap_or_else(|e| format!("ошибка: {e}")),
                                 None => format!("нет фрейма {idx}"),
                             }
                         };
@@ -563,7 +574,10 @@ async fn run() {
                             FORCE_CANVAS_FLUSH
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
                         }
-                        let sel = field(&raw, "sel").replace('`', "\\`");
+                        // JSON-encoded, not backtick-escaped — see the
+                        // comment on the same pattern in the keystroke
+                        // branch above.
+                        let sel = json_str(&field(&raw, "sel"));
                         let u = field(&raw, "u");
                         let v = field(&raw, "v");
                         let surface = parse_surface_key(&field(&raw, "surface"));
@@ -582,9 +596,10 @@ async fn run() {
                         let out = if surface.as_ref().is_some_and(|key| key.frame_path.is_empty())
                             || (surface.is_none() && idx_raw.is_empty())
                         {
-                            page.evaluate(&js).unwrap_or_else(|e| format!("ошибка: {e}"))
+                            page.evaluate_privileged(&js)
+                                .unwrap_or_else(|e| format!("ошибка: {e}"))
                         } else if let Some(key) = surface.as_ref() {
-                            page.devview_evaluate_in_frame(
+                            page.devview_evaluate_privileged_in_frame(
                                 &key.frame_path,
                                 key.generation,
                                 &js,
@@ -596,9 +611,9 @@ async fn run() {
                                 idx_raw.parse().unwrap_or(0),
                             );
                             match page.child_iframe(idx) {
-                                Some(c) => {
-                                    c.evaluate(&js).unwrap_or_else(|e| format!("ошибка: {e}"))
-                                }
+                                Some(c) => c
+                                    .evaluate_privileged(&js)
+                                    .unwrap_or_else(|e| format!("ошибка: {e}")),
                                 None => format!("нет фрейма {idx}"),
                             }
                         };
@@ -613,35 +628,44 @@ async fn run() {
                             &mut page,
                             field(&raw, "index").parse().unwrap_or(0),
                         );
-                        let sel = field(&raw, "sel").replace('`', "\\`");
-                        // Marked trusted, like the pointer path. An untrusted
-                        // click is not a click to a widget that checks — hCaptcha
-                        // takes the whole `pointerdown … click` sequence without a
-                        // complaint and does nothing at all with it, so a press on
-                        // its own button silently did nothing.
+                        // JSON-encoded like every other selector here: the
+                        // backtick-escaped template this used to build still ran
+                        // any `${...}` inside the value.
+                        let sel = json_str(&field(&raw, "sel"));
+                        // Marked trusted, like the pointer path, with the frame
+                        // realm's own minter handed in as a privileged-call
+                        // argument. An untrusted click is not a click to a widget
+                        // that checks — hCaptcha takes the whole `pointerdown …
+                        // click` sequence without a complaint and does nothing
+                        // at all with it, so a press on its own button silently
+                        // did nothing. The status reports what the events
+                        // actually were, not whether a minter was found.
                         let js = format!(
-                            "(function(){{var e=document.querySelector(`{sel}`);\
+                            "(function(caps){{var e=document.querySelector({sel});\
                              if(!e)return 'нет элемента';\
-                             var ns=(function(){{try{{var s=Object.getOwnPropertySymbols(globalThis,1);\
-                                 for(var i=0;i<s.length;i++){{var v=globalThis[s[i]];if(v&&v.__bo)return v;}}}}catch(e){{}}return null;}})();\
-                             var mark=(typeof globalThis.__bo_mark_trusted==='function')\
-                                 ?globalThis.__bo_mark_trusted\
-                                 :((ns&&ns.input&&typeof ns.input.mark==='function')?ns.input.mark:null);\
+                             var mark=(caps&&typeof caps.markTrusted==='function')?caps.markTrusted:null;\
                              var r=e.getBoundingClientRect();\
                              var b={{bubbles:true,cancelable:true,view:window,\
                                     clientX:Math.round(r.left+r.width/2),\
                                     clientY:Math.round(r.top+r.height/2)}};\
                              try{{e.focus&&e.focus();}}catch(_){{}}\
+                             var fired=0,untrusted=0,cancelled=0;\
                              ['pointerdown','mousedown','pointerup','mouseup','click']\
                                .forEach(function(t){{\
                                  var C=(t.indexOf('pointer')===0&&typeof PointerEvent!=='undefined')\
                                        ?PointerEvent:MouseEvent;\
-                                 try{{var ev=new C(t,b); if(mark)mark(ev); e.dispatchEvent(ev);}}catch(_){{}}\
+                                 try{{var ev=new C(t,b); if(mark)mark(ev);\
+                                      if(!e.dispatchEvent(ev))cancelled++;\
+                                      fired++; if(!ev.isTrusted)untrusted++;}}catch(_){{}}\
                                }});\
-                             return 'клик во фрейме по '+(e.id||e.tagName)+(mark?' [trusted]':' [untrusted]');}})()"
+                             return 'клик во фрейме по '+(e.id||e.tagName)\
+                               +(untrusted?' [untrusted '+untrusted+'/'+fired+']':' [trusted]')\
+                               +(cancelled?' (отменено событий: '+cancelled+')':'');}})"
                         );
                         let out = match page.child_iframe(idx) {
-                            Some(c) => c.evaluate(&js).unwrap_or_else(|e| format!("ошибка: {e}")),
+                            Some(c) => c
+                                .evaluate_privileged(&js)
+                                .unwrap_or_else(|e| format!("ошибка: {e}")),
                             None => format!("нет фрейма {idx}"),
                         };
                         emit(
@@ -683,7 +707,7 @@ async fn run() {
                         continue;
                     }
                     let immediate = page
-                        .evaluate(&wrap_action(&action_to_js(&raw)))
+                        .evaluate_privileged(&wrap_action(&action_to_js(&raw)))
                         .unwrap_or_else(|e| format!("ошибка: {e}"));
                     emit(
                         "action",
@@ -697,13 +721,21 @@ async fn run() {
                     // delays), so poll its parked result rather than blocking on it —
                     // and keep streaming snapshots meanwhile so the cursor animates.
                     if immediate == "запущено" {
-                        for _ in 0..100 {
+                        let mut settled = false;
+                        for _ in 0..ACTION_POLLS {
                             let _ = page
                                 .evaluate_async("void 0", std::time::Duration::from_millis(100))
                                 .await;
+                            // The frames keep living while the action runs. A
+                            // click that opens a widget, or a keystroke a framed
+                            // field answers, needs the frame's side of the
+                            // conversation running — not frozen, messages
+                            // unpumped, until a ten-second action ends.
+                            run_frames(&mut page, std::time::Duration::from_millis(30), &emit).await;
                             push_snapshot(&mut page, &events_tx, &inspect);
                             let r = page.evaluate(&format!("({NS_RESOLVE}||{{}}).devviewResult")).unwrap_or_default();
                             if r != "выполняется…" {
+                                settled = true;
                                 emit(
                                     "action",
                                     format!(
@@ -718,6 +750,22 @@ async fn run() {
                                 }
                                 break;
                             }
+                        }
+                        // Said out loud: the last status the view got was
+                        // "запущено", and silence afterwards reads as success.
+                        if !settled {
+                            emit(
+                                "action",
+                                format!(
+                                    "\"raw\":{},\"state\":{},\"ms\":{}",
+                                    json_str(&raw),
+                                    json_str(&format!(
+                                        "не завершилось за {} с — всё ещё выполняется в странице",
+                                        ACTION_POLLS / 10
+                                    )),
+                                    t0.elapsed().as_millis()
+                                ),
+                            );
                         }
                     } else if raw.contains("\"inspect\"") {
                         *inspect.lock().unwrap() = immediate;
@@ -748,24 +796,41 @@ async fn run() {
                 // Frames appear on their own — a widget injects one seconds after
                 // load with no command from us — so materialise on every tick, not
                 // only after a driver action. Already-built frames are skipped.
-                if let Some(n) = page.materialize_new_iframes().await {
-                    if n > 0 {
-                        emit("log", format!("\"text\":\"материализовано iframe: {n}\""));
-                    }
-                }
-                page.drive_children(std::time::Duration::from_millis(60))
-                    .await;
-                let (down, up) = page.pump_iframe_messages();
-                if down > 0 || up > 0 {
-                    emit(
-                        "log",
-                        format!("\"text\":\"postMessage вниз {down}, вверх {up}\""),
-                    );
-                }
+                run_frames(&mut page, std::time::Duration::from_millis(60), &emit).await;
                 push_snapshot(&mut page, &events_tx, &inspect);
             }
         })
         .await;
+}
+
+/// How many 100 ms polls a humanized action gets before the view is told it
+/// has not finished.
+const ACTION_POLLS: u32 = 100;
+
+/// One turn for the frame tree: build frames that appeared, give every frame
+/// realm a slice of its event loop, and carry `postMessage` across.
+///
+/// Frames appear on their own — a widget injects one seconds after load with
+/// no command from us — so this runs on every tick, and during a long action
+/// too. Already-built frames are skipped.
+async fn run_frames(
+    page: &mut browser_oxide::Page,
+    slice: std::time::Duration,
+    emit: &impl Fn(&str, String),
+) {
+    if let Some(n) = page.materialize_new_iframes().await {
+        if n > 0 {
+            emit("log", format!("\"text\":\"материализовано iframe: {n}\""));
+        }
+    }
+    page.drive_children(slice).await;
+    let (down, up) = page.pump_iframe_messages();
+    if down > 0 || up > 0 {
+        emit(
+            "log",
+            format!("\"text\":\"postMessage вниз {down}, вверх {up}\""),
+        );
+    }
 }
 
 fn push_snapshot(
@@ -1023,14 +1088,18 @@ fn wrap_action(inner: &str) -> String {
     // Parked on the engine's internal namespace rather than a global slot: a
     // symbol on `window` is visible to `Object.getOwnPropertySymbols`, and this
     // tool has no business adding one to a page it is meant to observe.
+    //
+    // A privileged function: `inner` may use `h`, the humanized-input API,
+    // which exists only as the capability object the engine passes in.
     format!(
-        "(function(){{var ns={NS_RESOLVE}||{{}};ns.devviewResult='выполняется…';\
+        "(function(caps){{var ns={NS_RESOLVE}||{{}};ns.devviewResult='выполняется…';\
+         var h=caps&&caps.human;\
          var r=({inner});\
          if(r&&typeof r.then==='function'){{\
            r.then(function(v){{ns.devviewResult=String(v);}},\
-                  function(e){{ns.devviewResult='ошибка: '+e.message;}});\
+                  function(e){{ns.devviewResult='ошибка: '+(e&&e.message||e);}});\
            return 'запущено';}}\
-         ns.devviewResult=String(r);return String(r);}})()"
+         ns.devviewResult=String(r);return String(r);}})"
     )
 }
 
@@ -1052,10 +1121,11 @@ fn wrap_action(inner: &str) -> String {
 /// coordinates. The mirror lays the document out at its own width, so its pixel
 /// positions are not the engine's; an element-relative offset survives that.
 ///
-/// Events are minted trusted where the realm still exposes the marker — the top
-/// page hands it to humanize.js, which captures and revokes it, so there the
-/// engine's own input API is used instead.
-const POINTER_JS: &str = r#"(function(){
+/// A privileged function (`Page::evaluate_privileged` and its frame
+/// counterparts): events are minted trusted with the minter the engine passes
+/// in, in whichever realm — top page or frame — the gesture lands. The status
+/// reports what the dispatched events actually were.
+const POINTER_JS: &str = r#"(function(caps){
   var canvasId = Number('__CANVAS_ID__');
   var rawU = __U__, rawV = __V__;
   if (typeof rawU !== 'number' || typeof rawV !== 'number'
@@ -1101,7 +1171,7 @@ const POINTER_JS: &str = r#"(function(){
     // computed at click time against the mirror's own DOM shape, still names
     // the right element even when the coordinate doesn't.
     if (!el || el === document.body || el === document.documentElement) {
-      try { var bySel = document.querySelector(`__SEL__`); if (bySel) el = bySel; } catch (e2) {}
+      try { var bySel = document.querySelector(__SEL__); if (bySel) el = bySel; } catch (e2) {}
     }
     if (!el) return 'нет элемента';
   }
@@ -1112,9 +1182,8 @@ const POINTER_JS: &str = r#"(function(){
   y = Math.max(0, Math.min(vh - 1, y));
   var ns = (function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);
       for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})();
-  var mark = (typeof globalThis.__bo_mark_trusted === 'function')
-      ? globalThis.__bo_mark_trusted
-      : ((ns && ns.input && typeof ns.input.mark === 'function') ? ns.input.mark : null);
+  var mark = (caps && typeof caps.markTrusted === 'function') ? caps.markTrusted : null;
+  var fired = 0, untrusted = 0;
   var st = ns ? (ns.__drag || (ns.__drag = {})) : {};
   function underPointer() {
     // Same body/html distrust as the initial resolution above — this re-runs
@@ -1151,6 +1220,8 @@ const POINTER_JS: &str = r#"(function(){
     try { ev = new Ctor(type, init); } catch (e) { return; }
     if (mark) { try { mark(ev); } catch (e) {} }
     try { (receiver || underPointer() || el).dispatchEvent(ev); } catch (e) {}
+    fired++;
+    if (!ev.isTrusted) untrusted++;
   }
   var P = globalThis.PointerEvent || globalThis.MouseEvent;
   var phase = '__PHASE__';
@@ -1213,8 +1284,8 @@ const POINTER_JS: &str = r#"(function(){
   }
   return phase + ' @' + Math.round(x) + ',' + Math.round(y)
     + ' → ' + (el.id ? '#' + el.id : el.tagName.toLowerCase())
-    + (mark ? ' [trusted]' : ' [untrusted]');
-})()"#;
+    + (untrusted ? ' [untrusted ' + untrusted + '/' + fired + ']' : ' [trusted]');
+})"#;
 
 /// One keystroke, replayed in the engine.
 ///
@@ -1227,20 +1298,25 @@ const POINTER_JS: &str = r#"(function(){
 /// On `keydown` of a printable key the value is edited at the caret and
 /// `beforeinput`/`input` are fired, which is what a real keystroke does — a
 /// bare `KeyboardEvent` changes no text at all.
-const KEY_JS: &str = r#"(function(){
-  var sel = `__SEL__`;
+///
+/// A privileged function, like [`POINTER_JS`]; the status says so when any
+/// dispatched event did not come out trusted.
+const KEY_JS: &str = r#"(function(caps){
+  var fired = 0, untrusted = 0;
+  var out = (function(){
+  var sel = __SEL__;
   var el = sel ? document.querySelector(sel) : (document.activeElement || document.body);
   if (!el) return 'нет цели';
-  var key = `__KEY__`, code = `__CODE__`, phase = '__PHASE__';
+  var key = __KEY__, code = __CODE__, phase = __PHASE__;
   var ns = (function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);
       for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})();
-  var mark = (typeof globalThis.__bo_mark_trusted === 'function')
-      ? globalThis.__bo_mark_trusted
-      : ((ns && ns.input && typeof ns.input.mark === 'function') ? ns.input.mark : null);
+  var mark = (caps && typeof caps.markTrusted === 'function') ? caps.markTrusted : null;
   function fire(type, Ctor, init) {
     var ev;
     try { ev = new Ctor(type, init); } catch (e) { return true; }
     if (mark) { try { mark(ev); } catch (e) {} }
+    fired++;
+    if (!ev.isTrusted) untrusted++;
     try { return el.dispatchEvent(ev); } catch (e) { return true; }
   }
   // A keystroke that arrives at a field nobody ever moved to or clicked is the
@@ -1319,7 +1395,9 @@ const KEY_JS: &str = r#"(function(){
          { inputType: itype, data: data, bubbles: true, cancelable: false });
   }
   return 'keydown ' + key + ' → ' + JSON.stringify(String(el.value)).slice(0, 40);
-})()"#;
+  })();
+  return out + (untrusted ? ' [untrusted ' + untrusted + '/' + fired + ']' : '');
+})"#;
 
 /// Inline everything the mirror cannot resolve on its own.
 ///
@@ -1547,57 +1625,133 @@ fn field(raw: &str, key: &str) -> String {
 /// Turns `{"action":…,"sel":…,"text":…}` into the JS that performs it.
 /// Selector-based on purpose: engine layout coordinates are not trustworthy yet.
 fn action_to_js(raw: &str) -> String {
-    // Values land inside backtick templates below, so escape what a template would
-    // otherwise eat. Decoding is `field`'s job — this used to carry a second, cruder
-    // copy of it that truncated at the first quote and left `\n` literal.
-    let get = |key: &str| -> String {
-        field(raw, key)
-            .replace('\\', "\\\\")
-            .replace('`', "\\`")
-            .replace("${", "\\${")
-    };
-    let (action, sel, text) = (get("action"), get("sel"), get("text"));
+    // Every value goes in as a complete JSON string literal. They used to be
+    // escaped into backtick templates, which still ran any `${...}` inside the
+    // value — and a selector can carry page-authored text. Decoding is
+    // `field`'s job.
+    let action = field(raw, "action");
+    let (sel, text) = (json_str(&field(raw, "sel")), json_str(&field(raw, "text")));
     match action.as_str() {
         "inspect" => format!(
-            "(function(){{var e=document.querySelector(`{sel}`);\
-             if(!e)return JSON.stringify({{sel:`{sel}`,error:'нет элемента'}});\
+            "(function(){{var e=document.querySelector({sel});\
+             if(!e)return JSON.stringify({{sel:{sel},error:'нет элемента'}});\
              var c=getComputedStyle(e),r=e.getBoundingClientRect(),o={{}};\
              {INSPECT_PROPS}.forEach(function(p){{o[p]=String(c[p]);}});\
-             return JSON.stringify({{sel:`{sel}`,\
+             return JSON.stringify({{sel:{sel},\
                rect:[Math.round(r.x),Math.round(r.y),Math.round(r.width),Math.round(r.height)],\
                style:o}});}})()"
         ),
         // The humanized path travels the cursor, dwells, then presses — and mints the
         // events trusted. `element.click()` reports isTrusted=false, which is exactly
-        // what vendor sensors read.
+        // what vendor sensors read. `h` is the humanized-input API `wrap_action`
+        // takes from the engine's capability object.
         "click" => format!(
-            "(function(){{var e=document.querySelector(`{sel}`);if(!e)return 'нет элемента';\
-             var h=({NS_RESOLVE}||{{}}).input;\
+            "(function(){{var e=document.querySelector({sel});if(!e)return 'нет элемента';\
              if(h&&typeof h.clickElement==='function')return h.clickElement(e);\
              e.click();return 'клик (isTrusted=false — humanize не загружен)';}})()"
         ),
         "fill" => format!(
-            "(function(){{var e=document.querySelector(`{sel}`);if(!e)return 'нет элемента';\
-             var h=({NS_RESOLVE}||{{}}).input;\
-             if(h&&typeof h.typeElement==='function')return h.typeElement(e,`{text}`);\
+            "(function(){{var e=document.querySelector({sel});if(!e)return 'нет элемента';\
+             if(h&&typeof h.typeElement==='function')return h.typeElement(e,{text});\
              var p=Object.getOwnPropertyDescriptor(e.constructor.prototype,'value');\
-             if(p&&p.set){{p.set.call(e,`{text}`);}}else{{e.value=`{text}`;}}\
+             if(p&&p.set){{p.set.call(e,{text});}}else{{e.value={text};}}\
              e.dispatchEvent(new Event('input',{{bubbles:true}}));\
-             return 'заполнено (humanize не загружен)';}})()"
+             return 'заполнено (isTrusted=false — humanize не загружен)';}})()"
         ),
-        // Not `text`: that copy is escaped for embedding in the backtick
-        // templates above, and this branch splices the script in directly.
-        // Doubling every backslash turned `/hcaptcha\.com/` into
-        // `/hcaptcha\\.com/` — a regex that matches a literal backslash and so
-        // never fires, silently corrupting any evaluated JS containing an escape.
-        "eval" => field(raw, "text"),
-        other => format!("'неизвестное действие: {other}'"),
+        // Indirect eval of the operator's script, at global scope: it runs as the
+        // page's own code would, and cannot see the capability object the
+        // surrounding `wrap_action` function was handed.
+        "eval" => format!("(0,eval)({text})"),
+        other => format!("'неизвестное действие: ' + {}", json_str(other)),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{serialize_js, PAGE, POINTER_JS};
+    use super::{action_to_js, serialize_js, wrap_action, KEY_JS, PAGE, POINTER_JS};
+
+    #[tokio::test]
+    async fn pointer_click_is_trusted_and_says_so() {
+        let mut page = browser_oxide::Page::from_html(
+            r#"<div id="target" style="width:200px;height:100px"></div><script>
+               globalThis.clicks=[];
+               document.getElementById('target').addEventListener('click',e=>clicks.push(e.isTrusted));
+               </script>"#,
+            None::<browser_oxide::stealth::StealthProfile>,
+        )
+        .await
+        .unwrap();
+        page.evaluate_privileged(&pointer("down", 0.2, 0.5))
+            .unwrap();
+        let status = page.evaluate_privileged(&pointer("up", 0.2, 0.5)).unwrap();
+        assert!(status.ends_with("[trusted]"), "{status}");
+        assert_eq!(page.evaluate("JSON.stringify(clicks)").unwrap(), "[true]");
+    }
+
+    #[tokio::test]
+    async fn keystroke_edits_the_field_with_trusted_events() {
+        let mut page = browser_oxide::Page::from_html(
+            r#"<input id="f"><script>
+               globalThis.seen=[];
+               for (const t of ['keydown','beforeinput','input','keyup'])
+                 document.getElementById('f').addEventListener(t,e=>seen.push(t+':'+e.isTrusted));
+               </script>"#,
+            None::<browser_oxide::stealth::StealthProfile>,
+        )
+        .await
+        .unwrap();
+        page.evaluate("document.getElementById('f').focus()")
+            .unwrap();
+        let key = |phase: &str| {
+            KEY_JS
+                .replace("__SEL__", "\"#f\"")
+                .replace("__KEY__", "\"a\"")
+                .replace("__CODE__", "\"KeyA\"")
+                .replace("__PHASE__", &format!("\"{phase}\""))
+                .replace("__CTRL__", "false")
+                .replace("__ALT__", "false")
+                .replace("__SHIFT__", "false")
+                .replace("__META__", "false")
+        };
+        let down = page.evaluate_privileged(&key("down")).unwrap();
+        assert!(!down.contains("untrusted"), "{down}");
+        page.evaluate_privileged(&key("up")).unwrap();
+        assert_eq!(
+            page.evaluate("document.getElementById('f').value").unwrap(),
+            "a"
+        );
+        assert_eq!(
+            page.evaluate("JSON.stringify(seen)").unwrap(),
+            r#"["keydown:true","beforeinput:true","input:true","keyup:true"]"#
+        );
+    }
+
+    /// A selector is page-influenced text (the mirror builds `:nth-of-type`
+    /// paths from the page's own ids); it must reach `querySelector` as data.
+    #[tokio::test]
+    async fn action_values_are_data_not_code() {
+        let mut page = browser_oxide::Page::from_html(
+            "<div id=x></div>",
+            None::<browser_oxide::stealth::StealthProfile>,
+        )
+        .await
+        .unwrap();
+        for action in ["inspect", "click", "fill"] {
+            let raw = format!(
+                r##"{{"action":"{action}","sel":"#x${{globalThis.pwned=1}}`'\"","text":"${{globalThis.pwned=2}}`"}}"##
+            );
+            let _ = page.evaluate_privileged(&wrap_action(&action_to_js(&raw)));
+        }
+        let raw = r#"{"action":"nope'+(globalThis.pwned=3)+'"}"#;
+        let status = page
+            .evaluate_privileged(&wrap_action(&action_to_js(raw)))
+            .unwrap();
+        assert!(status.starts_with("неизвестное действие: "), "{status}");
+        assert_eq!(
+            page.evaluate("String(globalThis.pwned)").unwrap(),
+            "undefined"
+        );
+    }
 
     #[test]
     fn canvas_substitution_is_not_applied_twice() {
@@ -1611,7 +1765,7 @@ mod tests {
     fn pointer(phase: &str, u: f64, v: f64) -> String {
         POINTER_JS
             .replace("__CANVAS_ID__", "-1")
-            .replace("__SEL__", "#target")
+            .replace("__SEL__", "\"#target\"")
             .replace("__U__", &u.to_string())
             .replace("__V__", &v.to_string())
             .replace("__PHASE__", phase)
@@ -1629,10 +1783,13 @@ mod tests {
         )
         .await
         .unwrap();
-        page.evaluate(&pointer("move", 0.1, 0.5)).unwrap();
-        page.evaluate(&pointer("down", 0.2, 0.5)).unwrap();
-        page.evaluate(&pointer("move", 0.8, 0.5)).unwrap();
-        page.evaluate(&pointer("up", 0.8, 0.5)).unwrap();
+        page.evaluate_privileged(&pointer("move", 0.1, 0.5))
+            .unwrap();
+        page.evaluate_privileged(&pointer("down", 0.2, 0.5))
+            .unwrap();
+        page.evaluate_privileged(&pointer("move", 0.8, 0.5))
+            .unwrap();
+        page.evaluate_privileged(&pointer("up", 0.8, 0.5)).unwrap();
         let events = page.evaluate("JSON.stringify(events)").unwrap();
         assert_eq!(
             events,
@@ -1652,7 +1809,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            page.evaluate(&pointer("move", f64::NAN, 0.5)).unwrap(),
+            page.evaluate_privileged(&pointer("move", f64::NAN, 0.5))
+                .unwrap(),
             "некорректные координаты"
         );
         assert_eq!(page.evaluate("String(moves)").unwrap(), "0");

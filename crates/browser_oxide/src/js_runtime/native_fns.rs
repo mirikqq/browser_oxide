@@ -26,7 +26,6 @@
 //! the class-extends / NoSideEffectsToString leak is structurally gone.
 
 use deno_core::v8;
-use std::collections::HashMap;
 
 pub(crate) const NATIVE_TAG: &str = "__browser_oxide_native__";
 
@@ -47,8 +46,6 @@ pub(crate) const NATIVE_TAG: &str = "__browser_oxide_native__";
 /// uses to tag masked host functions. The V8 API registry symbol from
 /// `v8::Symbol::for_api` is a DIFFERENT registry and will NOT find these tags.
 pub struct IframeRealmStore {
-    pub contexts: HashMap<u32, v8::Global<v8::Context>>,
-    pub globals: HashMap<u32, v8::Global<v8::Object>>,
     pub orig_fp_tostring: Option<v8::Global<v8::Function>>,
     pub native_tag_sym: Option<v8::Global<v8::Symbol>>,
 }
@@ -62,8 +59,6 @@ impl Default for IframeRealmStore {
 impl IframeRealmStore {
     pub fn new() -> Self {
         Self {
-            contexts: HashMap::new(),
-            globals: HashMap::new(),
             orig_fp_tostring: None,
             native_tag_sym: None,
         }
@@ -372,7 +367,7 @@ mod tests {
     /// Window.prototype), and that `create_data_property` on the inner global
     /// creates properties visible from INSIDE the child realm via script eval.
     /// Also tests that calling `set_prototype()` on the proxy (as done by
-    /// `op_create_child_realm`) doesn't change what `get_prototype()` returns.
+    /// a child realm) doesn't change what `get_prototype()` returns.
     #[test]
     fn verify_inner_global_property_visibility() {
         let mut rt = JsRuntime::new(RuntimeOptions::default());
@@ -383,13 +378,13 @@ mod tests {
         {
             let cs = &mut v8::ContextScope::new(scope, child_ctx);
 
-            // Simulate what op_create_child_realm does: set a Window prototype
+            // Simulate a child realm: set a Window prototype
             let window_proto_src = v8::String::new(cs, "(function Window(){}).prototype").unwrap();
             let window_proto_script = v8::Script::compile(cs, window_proto_src, None).unwrap();
             let window_proto_val = window_proto_script.run(cs).unwrap();
 
             let proxy = child_ctx.global(cs);
-            proxy.set_prototype(cs, window_proto_val); // mimic op_create_child_realm
+            proxy.set_prototype(cs, window_proto_val); // mimic a child realm
 
             // Now get inner global via get_prototype (must still be inner global, not window_proto)
             let proto_after = proxy

@@ -19,7 +19,8 @@ async fn sync(page: &mut Page) -> usize {
     let client = browser_oxide::net::HttpClient::new(&profile).expect("client");
     page.rematerialize_iframes("https://example.com/", &client, &profile)
         .await;
-    page.child_frame_ids().len()
+    // Same-origin (srcdoc) frames are realms of the page's isolate (F4).
+    page.frame_realms().len()
 }
 
 async fn blank_page() -> Page {
@@ -87,10 +88,9 @@ async fn rewriting_srcdoc_renavigates_the_frame() {
     // The realm must hold the *new* document. Skipping the rebuild leaves the old
     // one in place, which reads as a frame that ignores every navigation.
     let mut page = page;
+    let realm = page.frame_realms()[0].0;
     let text = page
-        .child_iframe(0)
-        .expect("child")
-        .evaluate("document.getElementById('mark').textContent")
+        .evaluate_in_frame_realm(realm, "document.getElementById('mark').textContent")
         .expect("eval");
     assert_eq!(text, "two", "реалм содержит новый документ");
 }

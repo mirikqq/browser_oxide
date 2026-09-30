@@ -1463,11 +1463,9 @@ async fn e2e_iframe_srcdoc_isolated() {
     .unwrap();
 
     assert_eq!(page.evaluate("scope").unwrap(), "parent");
-    assert_eq!(page.child_iframe_count(), 1);
-    assert_eq!(
-        page.child_iframe(0).unwrap().evaluate("scope").unwrap(),
-        "child"
-    );
+    assert_eq!(page.frame_realms().len(), 1);
+    let r = page.frame_realms()[0].0;
+    assert_eq!(page.evaluate_in_frame_realm(r, "scope").unwrap(), "child");
 }
 
 #[tokio::test]
@@ -1494,8 +1492,10 @@ async fn e2e_iframe_dom_isolated() {
     );
 
     // Child sees child DOM
+    let r = page.frame_realms()[0].0;
     assert_eq!(
-        page.child_iframe(0).unwrap().query_text("#c").unwrap(),
+        page.evaluate_in_frame_realm(r, "document.querySelector('#c').textContent")
+            .unwrap(),
         "child-dom"
     );
 }

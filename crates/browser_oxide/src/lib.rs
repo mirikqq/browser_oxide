@@ -22,6 +22,7 @@ pub mod workers;
 pub mod challenge;
 pub mod classify;
 pub mod csp_collector;
+pub(crate) mod frames;
 pub mod iframe;
 mod page;
 pub mod parallel;

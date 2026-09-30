@@ -191,6 +191,10 @@ pub fn create_runtime(dom: Dom, options: BrowserRuntimeOptions) -> JsRuntime {
 macro_rules! window_bootstrap_js {
     () => {
         concat!(
+            // First: every later bootstrap captures the ops this installs.
+            include_str!("js/realm_prelude.js"),
+            "
+",
             include_str!("js/console_bootstrap.js"),
             "\n",
             include_str!("js/stealth_bootstrap.js"),
@@ -391,7 +395,7 @@ pub fn create_runtime_with_signals(
     // IframeRealmStore: holds genuine child v8::Context instances (one per
     // iframe) so `iframe.contentWindow` returns a real realm instead of a
     // Proxy — matching real Chrome, where contentWindow is a genuine realm.
-    // Store orig_fp_tostring so op_create_child_realm can install the same
+    // Store orig_fp_tostring so frame realms (`realms.rs`) can install the same
     // genuine-native toString into every child context (cross-realm parity).
     {
         let mut realm_store = crate::js_runtime::native_fns::IframeRealmStore::new();
@@ -413,6 +417,10 @@ pub fn create_runtime_with_signals(
             .execute_script("<anonymous>", BOOTSTRAP_JS)
             .expect("bootstrap failed");
     }
+
+    // The prelude's hand-off for frame realms, lifted into Rust before
+    // cleanup and before anything but the engine has run.
+    super::realms::capture_seed(&mut runtime);
 
     // All bootstrap scripts run with name "<anonymous>" so V8 stack
     // frames don't leak browser_oxide-specific tags — real Chrome's
@@ -441,7 +449,7 @@ pub fn create_runtime_with_signals(
         })
     };
 
-    // Store the symbol in IframeRealmStore so op_create_child_realm can
+    // Store the symbol in IframeRealmStore so frame realms (`realms.rs`) can
     // pass it to install_native_fp_tostring for child realm contexts.
     // Two separate blocks avoid double-borrowing `runtime`: the scope borrow
     // must be dropped before the op_state borrow can be taken.
@@ -486,8 +494,12 @@ pub fn create_runtime_with_signals(
     // `at h (<init_script_0>:51:34)`, leaking the script index — which
     // real Chrome would not show. Both index and the `init_script` tag
     // are now scrubbed.
+    //
+    // The privileged capabilities come off the namespace first: an init script
+    // is caller code, and past this point nothing but the engine may hold them.
+    super::privileged::capture(&mut runtime);
     for code in options.init_scripts.iter() {
-        if let Err(e) = runtime.execute_script("<anonymous>", code.clone()) {
+        if let Err(e) = super::privileged::run_init_script(&mut runtime, code) {
             tracing::warn!(error = %e, "init script failed");
         }
     }
@@ -658,6 +670,11 @@ pub fn create_worker_runtime(
     runtime
         .execute_script("<anonymous>", include_str!("js/parity_bootstrap.js"))
         .expect("worker: parity bootstrap (post-cleanup) failed");
+
+    // event_bootstrap published its trusted-event minter here too; nothing in
+    // a worker synthesizes input, but a minter left on the namespace is one
+    // the worker's own script could take.
+    super::privileged::capture(&mut runtime);
 
     runtime
 }

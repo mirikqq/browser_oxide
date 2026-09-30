@@ -43,6 +43,10 @@ impl NavSignal {
 
 #[op2(fast)]
 pub fn op_set_pending_nav(s: &mut OpState) {
+    // A frame realm navigating itself navigates the frame, not the page.
+    if crate::js_runtime::realms::note_frame_navigation(s) {
+        return;
+    }
     let s = s.borrow::<NavSignal>();
     s.raise();
 }

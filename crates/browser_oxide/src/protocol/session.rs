@@ -396,7 +396,10 @@ impl CdpSession {
             // Puppeteer/Playwright drive the page via Input.dispatch* CDP
             // methods. Without these handlers, every user interaction script
             // gets "method not found" — full incompatibility. We translate
-            // each CDP call into a JS-side event dispatch via page.evaluate.
+            // each CDP call into a JS-side event dispatch, run as a
+            // privileged call (`Page::evaluate_privileged`) so the events come
+            // out `isTrusted`, as the ones Chrome's own input pipeline fires
+            // for these methods do.
             //
             // Mouse-path humanization is offered separately via the JS
             // helper `__browserOxide.humanMousePath` (wired to
@@ -464,7 +467,7 @@ impl CdpSession {
 
                         for (i, p) in pts.iter().enumerate() {
                             let script = format!(
-                                "(() => {{ \
+                                "((caps) => {{ const M = (caps && caps.markTrusted) || ((x) => x); \
                                   const props = {{ \
                                     bubbles: true, cancelable: true, composed: true, \
                                     clientX: {x}, clientY: {y}, screenX: {x}, screenY: {y}, \
@@ -476,9 +479,9 @@ impl CdpSession {
                                   const e = new PointerEvent('pointermove', props); \
                                   const m = new MouseEvent('mousemove', props); \
                                   const t = (document.elementFromPoint && document.elementFromPoint({x},{y})) || document.body || document; \
-                                  t.dispatchEvent(e); \
-                                  t.dispatchEvent(m); \
-                                }})()",
+                                  t.dispatchEvent(M(e)); \
+                                  t.dispatchEvent(M(m)); \
+                                }})",
                                 x = p.x,
                                 y = p.y,
                                 pressure = if buttons != 0 { 0.5 } else { 0.0 },
@@ -487,7 +490,7 @@ impl CdpSession {
                                 alt = (modifiers & 1) != 0,
                                 meta = (modifiers & 4) != 0,
                             );
-                            let _ = page.evaluate(&script);
+                            let _ = page.evaluate_privileged(&script);
 
                             // Real-time delay between points (8ms sample rate in model)
                             if i < pts.len() - 1 {
@@ -502,8 +505,26 @@ impl CdpSession {
                             "mouseMoved" => "pointermove",
                             _ => "pointermove",
                         };
+                        // Puppeteer/Playwright's `click()` is exactly a
+                        // `mousePressed` + `mouseReleased` pair at the same
+                        // point — real Chrome's own input pipeline fires
+                        // `click` (as a `PointerEvent`, per spec) and runs
+                        // the target's default action (checkbox toggle,
+                        // form submit, link navigation) as part of handling
+                        // `mouseReleased`. Without this every CDP-driven
+                        // click looked like a no-op press/release with no
+                        // `click` at all.
+                        let click_tail = if event_type == "mouseReleased" {
+                            "const notCancelled = t.dispatchEvent(M(new PointerEvent('click', props))); \
+                             if (notCancelled) { \
+                               const ns = (function(){try{var s=Object.getOwnPropertySymbols(globalThis,1);for(var i=0;i<s.length;i++){var v=globalThis[s[i]];if(v&&v.__bo)return v;}}catch(e){}return null;})(); \
+                               if (ns && typeof ns.activate === 'function') { try { ns.activate(t); } catch (_) {} } \
+                             }"
+                        } else {
+                            ""
+                        };
                         let script = format!(
-                            "(() => {{ \
+                            "((caps) => {{ const M = (caps && caps.markTrusted) || ((x) => x); \
                               const props = {{ \
                                 bubbles: true, cancelable: true, composed: true, \
                                 clientX: {x}, clientY: {y}, screenX: {x}, screenY: {y}, \
@@ -515,16 +536,17 @@ impl CdpSession {
                               const e = new PointerEvent({pointer_type:?}, props); \
                               const m = new MouseEvent({js_event:?}, props); \
                               const t = (document.elementFromPoint && document.elementFromPoint({x},{y})) || document.body || document; \
-                              t.dispatchEvent(e); \
-                              t.dispatchEvent(m); \
-                            }})()",
+                              t.dispatchEvent(M(e)); \
+                              t.dispatchEvent(M(m)); \
+                              {click_tail} \
+                            }})",
                             pressure = if event_type == "mousePressed" || buttons != 0 { 0.5 } else { 0.0 },
                             ctrl = (modifiers & 2) != 0,
                             shift = (modifiers & 8) != 0,
                             alt = (modifiers & 1) != 0,
                             meta = (modifiers & 4) != 0,
                         );
-                        let _ = page.evaluate(&script);
+                        let _ = page.evaluate_privileged(&script);
                     }
 
                     self.last_mouse_x = x;
@@ -562,31 +584,39 @@ impl CdpSession {
                 };
                 if !js_event.is_empty() {
                     let script = format!(
-                        "(() => {{ \
+                        "((caps) => {{ const M = (caps && caps.markTrusted) || ((x) => x); \
                           const e = new KeyboardEvent({js_event:?}, {{ \
                             bubbles: true, cancelable: true, \
                             key: {key:?}, code: {code:?}, \
                             ctrlKey: {ctrl}, shiftKey: {shift}, altKey: {alt}, metaKey: {meta} \
                           }}); \
-                          (document.activeElement || document.body || document).dispatchEvent(e); \
+                          (document.activeElement || document.body || document).dispatchEvent(M(e)); \
                           // For 'char' events, also fire an input event so text fields update.
                           {input_extra} \
-                        }})()",
+                        }})",
                         ctrl = (modifiers & 2) != 0,
                         shift = (modifiers & 8) != 0,
                         alt = (modifiers & 1) != 0,
                         meta = (modifiers & 4) != 0,
-                        input_extra = if event_type == "char" && !text.is_empty() {
+                        // Puppeteer/Playwright's `keyboard.type()` sends ONE
+                        // event per character with `type: 'keyDown'` and a
+                        // non-empty `text` — it does not use CDP's `'char'`
+                        // type at all for normal typing. Gating text
+                        // insertion on `'char'` only meant every
+                        // CDP-driven `page.type()` call inserted nothing.
+                        input_extra = if (event_type == "char" || event_type == "keyDown")
+                            && !text.is_empty()
+                        {
                             format!(
                                 "const ae = document.activeElement; \
                                  if (ae && ('value' in ae)) {{ ae.value = (ae.value || '') + {text:?}; \
-                                 ae.dispatchEvent(new Event('input', {{bubbles: true}})); }}"
+                                 ae.dispatchEvent(M(new Event('input', {{bubbles: true}}))); }}"
                             )
                         } else {
                             String::new()
                         },
                     );
-                    let _ = page.evaluate(&script);
+                    let _ = page.evaluate_privileged(&script);
                 }
                 Ok(serde_json::json!({}))
             }
@@ -610,15 +640,15 @@ impl CdpSession {
 
                         // Fire keydown
                         let kd_script = format!(
-                            "(() => {{ \
+                            "((caps) => {{ const M = (caps && caps.markTrusted) || ((x) => x); \
                               const e = new KeyboardEvent('keydown', {{ \
                                 bubbles: true, cancelable: true, key: {ch:?}, code: 'Key' + {ch:?}.toUpperCase() \
                               }}); \
-                              (document.activeElement || document.body || document).dispatchEvent(e); \
-                            }})()",
+                              (document.activeElement || document.body || document).dispatchEvent(M(e)); \
+                            }})",
                             ch = t.ch
                         );
-                        let _ = page.evaluate(&kd_script);
+                        let _ = page.evaluate_privileged(&kd_script);
 
                         // Dwell time (delay while key is down)
                         tokio::time::sleep(std::time::Duration::from_millis(t.dwell_ms as u64))
@@ -626,24 +656,24 @@ impl CdpSession {
 
                         // Insert character + fire 'input'
                         let script = format!(
-                            "(() => {{ const ae = document.activeElement; \
+                            "((caps) => {{ const M = (caps && caps.markTrusted) || ((x) => x); const ae = document.activeElement; \
                              if (ae && ('value' in ae)) {{ ae.value = (ae.value || '') + {text:?}; \
-                             ae.dispatchEvent(new Event('input', {{bubbles: true}})); }} }})()",
+                             ae.dispatchEvent(M(new Event('input', {{bubbles: true}}))); }} }})",
                             text = t.ch.to_string()
                         );
-                        let _ = page.evaluate(&script);
+                        let _ = page.evaluate_privileged(&script);
 
                         // Fire keyup
                         let ku_script = format!(
-                            "(() => {{ \
+                            "((caps) => {{ const M = (caps && caps.markTrusted) || ((x) => x); \
                               const e = new KeyboardEvent('keyup', {{ \
                                 bubbles: true, cancelable: true, key: {ch:?}, code: 'Key' + {ch:?}.toUpperCase() \
                               }}); \
-                              (document.activeElement || document.body || document).dispatchEvent(e); \
-                            }})()",
+                              (document.activeElement || document.body || document).dispatchEvent(M(e)); \
+                            }})",
                             ch = t.ch
                         );
-                        let _ = page.evaluate(&ku_script);
+                        let _ = page.evaluate_privileged(&ku_script);
                     }
                 }
                 Ok(serde_json::json!({}))

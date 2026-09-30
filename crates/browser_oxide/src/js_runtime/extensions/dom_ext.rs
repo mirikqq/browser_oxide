@@ -2,7 +2,7 @@ use crate::css_values::calc::{resolve_computed_value, resolve_length_to_px};
 use crate::css_values::types::length::CalcContext;
 use crate::dom::node::NodeId;
 use crate::dom::DomElement;
-use crate::js_runtime::native_fns::{install_native_fp_tostring, IframeRealmStore};
+use crate::js_runtime::realms::{op_frame_window, op_incumbent_window, op_realm_switch};
 use crate::js_runtime::state::DomState;
 use crate::js_runtime::utils::tokens_to_string;
 use deno_core::op2;
@@ -1223,6 +1223,11 @@ pub fn op_dom_get_computed_style(
         "direction",
         "visibility",
         "cursor",
+        // Inherited per CSS: a floating `<label style="pointer-events:none">`
+        // over a field passes clicks through its own `<span>` children too.
+        // Missing here, the span reported `auto`, hit-testing landed on it,
+        // and every click on the field underneath read as covered.
+        "pointer-events",
         "list-style-type",
         "list-style-position",
         "list-style-image",
@@ -1526,6 +1531,15 @@ pub fn op_dom_get_base_url(state: &mut OpState) -> String {
         .unwrap_or_else(|| "about:blank".to_string())
 }
 
+/// `localStorage`/`sessionStorage` live with the page's document: every frame
+/// realm is same-origin with the page (see `realms`), and same-origin documents
+/// share their storage — a value a frame stores is one the page reads.
+fn page_storage(
+    state: &mut OpState,
+) -> &mut std::collections::HashMap<String, std::collections::HashMap<String, String>> {
+    crate::js_runtime::realms::page_storage(state)
+}
+
 #[op2]
 #[string]
 pub fn op_dom_storage_get(
@@ -1533,8 +1547,10 @@ pub fn op_dom_storage_get(
     #[string] area: String,
     #[string] key: String,
 ) -> Option<String> {
-    let state = state.borrow::<DomState>();
-    state.storage.get(&area).and_then(|m| m.get(&key)).cloned()
+    page_storage(state)
+        .get(&area)
+        .and_then(|m| m.get(&key))
+        .cloned()
 }
 
 #[op2(fast)]
@@ -1544,24 +1560,21 @@ pub fn op_dom_storage_set(
     #[string] key: String,
     #[string] value: String,
 ) {
-    let state = state.borrow_mut::<DomState>();
-    if let Some(m) = state.storage.get_mut(&area) {
+    if let Some(m) = page_storage(state).get_mut(&area) {
         m.insert(key, value);
     }
 }
 
 #[op2(fast)]
 pub fn op_dom_storage_remove(state: &mut OpState, #[string] area: String, #[string] key: String) {
-    let state = state.borrow_mut::<DomState>();
-    if let Some(m) = state.storage.get_mut(&area) {
+    if let Some(m) = page_storage(state).get_mut(&area) {
         m.remove(&key);
     }
 }
 
 #[op2(fast)]
 pub fn op_dom_storage_clear(state: &mut OpState, #[string] area: String) {
-    let state = state.borrow_mut::<DomState>();
-    if let Some(m) = state.storage.get_mut(&area) {
+    if let Some(m) = page_storage(state).get_mut(&area) {
         m.clear();
     }
 }
@@ -1569,245 +1582,10 @@ pub fn op_dom_storage_clear(state: &mut OpState, #[string] area: String) {
 #[op2]
 #[serde]
 pub fn op_dom_storage_keys(state: &mut OpState, #[string] area: String) -> Vec<String> {
-    let state = state.borrow::<DomState>();
-    state
-        .storage
+    page_storage(state)
         .get(&area)
         .map(|m| m.keys().cloned().collect())
         .unwrap_or_default()
-}
-
-// ──────────────────────────────────────────────────────────────────
-// Child-realm support
-// ──────────────────────────────────────────────────────────────────
-
-/// Window constructor callback — throws per the spec ("Illegal constructor").
-/// Used only to create a real, named `Window` function whose `.name === "Window"`
-/// and whose `.prototype.constructor === Window`. In practice nothing calls
-/// `new Window()`, so the throw body is never reached; we keep it for spec correctness.
-fn _window_ctor_cb(
-    scope: &mut v8::PinScope,
-    _args: v8::FunctionCallbackArguments,
-    mut _rv: v8::ReturnValue,
-) {
-    if let Some(msg) = v8::String::new(scope, "Illegal constructor") {
-        let e = v8::Exception::type_error(scope, msg);
-        scope.throw_exception(e);
-    }
-}
-
-/// Create (or return cached) a genuine `v8::Context` child realm for an iframe's
-/// `contentWindow`.  Returns the child global as a live JS object — NOT a Proxy.
-///
-/// The child context gets:
-/// - Real, realm-distinct native intrinsics (`Object`/`Function`/`Array`/… ≠ parent's)
-///   — matching real Chrome, where contentWindow is a genuine realm, not a Proxy
-///   or a parent alias.
-/// - `[[Prototype]] === Window.prototype` → `cw.constructor.name === "Window"`.
-/// - Genuine-native `Function.prototype.toString` (same API-fn recipe as the main window).
-/// - Standard self-referential globals (`window`, `self`, `globalThis`, `frames`).
-///
-/// JS completes the setup by setting `document`, `location`, `navigator`, `fetch`,
-/// `devicePixelRatio` (accessor), etc. on the returned object.
-#[op2]
-pub fn op_create_child_realm<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    #[smi] realm_id: i32,
-) -> v8::Local<'s, v8::Value> {
-    let rid = realm_id as u32;
-
-    // Access OpState via the isolate-level state (public, stable in 0.311).
-    // op_state_from takes &Isolate; HandleScope auto-derefs there.
-    let op_state_rc = JsRuntime::op_state_from(scope);
-
-    // Fast path: cached realm — return the previously-created global.
-    {
-        let op_state = op_state_rc.borrow();
-        if let Some(store) = op_state.try_borrow::<IframeRealmStore>() {
-            if let Some(global) = store.globals.get(&rid) {
-                return v8::Local::new(scope, global).into();
-            }
-        }
-    }
-
-    // Clone the `orig_fp_tostring` and `native_tag_sym` Globals into new
-    // handles BEFORE entering the child ContextScope (requires parent scope).
-    let orig_fpt: Option<v8::Global<v8::Function>>;
-    let native_tag_sym: Option<v8::Global<v8::Symbol>>;
-    {
-        let op_state = op_state_rc.borrow();
-        if let Some(store) = op_state.try_borrow::<IframeRealmStore>() {
-            orig_fpt = store.orig_fp_tostring.as_ref().map(|g| {
-                let local = v8::Local::new(scope, g);
-                v8::Global::new(scope, local)
-            });
-            native_tag_sym = store.native_tag_sym.as_ref().map(|g| {
-                let local = v8::Local::new(scope, g);
-                v8::Global::new(scope, local)
-            });
-        } else {
-            orig_fpt = None;
-            native_tag_sym = None;
-        }
-    }
-
-    // Create the child context (vanilla v8::Context — full native intrinsics).
-    let child_ctx = v8::Context::new(scope, v8::ContextOptions::default());
-
-    // Copy parent's security token to child so V8 treats the contexts as
-    // same-origin (about:blank inherits the parent origin in Chrome).
-    // Without this, accessing child-realm objects from the parent scope
-    // throws "TypeError: no access" via V8's cross-context security check.
-    let parent_ctx = scope.get_current_context();
-    let parent_tok = parent_ctx.get_security_token(scope);
-    child_ctx.set_security_token(parent_tok);
-
-    // Set up the child context.  Returns None on any fatal V8 allocation
-    // failure (extremely rare); the outer code falls back to undefined.
-    let child_global_g: Option<v8::Global<v8::Object>> = {
-        let cs = &mut v8::ContextScope::new(scope, child_ctx);
-
-        // Build a real `Window` function (FunctionTemplate → native `[native code]`)
-        // so the child global is typed: `constructor.name === "Window"`.
-        let window_tmpl = v8::FunctionTemplate::new(cs, _window_ctor_cb);
-        if let Some(n) = v8::String::new(cs, "Window") {
-            window_tmpl.set_class_name(n);
-        }
-        let window_fn = match window_tmpl.get_function(cs) {
-            Some(f) => f,
-            None => return v8::undefined(cs).into(),
-        };
-        if let Some(n) = v8::String::new(cs, "Window") {
-            window_fn.set_name(n);
-        }
-
-        // child_global.[[Prototype]] = Window.prototype
-        // → child_global.constructor.name === "Window"
-        if let Some(pk) = v8::String::new(cs, "prototype") {
-            if let Some(proto_val) = window_fn.get(cs, pk.into()) {
-                let child_global = child_ctx.global(cs);
-                child_global.set_prototype(cs, proto_val);
-            }
-        }
-
-        let child_global = child_ctx.global(cs);
-
-        // Expose Window on child global (scripts may read `contentWindow.Window`).
-        if let Some(k) = v8::String::new(cs, "Window") {
-            child_global.set(cs, k.into(), window_fn.into());
-        }
-
-        // Standard self-referential globals (all point to child_global).
-        for key in &["window", "self", "globalThis", "frames"] {
-            if let Some(k) = v8::String::new(cs, key) {
-                child_global.set(cs, k.into(), child_global.into());
-            }
-        }
-        // length = 0  (avoid borrow-twice by staging the value first)
-        if let Some(k) = v8::String::new(cs, "length") {
-            let zero = v8::Integer::new(cs, 0);
-            child_global.set(cs, k.into(), zero.into());
-        }
-        // opener = null
-        if let Some(k) = v8::String::new(cs, "opener") {
-            let null = v8::null(cs);
-            child_global.set(cs, k.into(), null.into());
-        }
-
-        // Install genuine-native Function.prototype.toString in child realm.
-        // Closes the [[SourceText]] leak for child-realm functions too.
-        // Pass native_tag_sym (JS global registry) so tagged host fns
-        // in the child realm stringify correctly via the Array-data path.
-        if let Some(ref orig) = orig_fpt {
-            install_native_fp_tostring(cs, orig, native_tag_sym.as_ref());
-        }
-
-        Some(v8::Global::new(cs, child_global))
-    };
-
-    let child_global_g = match child_global_g {
-        Some(g) => g,
-        None => return v8::undefined(scope).into(),
-    };
-
-    // Build Local from Global BEFORE moving Global into the store.
-    let local: v8::Local<'s, v8::Value> = v8::Local::new(scope, &child_global_g).into();
-
-    // Persist context (keeps it alive) and cache global in OpState.
-    {
-        let mut op_state = op_state_rc.borrow_mut();
-        if let Some(store) = op_state.try_borrow_mut::<IframeRealmStore>() {
-            store
-                .contexts
-                .insert(rid, v8::Global::new(scope, child_ctx));
-            store.globals.insert(rid, child_global_g);
-        }
-    }
-
-    local
-}
-
-/// Set a property on the INNER GLOBAL of a child realm.
-///
-/// The global proxy's own property dict is NOT visible to code running inside
-/// the child realm (which reads from the inner global's scope chain). Setting
-/// on the proxy via `proxy.set()` from Rust only writes to the proxy's own
-/// Two-path write to guarantee visibility from both inside and outside the realm:
-///
-/// 1. `create_data_property` on the inner global (the JSGlobalObject behind the
-///    GlobalProxy): makes the property an own property of the inner global, so
-///    scope-chain lookups from scripts running INSIDE the realm find it.
-///
-/// 2. `proxy.set()` on the GlobalProxy: puts the property in the proxy's own
-///    dictionary, so cross-context reads from the parent (`cw.screen`) find it.
-///
-/// Both paths are necessary: V8's API `Object::Set()` on a GlobalProxy writes to
-/// the proxy's own dict (not the inner global), so scope-chain lookups inside the
-/// realm miss it. Conversely, `create_data_property` on the inner global is NOT
-/// reachable from a cross-context `proxy.property` read (the proxy's own dict is
-/// checked first and exclusively for cross-context callers without the interceptor).
-#[op2]
-pub fn op_set_child_realm_prop<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    #[smi] realm_id: i32,
-    key: v8::Local<v8::Value>,
-    value: v8::Local<v8::Value>,
-) -> v8::Local<'s, v8::Value> {
-    let rid = realm_id as u32;
-    let op_state_rc = JsRuntime::op_state_from(scope);
-
-    let child_ctx_g: Option<v8::Global<v8::Context>> = {
-        let op_state = op_state_rc.borrow();
-        op_state.try_borrow::<IframeRealmStore>().and_then(|store| {
-            store.contexts.get(&rid).map(|g| {
-                let local = v8::Local::new(scope, g);
-                v8::Global::new(scope, local)
-            })
-        })
-    };
-    let child_ctx_g = match child_ctx_g {
-        Some(g) => g,
-        None => return v8::undefined(scope).into(),
-    };
-
-    let child_ctx = v8::Local::new(scope, &child_ctx_g);
-    let cs = &mut v8::ContextScope::new(scope, child_ctx);
-    let child_proxy = child_ctx.global(cs);
-
-    // Path 1: inner global own property (inside-realm scope chain visibility).
-    if let Some(inner) = child_proxy
-        .get_prototype(cs)
-        .and_then(|p| v8::Local::<v8::Object>::try_from(p).ok())
-    {
-        if let Ok(k) = v8::Local::<v8::Name>::try_from(key) {
-            inner.create_data_property(cs, k, value);
-        }
-    }
-
-    // Path 2: proxy own property (cross-context parent-side visibility).
-    child_proxy.set(cs, key, value);
-
-    v8::undefined(cs).into()
 }
 
 /// Run a dynamically inserted classic script under its own URL.
@@ -1819,6 +1597,11 @@ pub fn op_set_child_realm_prop<'s>(
 /// Compiling with a `ScriptOrigin` gives the frames the script's URL, exactly
 /// as the document's own scripts already get from `execute_script_with_name`.
 ///
+/// The script runs in the document that inserted it: an op runs in the page's
+/// context whoever calls it, so a script a same-origin frame inserts is
+/// compiled in that frame's realm (the active one — see `realms`), not the
+/// page's.
+///
 /// Exceptions propagate to the caller, as they do out of `eval`.
 #[op2(nofast, reentrant)]
 pub fn op_run_classic_script<'s>(
@@ -1826,12 +1609,19 @@ pub fn op_run_classic_script<'s>(
     #[string] code: String,
     #[string] url: String,
 ) {
-    let Some(src) = v8::String::new(scope, &code) else {
+    let op_state = JsRuntime::op_state_from(scope);
+    let realm_ctx = crate::js_runtime::realms::active_context(scope, &op_state);
+    let ctx = match realm_ctx {
+        Some(c) => v8::Local::new(scope, &c),
+        None => scope.get_current_context(),
+    };
+    let cs = &mut v8::ContextScope::new(scope, ctx);
+    let Some(src) = v8::String::new(cs, &code) else {
         return;
     };
-    let origin = v8::String::new(scope, &url).map(|name| {
+    let origin = v8::String::new(cs, &url).map(|name| {
         v8::ScriptOrigin::new(
-            scope,
+            cs,
             name.into(),
             0,
             0,
@@ -1844,68 +1634,9 @@ pub fn op_run_classic_script<'s>(
             None,
         )
     });
-    if let Some(script) = v8::Script::compile(scope, src, origin.as_ref()) {
-        script.run(scope);
+    if let Some(script) = v8::Script::compile(cs, src, origin.as_ref()) {
+        script.run(cs);
     }
-}
-
-/// Execute a JavaScript string inside a child realm's context.
-///
-/// Compiles and runs `code` in the child context scope. Returns the result
-/// (coerced to string) or `undefined` on compile/runtime error. Used for
-/// cases where `op_set_child_realm_prop` cannot express the required
-/// descriptor shape (e.g. accessor properties with a getter function).
-///
-/// `reentrant`: the code we run is page script, and it calls ops of its own —
-/// a srcdoc frame that runs `querySelector` re-enters `op_dom_query_selector`
-/// from inside this one. Without the marker deno_core aborts the process
-/// (non-unwinding panic), so it is not optional.
-#[op2(reentrant)]
-#[string]
-pub fn op_eval_in_child_realm<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    #[smi] realm_id: i32,
-    #[string] code: String,
-) -> Option<String> {
-    let rid = realm_id as u32;
-    let op_state_rc = JsRuntime::op_state_from(scope);
-
-    let child_ctx_g: Option<v8::Global<v8::Context>> = {
-        let op_state = op_state_rc.borrow();
-        op_state.try_borrow::<IframeRealmStore>().and_then(|store| {
-            store.contexts.get(&rid).map(|g| {
-                let local = v8::Local::new(scope, g);
-                v8::Global::new(scope, local)
-            })
-        })
-    };
-    let child_ctx_g = child_ctx_g?;
-
-    let child_ctx = v8::Local::new(scope, &child_ctx_g);
-    let cs = &mut v8::ContextScope::new(scope, child_ctx);
-
-    let src = v8::String::new(cs, &code)?;
-    // A swallowed compile/runtime error here means the child realm is
-    // silently under-populated (a missing shim can make site scripts
-    // bail or hit an undefined receiver). Surface it to an opt-in
-    // diagnostic channel
-    // (`BROWSER_OXIDE_DEBUG_CHILD_REALM`) WITHOUT changing behavior: still
-    // best-effort runs the script, still returns `None`.
-    v8::tc_scope!(let tc, cs);
-    let ok = match v8::Script::compile(tc, src, None) {
-        Some(script) => script.run(tc).is_some(),
-        None => false,
-    };
-    if !ok && std::env::var("BROWSER_OXIDE_DEBUG_CHILD_REALM").is_ok() {
-        let msg = tc
-            .exception()
-            .and_then(|e| e.to_string(tc))
-            .map(|s| s.to_rust_string_lossy(tc))
-            .unwrap_or_else(|| "<no exception object>".to_string());
-        let snippet: String = code.chars().take(160).collect();
-        eprintln!("[child-realm:{rid}] eval error: {msg} | code[..160]={snippet:?}");
-    }
-    None
 }
 
 deno_core::extension!(
@@ -1957,6 +1688,9 @@ deno_core::extension!(
         op_dom_refresh_stylesheets,
         op_iframe_post_to_child,
         op_iframe_post_to_parent,
+        op_realm_switch,
+        op_frame_window,
+        op_incumbent_window,
         op_iframe_take_child_messages,
         op_iframe_take_parent_messages,
         op_dom_get_stylesheet_count,
@@ -1970,9 +1704,6 @@ deno_core::extension!(
         op_dom_storage_remove,
         op_dom_storage_clear,
         op_dom_storage_keys,
-        op_create_child_realm,
-        op_set_child_realm_prop,
-        op_eval_in_child_realm,
         op_run_classic_script,
     ],
 );

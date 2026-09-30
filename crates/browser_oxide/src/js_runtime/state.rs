@@ -57,6 +57,11 @@ pub struct DomState {
     /// the affected realms; whatever is still in the tree is then rebuilt from its
     /// current attributes.
     pub invalidated_frames: Vec<u32>,
+    /// `<iframe>` node ids whose document the engine could not build — a
+    /// failed fetch, a CSP `frame-src` refusal — so the page's automatic frame
+    /// settling does not refetch it on every turn. A node leaves the set when
+    /// its browsing context is invalidated. Per document: node ids are.
+    pub frame_load_failures: std::collections::HashSet<u32>,
     pub stealth_profile: Option<crate::stealth::StealthProfile>,
     /// Active Content Security Policy. Built from the response
     /// `Content-Security-Policy` header(s) plus any
@@ -120,6 +125,7 @@ impl DomState {
             messages_to_children: Vec::new(),
             messages_to_parent: Vec::new(),
             invalidated_frames: Vec::new(),
+            frame_load_failures: std::collections::HashSet::new(),
             stealth_profile: None,
             csp_policy: None,
             csp_origin: None,
