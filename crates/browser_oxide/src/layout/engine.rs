@@ -1,14 +1,16 @@
-use crate::style::{StyleTree, Stylist};
 use crate::css_values::property::{CssValue, PropertyId};
 use crate::css_values::types::display::{Display, Position};
 use crate::dom::node::{NodeData, NodeId};
 use crate::dom::Dom;
+use crate::layout::full::FullLayout;
 #[cfg(feature = "paint")]
 use crate::layout::paint_tree::PaintStyle;
 use crate::layout::query::DOMRect;
 use crate::layout::resolve::ResolveContext;
 use crate::layout::style_map::computed_to_taffy;
 use crate::layout::viewport::Viewport;
+use crate::layout::LayoutMode;
+use crate::style::{StyleTree, Stylist};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use taffy::prelude::*;
@@ -33,7 +35,7 @@ pub struct TextBox {
 /// Advance width is approximated at 0.6em per character and the line box at
 /// 1.2em, which is close enough for layout purposes; what matters is that the
 /// run *wraps* rather than growing without bound.
-fn measure_text(
+pub(crate) fn measure_text(
     known: taffy::Size<Option<f32>>,
     available: taffy::Size<AvailableSpace>,
     _node: taffy::NodeId,
@@ -78,6 +80,11 @@ pub struct LayoutEngine {
     pub(super) tree: TaffyTree<TextBox>,
     pub(super) dom_to_taffy: HashMap<u32, taffy::NodeId>,
     viewport: Viewport,
+    mode: LayoutMode,
+    /// The platform the profile claims, which picks the fonts text is measured in.
+    os_name: String,
+    /// The result of the last `Full` layout; `None` in `Legacy` mode.
+    pub(super) full: Option<FullLayout>,
     dirty: bool,
     /// Bumped on every mutation that sets `dirty`, and never reset by
     /// `compute()`. `dirty` alone can't back an external cache: `compute()`
@@ -130,6 +137,9 @@ impl LayoutEngine {
             #[cfg(feature = "paint")]
             paint_styles: HashMap::new(),
             viewport,
+            mode: crate::layout::default_mode(),
+            os_name: "macOS".to_string(),
+            full: None,
             dirty: true,
             dirty_epoch: 0,
             root_taffy: None,
@@ -151,6 +161,26 @@ impl LayoutEngine {
     pub fn set_viewport(&mut self, viewport: Viewport) {
         self.viewport = viewport;
         self.set_dirty();
+    }
+
+    pub fn set_os_name(&mut self, os_name: &str) {
+        if self.os_name != os_name {
+            self.os_name = os_name.to_string();
+            self.set_dirty();
+        }
+    }
+
+    pub fn mode(&self) -> LayoutMode {
+        self.mode
+    }
+
+    /// Switch between the legacy and the full layout. Everything laid out so far
+    /// is recomputed on the next query.
+    pub fn set_mode(&mut self, mode: LayoutMode) {
+        if self.mode != mode {
+            self.mode = mode;
+            self.set_dirty();
+        }
     }
 
     /// Install the document's style rules. Marks layout dirty: geometry computed
@@ -182,6 +212,11 @@ impl LayoutEngine {
 
     /// Compute layout for the entire DOM tree.
     pub fn compute(&mut self, dom: &Dom) {
+        if self.mode == LayoutMode::Full {
+            self.compute_full(dom);
+            return;
+        }
+        self.full = None;
         // Clear previous tree
         self.tree = TaffyTree::new();
         self.dom_to_taffy.clear();
@@ -223,6 +258,32 @@ impl LayoutEngine {
         self.dirty = false;
     }
 
+    fn compute_full(&mut self, dom: &Dom) {
+        #[cfg(feature = "paint")]
+        self.paint_styles.clear();
+        self.style_tree(dom);
+        let Some(styles) = self.styles.take() else {
+            return;
+        };
+        #[cfg(feature = "paint")]
+        let paint_styles = &mut self.paint_styles;
+        let layout = FullLayout::compute(
+            dom,
+            &styles,
+            self.viewport,
+            &self.os_name,
+            |id, computed| {
+                #[cfg(feature = "paint")]
+                paint_styles.insert(id.to_raw(), PaintStyle::from_computed(computed));
+                #[cfg(not(feature = "paint"))]
+                let _ = (id, computed);
+            },
+        );
+        self.styles = Some(styles);
+        self.full = Some(layout);
+        self.dirty = false;
+    }
+
     /// The document's computed styles, recomputed only if something changed
     /// since they were last computed. Needs no layout.
     pub fn style_tree(&mut self, dom: &Dom) -> &StyleTree {
@@ -250,6 +311,37 @@ impl LayoutEngine {
     pub fn get_bounding_rect(&mut self, dom: &Dom, node_id: NodeId) -> DOMRect {
         self.ensure_computed(dom);
 
+        if let Some(full) = &self.full {
+            let Some(&n) = full.dom_to_node.get(&node_id.to_raw()) else {
+                let rects = full.inline_rects(node_id.to_raw());
+                let Some(first) = rects.first() else {
+                    return DOMRect::default();
+                };
+                let (mut x0, mut y0) = (first[0], first[1]);
+                let (mut x1, mut y1) = (first[0] + first[2], first[1] + first[3]);
+                for r in &rects[1..] {
+                    x0 = x0.min(r[0]);
+                    y0 = y0.min(r[1]);
+                    x1 = x1.max(r[0] + r[2]);
+                    y1 = y1.max(r[1] + r[3]);
+                }
+                return DOMRect::new(
+                    f64::from(x0),
+                    f64::from(y0),
+                    f64::from(x1 - x0),
+                    f64::from(y1 - y0),
+                );
+            };
+            let size = full.tree.nodes[n].layout.size;
+            let (x, y) = full.absolute_position(n);
+            return DOMRect::new(
+                f64::from(x),
+                f64::from(y),
+                f64::from(size.width),
+                f64::from(size.height),
+            );
+        }
+
         // Accumulate absolute position by walking up the taffy tree
         let taffy_id = match self.dom_to_taffy.get(&node_id.to_raw()) {
             Some(id) => *id,
@@ -271,6 +363,30 @@ impl LayoutEngine {
             layout.size.width as f64,
             layout.size.height as f64,
         )
+    }
+
+    /// One rectangle per line box the node occupies: a box of its own has one, an
+    /// inline element that wraps has one for each line, and an element with no box
+    /// has none. `Legacy` always reports the one bounding rectangle.
+    pub fn get_client_rects(&mut self, dom: &Dom, node_id: NodeId) -> Vec<DOMRect> {
+        self.ensure_computed(dom);
+        if let Some(full) = &self.full {
+            if !full.dom_to_node.contains_key(&node_id.to_raw()) {
+                return full
+                    .client_rects(dom, node_id)
+                    .into_iter()
+                    .map(|r| {
+                        DOMRect::new(
+                            f64::from(r[0]),
+                            f64::from(r[1]),
+                            f64::from(r[2]),
+                            f64::from(r[3]),
+                        )
+                    })
+                    .collect();
+            }
+        }
+        vec![self.get_bounding_rect(dom, node_id)]
     }
 
     /// Get offsetWidth (width including padding + border).
@@ -446,6 +562,16 @@ impl LayoutEngine {
                 }
                 self.css_position.insert(node_id.to_raw(), position);
                 let display = match computed.get(&PropertyId::Display) {
+                    // These did not parse before, and the legacy layout keeps
+                    // treating them as the initial `inline`.
+                    Some(CssValue::Display(
+                        Display::TableRowGroup
+                        | Display::TableHeaderGroup
+                        | Display::TableFooterGroup
+                        | Display::TableColumn
+                        | Display::TableColumnGroup
+                        | Display::TableCaption,
+                    )) => Display::Inline,
                     Some(CssValue::Display(d)) => *d,
                     _ => Display::Inline,
                 };
@@ -573,6 +699,21 @@ impl LayoutEngine {
     }
 
     fn taffy_size(&self, node_id: NodeId) -> (f64, f64) {
+        if let Some(full) = &self.full {
+            return full
+                .dom_to_node
+                .get(&node_id.to_raw())
+                .map(|&n| {
+                    let size = full.tree.nodes[n].layout.size;
+                    (
+                        crate::layout::layout_unit::LayoutUnit::from_taffy_f32(size.width)
+                            .to_f64_px(),
+                        crate::layout::layout_unit::LayoutUnit::from_taffy_f32(size.height)
+                            .to_f64_px(),
+                    )
+                })
+                .unwrap_or((0.0, 0.0));
+        }
         match self.dom_to_taffy.get(&node_id.to_raw()) {
             Some(taffy_id) => match self.tree.layout(*taffy_id) {
                 Ok(layout) => (
@@ -588,6 +729,19 @@ impl LayoutEngine {
     }
 
     fn taffy_position(&self, node_id: NodeId) -> (f64, f64) {
+        if let Some(full) = &self.full {
+            return full
+                .dom_to_node
+                .get(&node_id.to_raw())
+                .map(|&n| {
+                    let at = full.tree.nodes[n].layout.location;
+                    (
+                        crate::layout::layout_unit::LayoutUnit::from_taffy_f32(at.x).to_f64_px(),
+                        crate::layout::layout_unit::LayoutUnit::from_taffy_f32(at.y).to_f64_px(),
+                    )
+                })
+                .unwrap_or((0.0, 0.0));
+        }
         match self.dom_to_taffy.get(&node_id.to_raw()) {
             Some(taffy_id) => match self.tree.layout(*taffy_id) {
                 Ok(layout) => (

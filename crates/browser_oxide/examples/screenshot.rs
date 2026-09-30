@@ -1,6 +1,9 @@
 //! Render a page to a PNG with the engine's own painter.
 //!
-//!   cargo run --release -p browser_oxide --features paint --example screenshot -- <url|file.html> [out.png] [--full]
+//!   cargo run --release -p browser_oxide --features paint --example screenshot -- <url|file.html> [out.png] [--full] [--font file.ttf]...
+//!
+//! `--font` adds a fallback face for characters the bundled fonts lack (CJK,
+//! colour emoji); the engine does not read font files itself.
 //!
 //! The picture is drawn from the engine's layout, not by a browser, so it shows
 //! what the engine believes about the page — gaps included. See docs/GUI_PLAN.md.
@@ -13,6 +16,17 @@ fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let full_page = args.iter().any(|a| a == "--full");
     args.retain(|a| a != "--full");
+    while let Some(i) = args.iter().position(|a| a == "--font") {
+        args.remove(i);
+        if i < args.len() {
+            let path = args.remove(i);
+            let data = std::fs::read(&path).expect("read font");
+            assert!(
+                browser_oxide::text::fallback::register_fallback_face(data, 0),
+                "not a font: {path}"
+            );
+        }
+    }
     let target = args
         .first()
         .cloned()
@@ -22,6 +36,7 @@ fn main() {
         .cloned()
         .unwrap_or_else(|| "screenshot.png".to_string());
 
+    browser_oxide::layout::set_default_mode(browser_oxide::layout::LayoutMode::Full);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

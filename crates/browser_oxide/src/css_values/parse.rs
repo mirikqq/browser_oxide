@@ -42,7 +42,8 @@ pub fn parse_property(
     let name_lower = name.to_ascii_lowercase();
 
     // Shorthands that expand through the longhand parsers.
-    if let Some(expanded) = crate::css_values::shorthand::expand(&name_lower, value_trimmed, important)
+    if let Some(expanded) =
+        crate::css_values::shorthand::expand(&name_lower, value_trimmed, important)
     {
         return expanded;
     }
@@ -89,11 +90,17 @@ pub fn parse_property(
         "flex-wrap" => parse_flex_wrap(value_trimmed)?,
         "flex-grow" | "flex-shrink" => parse_number(value_trimmed)?,
         "flex-basis" => parse_length_percentage_auto(value_trimmed)?,
+        "grid-template-columns"
+        | "grid-template-rows"
+        | "border-collapse"
+        | "border-spacing"
+        | "vertical-align" => CssValue::CustomValue(component_values_to_string(value_trimmed)),
         "align-items" | "align-self" | "align-content" | "justify-content" | "justify-items"
         | "justify-self" => parse_alignment(value_trimmed)?,
         "row-gap" | "column-gap" => parse_length_percentage(value_trimmed)?,
-        "border-top-color" | "border-right-color" | "border-bottom-color"
-        | "border-left-color" => parse_color(value_trimmed)?,
+        "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => {
+            parse_color(value_trimmed)?
+        }
         "font-size" => parse_font_size(value_trimmed)?,
         "font-family" => parse_font_family(value_trimmed)?,
         "font-weight" => parse_font_weight(value_trimmed)?,
@@ -159,6 +166,12 @@ fn parse_display(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
         "contents" => Display::Contents,
         "table-row" => Display::TableRow,
         "table-cell" => Display::TableCell,
+        "table-row-group" => Display::TableRowGroup,
+        "table-header-group" => Display::TableHeaderGroup,
+        "table-footer-group" => Display::TableFooterGroup,
+        "table-column" => Display::TableColumn,
+        "table-column-group" => Display::TableColumnGroup,
+        "table-caption" => Display::TableCaption,
         _ => {
             return Err(ValueError::InvalidValue(format!(
                 "invalid display: {}",

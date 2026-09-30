@@ -22,6 +22,7 @@ use crate::css_values::types::length::Length;
 use crate::dom::node::{NodeData, NodeId};
 use crate::dom::Dom;
 use crate::layout::engine::LayoutEngine;
+use crate::layout::full::ifc::{Frag, FragKind};
 
 /// A colour as straight (non-premultiplied) RGBA bytes.
 pub type Rgba = [u8; 4];
@@ -33,6 +34,8 @@ pub struct PaintStyle {
     pub background: Option<Rgba>,
     pub color: Rgba,
     pub font_size: f32,
+    /// `font-family` as a canvas `font` shorthand would take it.
+    pub font_family: String,
     pub bold: bool,
     pub italic: bool,
     pub hidden: bool,
@@ -106,6 +109,7 @@ impl PaintStyle {
             background,
             color,
             font_size,
+            font_family: crate::layout::full::font::family_list(c),
             bold,
             italic,
             hidden,
@@ -129,11 +133,15 @@ pub struct PaintBox {
     pub tag: Option<String>,
     /// The text of a text-node run, whitespace as authored.
     pub text: Option<String>,
+    /// Set for a line of text layout already broke: the absolute y of its
+    /// baseline. The painter draws it as it is instead of wrapping it again.
+    pub text_baseline: Option<f32>,
     pub background: Option<Rgba>,
     /// Text colour.
     pub color: Rgba,
     /// Font size in px.
     pub font_size: f32,
+    pub font_family: String,
     pub bold: bool,
     pub italic: bool,
     /// Border widths, top / right / bottom / left.
@@ -174,15 +182,54 @@ impl LayoutEngine {
     /// not honoured yet.
     pub fn paint_boxes(&mut self, dom: &Dom) -> Vec<PaintBox> {
         self.ensure_computed(dom);
-        let Some(root) = self.root_taffy else {
-            return Vec::new();
-        };
-        let dom_of: HashMap<taffy::NodeId, u32> = self
+        if let Some(full) = self.full.as_ref() {
+            let dom_of = full
+                .dom_to_node
+                .iter()
+                .map(|(d, n)| (taffy::NodeId::from(*n), *d))
+                .collect();
+            return self.walk_paint(
+                dom,
+                full.root.map(taffy::NodeId::from),
+                dom_of,
+                |id| Some(full.tree.nodes[usize::from(id)].layout),
+                |id| {
+                    full.tree.nodes[usize::from(id)]
+                        .children
+                        .iter()
+                        .map(|c| taffy::NodeId::from(*c))
+                        .collect()
+                },
+                |id| full.tree.nodes[usize::from(id)].frags.clone(),
+            );
+        }
+        let dom_of = self
             .dom_to_taffy
             .iter()
             .map(|(dom_id, taffy_id)| (*taffy_id, *dom_id))
             .collect();
+        self.walk_paint(
+            dom,
+            self.root_taffy,
+            dom_of,
+            |id| self.tree.layout(id).copied().ok(),
+            |id| self.tree.children(id).unwrap_or_default(),
+            |_| Vec::new(),
+        )
+    }
 
+    fn walk_paint(
+        &self,
+        dom: &Dom,
+        root: Option<taffy::NodeId>,
+        dom_of: HashMap<taffy::NodeId, u32>,
+        layout_of: impl Fn(taffy::NodeId) -> Option<taffy::Layout>,
+        children_of: impl Fn(taffy::NodeId) -> Vec<taffy::NodeId>,
+        frags_of: impl Fn(taffy::NodeId) -> Vec<Frag>,
+    ) -> Vec<PaintBox> {
+        let Some(root) = root else {
+            return Vec::new();
+        };
         let base = Inherited {
             opacity: 1.0,
             clip: None,
@@ -191,7 +238,7 @@ impl LayoutEngine {
         // (taffy node, parent's absolute origin, inherited state)
         let mut stack = vec![(root, (0.0f32, 0.0f32), base)];
         while let Some((tid, (px, py), inh)) = stack.pop() {
-            let Ok(layout) = self.tree.layout(tid).copied() else {
+            let Some(layout) = layout_of(tid) else {
                 continue;
             };
             let (x, y) = (px + layout.location.x, py + layout.location.y);
@@ -216,9 +263,11 @@ impl LayoutEngine {
                                 height: h,
                                 tag: Some(elem.name.local.to_ascii_lowercase()),
                                 text: None,
+                                text_baseline: None,
                                 background: style.background,
                                 color: style.color,
                                 font_size: style.font_size,
+                                font_family: style.font_family.clone(),
                                 bold: style.bold,
                                 italic: style.italic,
                                 border: [
@@ -243,9 +292,8 @@ impl LayoutEngine {
                     }
                     NodeData::Text(text) => {
                         // A text run is painted in its parent's style.
-                        if let Some(style) = n
-                            .parent
-                            .and_then(|p| self.paint_styles.get(&p.to_raw()))
+                        if let Some(style) =
+                            n.parent.and_then(|p| self.paint_styles.get(&p.to_raw()))
                         {
                             out.push(PaintBox {
                                 node,
@@ -255,9 +303,11 @@ impl LayoutEngine {
                                 height: h,
                                 tag: None,
                                 text: Some(text.to_string()),
+                                text_baseline: None,
                                 background: None,
                                 color: style.color,
                                 font_size: style.font_size,
+                                font_family: style.font_family.clone(),
                                 bold: style.bold,
                                 italic: style.italic,
                                 border: [0.0; 4],
@@ -272,10 +322,70 @@ impl LayoutEngine {
                 }
             }
 
-            let Ok(children) = self.tree.children(tid) else {
-                continue;
-            };
-            for child in children.into_iter().rev() {
+            // Inline content: the boxes of inline elements first, so their
+            // backgrounds sit under the text, then the lines of text.
+            let mut frags = frags_of(tid);
+            frags.sort_by_key(|f| f.kind == FragKind::Text);
+            for f in frags {
+                let Some(style) = self.paint_styles.get(&f.owner) else {
+                    continue;
+                };
+                let (fx, fy) = (x + f.rect[0], y + f.rect[1]);
+                match f.kind {
+                    FragKind::Box => {
+                        let Some(elem) = dom
+                            .get(NodeId::from_raw(f.dom))
+                            .and_then(|n| n.as_element())
+                        else {
+                            continue;
+                        };
+                        out.push(PaintBox {
+                            node: NodeId::from_raw(f.dom),
+                            x: fx,
+                            y: fy,
+                            width: f.rect[2],
+                            height: f.rect[3],
+                            tag: Some(elem.name.local.to_ascii_lowercase()),
+                            text: None,
+                            text_baseline: None,
+                            background: style.background,
+                            color: style.color,
+                            font_size: style.font_size,
+                            font_family: style.font_family.clone(),
+                            bold: style.bold,
+                            italic: style.italic,
+                            border: f.border,
+                            border_color: style.border_color,
+                            visible: !style.hidden,
+                            opacity: inh.opacity * style.opacity,
+                            clip: inh.clip,
+                        });
+                    }
+                    FragKind::Text => out.push(PaintBox {
+                        node: NodeId::from_raw(f.dom),
+                        x: fx,
+                        y: fy,
+                        width: f.rect[2],
+                        height: f.rect[3],
+                        tag: None,
+                        text: Some(f.text.clone()),
+                        text_baseline: Some(y + f.baseline),
+                        background: None,
+                        color: style.color,
+                        font_size: style.font_size,
+                        font_family: style.font_family.clone(),
+                        bold: style.bold,
+                        italic: style.italic,
+                        border: [0.0; 4],
+                        border_color: [style.color; 4],
+                        visible: !style.hidden,
+                        opacity: inh.opacity * style.opacity,
+                        clip: inh.clip,
+                    }),
+                }
+            }
+
+            for child in children_of(tid).into_iter().rev() {
                 stack.push((child, (x, y), child_inh.clone()));
             }
         }

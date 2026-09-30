@@ -1086,7 +1086,7 @@ impl Page {
     }
 
     /// Same-origin frames: every frame realm, as `(realm id, parent realm id,
-    /// <iframe> node id in the parent's document)`. The page is realm 0; a
+    /// iframe node id in the parent's document)`. The page is realm 0; a
     /// frame nested in a frame names that frame's realm as its parent.
     /// Cross-origin frames are isolates of their own — see
     /// [`Self::child_iframe`].
@@ -1833,6 +1833,20 @@ impl Page {
         };
         let (w, h) = crate::paint::surface_size(viewport, doc_height, opts.full_page);
         crate::paint::render(&boxes, w, h, &os_name).ok_or_else(|| "empty surface".to_string())
+    }
+
+    /// Switch this page between the legacy and the full layout; see
+    /// [`crate::layout::LayoutMode`]. Geometry already read by scripts is not
+    /// recomputed for them; to lay a page out one way from the start, set the
+    /// process default with [`crate::layout::set_default_mode`] before creating it.
+    pub fn set_layout_mode(&mut self, mode: crate::layout::LayoutMode) {
+        let op_state = self.event_loop.runtime_mut().op_state();
+        let mut state = op_state.borrow_mut();
+        if let Some(dom_state) = state.try_borrow_mut::<crate::js_runtime::state::DomState>() {
+            dom_state.layout_engine.set_mode(mode);
+            // The user-agent sheet differs between the modes.
+            dom_state.update_cached_rules();
+        }
     }
 
     /// V8's `used_heap_size` for this page's isolate, in bytes.

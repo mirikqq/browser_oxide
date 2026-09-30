@@ -147,7 +147,9 @@ pub fn computed_to_taffy(style: &ComputedStyle, ctx: &ResolveContext) -> taffy::
     ts
 }
 
-fn to_align_items(a: crate::css_values::types::display::AlignmentValue) -> Option<taffy::AlignItems> {
+fn to_align_items(
+    a: crate::css_values::types::display::AlignmentValue,
+) -> Option<taffy::AlignItems> {
     use crate::css_values::types::display::AlignmentValue as A;
     Some(match a {
         A::Normal => return None,

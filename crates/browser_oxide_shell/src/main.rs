@@ -10,6 +10,9 @@
 //! window never calls it directly: a worker thread does the (blocking) navigation
 //! and painting and hands finished bitmaps back, so the UI stays responsive
 //! while a page loads.
+//!
+//! `--host-fonts` lets the window draw CJK and colour emoji with the host's fonts.
+//! Off by default: the engine's fonts are otherwise only its own.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -308,8 +311,37 @@ impl eframe::App for App {
     }
 }
 
+/// Fonts of the host that draw what the bundled ones cannot: CJK and colour
+/// emoji. Only pixels depend on them; the engine's measurements do not.
+const HOST_FONTS: &[&str] = &[
+    "/System/Library/Fonts/Apple Color Emoji.ttc",
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    r"C:\Windows\Fonts\seguiemj.ttf",
+    r"C:\Windows\Fonts\msyh.ttc",
+    r"C:\Windows\Fonts\YuGothR.ttc",
+    r"C:\Windows\Fonts\malgun.ttf",
+    "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+];
+
+fn register_host_fonts() -> usize {
+    HOST_FONTS
+        .iter()
+        .filter_map(|path| std::fs::read(path).ok())
+        .filter(|data| browser_oxide::text::fallback::register_fallback_face(data.clone(), 0))
+        .count()
+}
+
 fn main() -> eframe::Result {
-    let initial = std::env::args().nth(1);
+    browser_oxide::layout::set_default_mode(browser_oxide::layout::LayoutMode::Full);
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(i) = args.iter().position(|a| a == "--host-fonts") {
+        args.remove(i);
+        register_host_fonts();
+    }
+    let initial = args.into_iter().next();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("BrowserOxide")

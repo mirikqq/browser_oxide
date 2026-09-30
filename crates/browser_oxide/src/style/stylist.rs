@@ -41,6 +41,8 @@ use crate::style::custom::{self, CustomProps};
 /// The user-agent stylesheet, see `ua.css`.
 const UA_CSS: &str = include_str!("ua.css");
 
+/// What `LayoutMode::Full` adds, see `ua_full.css`.
+const UA_FULL_CSS: &str = include_str!("ua_full.css");
 
 /// Order given to presentational hints: above every rule of the user-agent sheet,
 /// below every author rule (the origin sees to the latter).
@@ -95,6 +97,13 @@ static UA_STYLIST: LazyLock<Stylist> = LazyLock::new(|| {
     s
 });
 
+static UA_FULL_STYLIST: LazyLock<Stylist> = LazyLock::new(|| {
+    let mut s = Stylist::empty(MediaFeatures::default());
+    s.add_stylesheet(UA_CSS, Origin::UserAgent);
+    s.add_stylesheet(UA_FULL_CSS, Origin::UserAgent);
+    s
+});
+
 impl Stylist {
     fn empty(media: MediaFeatures) -> Self {
         Self {
@@ -109,6 +118,17 @@ impl Stylist {
     /// `@media` blocks of author sheets added later apply.
     pub fn new(media: MediaFeatures) -> Self {
         let mut s = UA_STYLIST.clone();
+        s.media = media;
+        s
+    }
+
+    /// [`Stylist::new`] for a layout mode: `Full` adds the table rules to the
+    /// user-agent sheet.
+    pub fn for_mode(media: MediaFeatures, mode: crate::layout::LayoutMode) -> Self {
+        let mut s = match mode {
+            crate::layout::LayoutMode::Full => UA_FULL_STYLIST.clone(),
+            crate::layout::LayoutMode::Legacy => UA_STYLIST.clone(),
+        };
         s.media = media;
         s
     }

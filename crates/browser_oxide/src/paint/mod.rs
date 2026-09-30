@@ -19,6 +19,8 @@
 
 use crate::canvas::canvas2d::Canvas2D;
 use crate::layout::{PaintBox, Viewport};
+use crate::text::fallback::{segments, Segment};
+use crate::text::ParsedFont;
 
 /// Tallest picture `Page::screenshot` will produce, so a runaway layout cannot
 /// ask for a gigabyte bitmap.
@@ -66,7 +68,7 @@ pub fn render(boxes: &[PaintBox], width: u32, height: u32, os_name: &str) -> Opt
             continue;
         }
         match (&b.text, &b.tag) {
-            (Some(text), _) => paint_text(&mut canvas, b, text),
+            (Some(text), _) => paint_text(&mut canvas, b, text, os_name),
             (None, Some(tag)) => paint_element(&mut canvas, b, tag),
             (None, None) => {}
         }
@@ -193,22 +195,83 @@ pub(crate) fn wrap_lines(
     lines
 }
 
-fn paint_text(canvas: &mut Canvas2D, b: &PaintBox, text: &str) {
-    let size = b.font_size.max(1.0);
-    let font = format!(
-        "{}{}{}px sans-serif",
+fn font_css(b: &PaintBox, family: &str) -> String {
+    format!(
+        "{}{}{}px {family}",
         if b.italic { "italic " } else { "" },
         if b.bold { "bold " } else { "" },
-        size
-    );
-    canvas.set_font(&font);
+        b.font_size.max(1.0)
+    )
+}
+
+/// `line` in the boxes' font, split into the stretches each face draws.
+fn line_segments<'a>(b: &PaintBox, line: &'a str, os_name: &str) -> Vec<Segment<'a>> {
+    match ParsedFont::parse(&font_css(b, &b.font_family)) {
+        Some(font) => segments(line, &font, os_name),
+        None => vec![Segment {
+            text: line,
+            face: None,
+            covered: true,
+        }],
+    }
+}
+
+fn line_width(canvas: &mut Canvas2D, b: &PaintBox, line: &str, os_name: &str) -> f32 {
+    canvas.set_font(&font_css(b, &b.font_family));
+    line_segments(b, line, os_name)
+        .iter()
+        .map(|seg| match seg.face {
+            Some(f) => canvas.measure_text_with_face(seg.text, f.data, f.index),
+            None => canvas.measure_text(seg.text),
+        } as f32)
+        .sum()
+}
+
+fn draw_line(
+    canvas: &mut Canvas2D,
+    b: &PaintBox,
+    line: &str,
+    x: f32,
+    baseline: f32,
+    os_name: &str,
+) {
+    let mut x = x;
+    for seg in line_segments(b, line, os_name) {
+        let width = match seg.face {
+            Some(f) => {
+                canvas.fill_text_with_face(seg.text, x, baseline, f.data, f.index);
+                canvas.measure_text_with_face(seg.text, f.data, f.index)
+            }
+            None => {
+                canvas.fill_text(seg.text, x, baseline);
+                canvas.measure_text(seg.text)
+            }
+        };
+        x += width as f32;
+    }
+}
+
+fn paint_text(canvas: &mut Canvas2D, b: &PaintBox, text: &str, os_name: &str) {
+    let size = b.font_size.max(1.0);
+    canvas.set_font(&font_css(b, &b.font_family));
     set_fill(canvas, b.color);
     canvas.set_global_alpha(b.opacity);
+
+    // A line layout already broke is drawn where layout put it.
+    if let Some(baseline) = b.text_baseline {
+        if clipped([b.x, b.y, b.width, b.height], b.clip).is_some() {
+            draw_line(canvas, b, text, b.x, baseline, os_name);
+        }
+        canvas.set_global_alpha(1.0);
+        return;
+    }
 
     // Layout sized this run at 1.2em per line; paint on the same grid so the
     // lines land inside the box layout gave them.
     let line_height = size * 1.2;
-    let lines = wrap_lines(text, b.width.max(1.0), |s| canvas.measure_text(s) as f32);
+    let lines = wrap_lines(text, b.width.max(1.0), |s| {
+        line_width(canvas, b, s, os_name)
+    });
     for (i, line) in lines.iter().enumerate() {
         let top = b.y + i as f32 * line_height;
         // Whole-line clipping: a line only partly inside an overflow box still
@@ -216,7 +279,7 @@ fn paint_text(canvas: &mut Canvas2D, b: &PaintBox, text: &str) {
         if clipped([b.x, top, b.width, line_height], b.clip).is_none() {
             continue;
         }
-        canvas.fill_text(line, b.x, top + size);
+        draw_line(canvas, b, line, b.x, top + size, os_name);
     }
     canvas.set_global_alpha(1.0);
 }

@@ -1,0 +1,14 @@
+/* What `LayoutMode::Full` adds to the user-agent sheet: the table model, which the
+   legacy layout cannot lay out (and whose output must not move). After the HTML
+   rendering section's tables part and Chrome's html.css. */
+
+table { display: table; border-collapse: separate; border-spacing: 2px; box-sizing: border-box }
+caption { display: table-caption; text-align: center }
+colgroup { display: table-column-group }
+col { display: table-column }
+thead { display: table-header-group; vertical-align: middle }
+tbody { display: table-row-group; vertical-align: middle }
+tfoot { display: table-footer-group; vertical-align: middle }
+tr { display: table-row; vertical-align: inherit }
+td, th { display: table-cell; vertical-align: inherit; padding: 1px }
+th { font-weight: bold; text-align: center }

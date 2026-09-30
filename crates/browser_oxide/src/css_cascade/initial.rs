@@ -57,6 +57,12 @@ pub fn initial_value(property: &PropertyId) -> CssValue {
         PropertyId::FlexGrow => CssValue::Number(0.0),
         PropertyId::FlexShrink => CssValue::Number(1.0),
         PropertyId::FlexBasis => CssValue::LengthPercentageAuto(LengthPercentageAuto::Auto),
+        PropertyId::GridTemplateColumns | PropertyId::GridTemplateRows => {
+            CssValue::CustomValue("none".to_string())
+        }
+        PropertyId::BorderCollapse => CssValue::CustomValue("separate".to_string()),
+        PropertyId::BorderSpacing => CssValue::CustomValue("0px".to_string()),
+        PropertyId::VerticalAlign => CssValue::CustomValue("baseline".to_string()),
         PropertyId::AlignItems => CssValue::Alignment(AlignmentValue::Normal),
         PropertyId::AlignSelf => CssValue::Alignment(AlignmentValue::Normal),
         PropertyId::AlignContent => CssValue::Alignment(AlignmentValue::Normal),

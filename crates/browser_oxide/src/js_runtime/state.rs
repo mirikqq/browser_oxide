@@ -123,8 +123,9 @@ impl DomState {
             stylesheets: Vec::new(),
             external_stylesheets: Vec::new(),
             cached_rules: Vec::new(),
-            stylist: std::rc::Rc::new(crate::style::Stylist::new(
+            stylist: std::rc::Rc::new(crate::style::Stylist::for_mode(
                 crate::css_cascade::MediaFeatures::default(),
+                crate::layout::default_mode(),
             )),
             computed_style_cache: HashMap::new(),
             computed_style_cache_epoch: 0,
@@ -143,6 +144,7 @@ impl DomState {
     /// Call after assigning `stealth_profile`.
     pub fn sync_viewport_from_profile(&mut self) {
         if let Some(p) = self.stealth_profile.as_ref() {
+            self.layout_engine.set_os_name(&p.os_name);
             // The profile is the single source of geometry: layout, media
             // queries and `devicePixelRatio` all have to read the same numbers.
             // Layout used to be handed the size but not the density, pinning
@@ -212,7 +214,7 @@ impl DomState {
         }
         // The cascade itself is decided by one `Stylist`, which layout reads; the
         // `cached_rules` above remain for `getComputedStyle`'s text lookup.
-        let mut stylist = crate::style::Stylist::new(features);
+        let mut stylist = crate::style::Stylist::for_mode(features, self.layout_engine.mode());
         for css_text in &self.stylesheets {
             stylist.add_stylesheet(css_text, crate::css_cascade::Origin::Author);
         }

@@ -115,6 +115,8 @@ rustfft = "6"
 glow = { version = "0.18", optional = true }
 # --- layout ---
 taffy = "0.12"
+unicode-linebreak = "0.1"
+unicode-width = "0.2"
 # --- misc ---
 chrono = "0.4"
 thiserror = "2"

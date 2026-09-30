@@ -35,6 +35,29 @@ pub fn op_layout_get_bounding_rect(state: &mut OpState, #[smi] node_id: i32) -> 
     }
 }
 
+/// Every line-box rectangle of a node, in document coordinates.
+#[op2]
+#[serde]
+pub fn op_layout_get_client_rects(state: &mut OpState, #[smi] node_id: i32) -> Vec<DOMRectJson> {
+    let state = state.borrow_mut::<DomState>();
+    let nid = NodeId::from_raw(node_id as u32);
+    state
+        .layout_engine
+        .get_client_rects(&state.dom, nid)
+        .into_iter()
+        .map(|rect| DOMRectJson {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+            top: rect.y,
+            right: rect.x + rect.width,
+            bottom: rect.y + rect.height,
+            left: rect.x,
+        })
+        .collect()
+}
+
 #[op2(fast)]
 #[smi]
 pub fn op_layout_get_offset_width(state: &mut OpState, #[smi] node_id: i32) -> i32 {
@@ -243,6 +266,7 @@ deno_core::extension!(
     layout_extension,
     ops = [
         op_layout_get_bounding_rect,
+        op_layout_get_client_rects,
         op_layout_get_offset_width,
         op_layout_get_offset_height,
         op_layout_get_offset_top,

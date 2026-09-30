@@ -13,6 +13,8 @@ pub fn is_inherited(property: &PropertyId) -> bool {
             | PropertyId::TextAlign
             | PropertyId::WhiteSpace
             | PropertyId::Visibility
+            | PropertyId::BorderCollapse
+            | PropertyId::BorderSpacing
             | PropertyId::Custom(_)
     )
 }

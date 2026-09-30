@@ -1314,7 +1314,12 @@
             const sy = (typeof globalThis.scrollY === "number") ? globalThis.scrollY : 0;
             return new DOMRect(r.x - sx, r.y - sy, r.width, r.height);
         }
-        getClientRects() { return [this.getBoundingClientRect()]; }
+        getClientRects() {
+            const sx = (typeof globalThis.scrollX === "number") ? globalThis.scrollX : 0;
+            const sy = (typeof globalThis.scrollY === "number") ? globalThis.scrollY : 0;
+            return ops.op_layout_get_client_rects(_getNodeId(this))
+                .map((r) => new DOMRect(r.x - sx, r.y - sy, r.width, r.height));
+        }
         get offsetWidth() { return ops.op_layout_get_offset_width(_getNodeId(this)); }
         get offsetHeight() { return ops.op_layout_get_offset_height(_getNodeId(this)); }
         get offsetTop() { return ops.op_layout_get_offset_top(_getNodeId(this)); }
