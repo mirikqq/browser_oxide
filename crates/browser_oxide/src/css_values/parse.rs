@@ -13,9 +13,25 @@ pub fn parse_property(
     important: bool,
 ) -> Result<Vec<PropertyDeclaration>, ValueError> {
     let value_trimmed = trim_whitespace(value);
+    let lower = name.to_ascii_lowercase();
+    // Logical properties are aliases of physical ones (horizontal LTR mode).
+    let name: &str = crate::css_values::shorthand::logical_alias(&lower).unwrap_or(name);
 
-    // CSS-wide keywords
+    // CSS-wide keywords. On a shorthand the keyword applies to every longhand it
+    // sets; naming the shorthand itself would set nothing.
     if let Some(keyword) = try_css_wide_keyword(value_trimmed) {
+        if let Some(longhands) =
+            crate::css_values::shorthand::longhands_of(&name.to_ascii_lowercase())
+        {
+            return Ok(longhands
+                .iter()
+                .map(|l| PropertyDeclaration {
+                    property: PropertyId::from_name(l),
+                    value: keyword.clone(),
+                    important,
+                })
+                .collect());
+        }
         return Ok(vec![PropertyDeclaration {
             property: PropertyId::from_name(name),
             value: keyword,
@@ -24,6 +40,12 @@ pub fn parse_property(
     }
 
     let name_lower = name.to_ascii_lowercase();
+
+    // Shorthands that expand through the longhand parsers.
+    if let Some(expanded) = crate::css_values::shorthand::expand(&name_lower, value_trimmed, important)
+    {
+        return expanded;
+    }
 
     // Shorthand expansion
     match name_lower.as_str() {
@@ -69,7 +91,9 @@ pub fn parse_property(
         "flex-basis" => parse_length_percentage_auto(value_trimmed)?,
         "align-items" | "align-self" | "align-content" | "justify-content" | "justify-items"
         | "justify-self" => parse_alignment(value_trimmed)?,
-        "gap" | "row-gap" | "column-gap" => parse_length_percentage(value_trimmed)?,
+        "row-gap" | "column-gap" => parse_length_percentage(value_trimmed)?,
+        "border-top-color" | "border-right-color" | "border-bottom-color"
+        | "border-left-color" => parse_color(value_trimmed)?,
         "font-size" => parse_font_size(value_trimmed)?,
         "font-family" => parse_font_family(value_trimmed)?,
         "font-weight" => parse_font_weight(value_trimmed)?,
@@ -259,6 +283,7 @@ fn parse_border_shorthand(
     // Components may appear in any order; each is recognised by its own shape.
     let mut width: Option<CssValue> = None;
     let mut style: Option<CssValue> = None;
+    let mut colour: Option<CssValue> = None;
     for part in &parts {
         let one = std::slice::from_ref(*part);
         if style.is_none() && parse_border_style(one).is_ok() {
@@ -271,7 +296,12 @@ fn parse_border_shorthand(
                 continue;
             }
         }
-        // Anything else is the colour, which layout does not consume.
+        // Anything else is the colour.
+        if colour.is_none() {
+            if let Ok(c) = parse_color(one) {
+                colour = Some(c);
+            }
+        }
     }
     // `border: none` and `border: 0` both mean no border box, from either side.
     let style = style.unwrap_or(CssValue::BorderStyle(
@@ -299,6 +329,9 @@ fn parse_border_shorthand(
             important,
         });
     }
+    out.extend(crate::css_values::shorthand::border_colors(
+        colour, sides, important,
+    ));
     Ok(out)
 }
 
@@ -467,7 +500,7 @@ fn parse_number(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
     Err(ValueError::InvalidValue("expected number".into()))
 }
 
-fn parse_font_size(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
+pub(crate) fn parse_font_size(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
     if value.len() == 1 {
         if let Some(ident) = try_ident(&value[0]) {
             let px = match ident.to_ascii_lowercase().as_str() {
@@ -507,7 +540,7 @@ fn parse_font_size(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError>
     Err(ValueError::InvalidValue("expected font-size value".into()))
 }
 
-fn parse_font_family(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
+pub(crate) fn parse_font_family(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
     let mut families = Vec::new();
     let mut current_name_parts: Vec<String> = Vec::new();
 
@@ -571,7 +604,7 @@ fn match_generic_or_named(name: &str) -> FontFamily {
     }
 }
 
-fn parse_font_weight(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
+pub(crate) fn parse_font_weight(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
     if value.len() == 1 {
         if let Some(ident) = try_ident(&value[0]) {
             let w = match ident.to_ascii_lowercase().as_str() {
@@ -601,7 +634,7 @@ fn parse_font_weight(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueErro
     ))
 }
 
-fn parse_font_style(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
+pub(crate) fn parse_font_style(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
     let ident = expect_single_ident(value)?;
     let s = match ident.to_ascii_lowercase().as_str() {
         "normal" => FontStyle::Normal,
@@ -617,7 +650,7 @@ fn parse_font_style(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError
     Ok(CssValue::FontStyle(s))
 }
 
-fn parse_line_height(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
+pub(crate) fn parse_line_height(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
     if value.len() == 1 {
         if let Some(ident) = try_ident(&value[0]) {
             if ident.eq_ignore_ascii_case("normal") {
@@ -682,7 +715,7 @@ fn parse_white_space(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueErro
     Ok(CssValue::WhiteSpace(w))
 }
 
-fn parse_color(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
+pub(crate) fn parse_color(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
     // Named color or currentcolor
     if value.len() == 1 {
         if let Some(ident) = try_ident(&value[0]) {
@@ -1021,7 +1054,7 @@ fn expect_single_ident(value: &[ComponentValue<'_>]) -> Result<String, ValueErro
     ))
 }
 
-fn try_ident(cv: &ComponentValue<'_>) -> Option<String> {
+pub(crate) fn try_ident(cv: &ComponentValue<'_>) -> Option<String> {
     match cv {
         ComponentValue::Token(Token {
             kind: TokenKind::Ident(name),

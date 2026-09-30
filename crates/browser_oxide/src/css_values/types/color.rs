@@ -48,9 +48,33 @@ impl Color {
             Color::Rgba { r, g, b, a } => (*r, *g, *b, *a),
             Color::Transparent => (0, 0, 0, 0.0),
             Color::CurrentColor => (0, 0, 0, 1.0), // placeholder
-            _ => (0, 0, 0, 1.0),                   // TODO: implement color space conversions
+            Color::Hsl { h, s, l, a } => {
+                let (r, g, b) = hsl_to_rgb(*h, *s / 100.0, *l / 100.0);
+                (r, g, b, *a)
+            }
+            _ => (0, 0, 0, 1.0), // TODO: implement the remaining colour spaces
         }
     }
+}
+
+/// `hsl()` to sRGB bytes. `h` is in degrees; `s` and `l` are fractions.
+fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (u8, u8, u8) {
+    let s = s.clamp(0.0, 1.0);
+    let l = l.clamp(0.0, 1.0);
+    let h = h.rem_euclid(360.0);
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r, g, b) = match (h / 60.0) as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let byte = |v: f64| ((v + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    (byte(r), byte(g), byte(b))
 }
 
 /// Resolve a named CSS color. Returns None if not a valid name.
@@ -248,5 +272,20 @@ mod tests {
                 ..
             })
         ));
+    }
+}
+
+#[cfg(test)]
+mod hsl_tests {
+    use super::*;
+
+    #[test]
+    fn hsl_primaries() {
+        let rgba = |h, s, l| Color::Hsl { h, s, l, a: 1.0 }.to_rgba();
+        assert_eq!(rgba(0.0, 100.0, 50.0), (255, 0, 0, 1.0));
+        assert_eq!(rgba(120.0, 100.0, 50.0), (0, 255, 0, 1.0));
+        assert_eq!(rgba(240.0, 100.0, 50.0), (0, 0, 255, 1.0));
+        assert_eq!(rgba(0.0, 0.0, 50.0), (128, 128, 128, 1.0));
+        assert_eq!(rgba(-120.0, 100.0, 50.0), (0, 0, 255, 1.0));
     }
 }

@@ -29,6 +29,10 @@ stealth = ["generator", "geoip"]
 # emitted. Off by default: OSMesa adds ~15 MB and is not on the critical
 # path for any tracked blocker site.
 webgl-render = ["glow"]
+# Rasterises the laid-out page: `Page::screenshot`, and the pixels the `browser_oxide_shell`
+# window shows. Off by default so headless embedders carry none of it; it adds no
+# dependencies (it draws through the Skia already used for canvas).
+paint = []
 # Optional in-engine ad/tracker blocker (MPL-2.0 `adblock`); off by default.
 blocker = ["dep:adblock"]
 # Bayesian-network fingerprint sampling (`stealth::generator`); part of
@@ -129,6 +133,10 @@ futures-util = "0.3"
 url = "2"
 criterion = { version = "0.5", features = ["async_tokio"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[example]]
+name = "screenshot"
+required-features = ["paint"]
 
 [[bench]]
 name = "page_throughput"

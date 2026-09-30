@@ -74,7 +74,9 @@ The whole engine is the single `browser_oxide` crate
 (`crates/browser_oxide`), organized into single-responsibility modules
 under `src/`. The workspace publishes exactly two crates —
 `browser_oxide` and the `browser_oxide_mcp` server; `browser_oxide_py`
-is a standalone (PyPI) workspace.
+is a standalone (PyPI) workspace. `browser_oxide_shell` (a desktop window,
+never published) is a workspace member but not a default one: a bare
+`cargo build` stays headless. See `docs/GUI_PLAN.md`.
 
 | Module (`browser_oxide::…`) | Purpose |
 |---|---|

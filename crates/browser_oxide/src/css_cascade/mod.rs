@@ -9,7 +9,7 @@ pub mod initial;
 pub mod layers;
 pub mod media;
 
-pub use cascade::{cascade_sort, CascadeEntry, Origin};
+pub use cascade::{cascade_sort, compare_keys, CascadeEntry, CascadeKey, Origin};
 pub use computed::ComputedStyle;
 pub use inheritance::is_inherited;
 pub use initial::initial_value;

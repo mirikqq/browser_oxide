@@ -1801,6 +1801,40 @@ impl Page {
         self.event_loop.execute_script(js)
     }
 
+    /// Rasterise the page as it is laid out right now (`feature = "paint"`).
+    ///
+    /// Returns the picture as straight-alpha RGBA. It is drawn from the layout
+    /// engine's own boxes, so it shows what the engine believes about the page —
+    /// including where layout is still approximate; see `docs/GUI_PLAN.md`.
+    /// Nothing is run or awaited first: settle the page (navigate, pump the
+    /// event loop) before calling.
+    #[cfg(feature = "paint")]
+    pub fn screenshot(
+        &mut self,
+        opts: &crate::paint::ScreenshotOptions,
+    ) -> Result<crate::paint::Bitmap, String> {
+        // The profile's platform decides the font set, as it does for canvas text.
+        let os_name = self
+            .evaluate("(navigator.userAgentData && navigator.userAgentData.platform) || ''")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Windows".to_string());
+
+        let (boxes, viewport, doc_height) = {
+            let op_state = self.event_loop.runtime_mut().op_state();
+            let mut state = op_state.borrow_mut();
+            let dom_state = state
+                .try_borrow_mut::<crate::js_runtime::state::DomState>()
+                .ok_or_else(|| "page has no DOM state".to_string())?;
+            let dom_state = &mut *dom_state;
+            let boxes = dom_state.layout_engine.paint_boxes(&dom_state.dom);
+            let doc_height = boxes.iter().map(|b| b.y + b.height).fold(0.0, f32::max);
+            (boxes, dom_state.layout_engine.viewport(), doc_height)
+        };
+        let (w, h) = crate::paint::surface_size(viewport, doc_height, opts.full_page);
+        crate::paint::render(&boxes, w, h, &os_name).ok_or_else(|| "empty surface".to_string())
+    }
+
     /// V8's `used_heap_size` for this page's isolate, in bytes.
     ///
     /// Useful for monitoring a [`crate::pool::PagePool`]: sample after each

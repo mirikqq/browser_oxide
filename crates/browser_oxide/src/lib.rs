@@ -15,8 +15,11 @@ pub mod html_parser;
 pub mod js_runtime;
 pub mod layout;
 pub mod net;
+#[cfg(feature = "paint")]
+pub mod paint;
 pub mod protocol;
 pub mod stealth;
+pub mod style;
 pub mod workers;
 
 pub mod challenge;

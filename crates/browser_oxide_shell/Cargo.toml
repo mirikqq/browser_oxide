@@ -1,0 +1,30 @@
+[package]
+name = "browser_oxide_shell"
+version.workspace = true
+edition.workspace = true
+# The window toolkit needs a newer compiler than the engine's 1.91 floor. The
+# `msrv` CI job builds the workspace without this crate for that reason.
+rust-version = "1.95"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Desktop window for the BrowserOxide engine: an address bar and the page as the engine paints it"
+# A local tool, not a library: the published crates stay headless.
+publish = false
+
+[[bin]]
+name = "browser-oxide-shell"
+path = "src/main.rs"
+
+[dependencies]
+browser_oxide = { workspace = true, features = ["paint"] }
+eframe = { version = "0.36", default-features = false, features = [
+  "glow",
+  "default_fonts",
+  "x11",
+  "wayland",
+] }
+
+[lints]
+workspace = true

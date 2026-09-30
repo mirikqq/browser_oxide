@@ -1,0 +1,72 @@
+/* The user-agent stylesheet, after the HTML rendering section
+   (https://html.spec.whatwg.org/multipage/rendering.html) and Chrome's html.css.
+
+   Only what the engine can represent is here. Missing on purpose, each for a
+   reason that is written next to it:
+
+   - Tables: layout has no table algorithm yet, so `display: table*` would only
+     stack cells vertically. Until it does, table parts keep the initial
+     `display` and are laid out as a wrapping row (see GUI_PLAN, stage 3).
+   - Form controls: their intrinsic sizes and borders are not modelled, and
+     declaring borders without the sizes would shift boxes without making them
+     right.
+   - `iframe { border: 2px inset }`: frame geometry is handed to the frame's
+     realm as the border box; changing it needs the content box threaded through
+     first.
+   - `list-style`, `text-decoration`, `cursor`, `vertical-align`: not in the
+     property registry yet. */
+
+html { display: block }
+
+/* Hidden elements */
+area, base, basefont, datalist, head, link, meta, noembed, noframes, param,
+rp, script, style, template, title, noscript, [hidden], input[type=hidden i] { display: none }
+dialog:not([open]) { display: none }
+
+/* Flow content */
+address, blockquote, center, dialog, div, figure, figcaption, footer, form,
+header, hr, legend, listing, main, p, plaintext, pre, search, xmp,
+article, aside, nav, section, h1, h2, h3, h4, h5, h6, hgroup, details, summary,
+fieldset, optgroup, dir, dd, dl, dt, menu, ol, ul, body { display: block }
+li { display: list-item }
+slot { display: contents }
+
+body { margin: 8px }
+
+p, dl, menu, ol, ul { margin-top: 1em; margin-bottom: 1em }
+blockquote, figure { margin: 1em 40px }
+dd { margin-left: 40px }
+menu, ol, ul { padding-left: 40px }
+:is(dir, dl, menu, ol, ul) :is(dir, dl, menu, ol, ul) { margin-top: 0; margin-bottom: 0 }
+pre, listing, xmp, plaintext { margin-top: 1em; margin-bottom: 1em; white-space: pre }
+address { font-style: italic }
+
+hr {
+  margin-top: 0.5em; margin-bottom: 0.5em; margin-left: auto; margin-right: auto;
+  border: 1px inset; overflow: hidden; color: gray;
+}
+
+fieldset {
+  margin-left: 2px; margin-right: 2px;
+  padding-top: 0.35em; padding-bottom: 0.625em; padding-left: 0.75em; padding-right: 0.75em;
+  border: 2px groove;
+}
+
+/* Headings */
+h1 { font-size: 2em; margin-top: 0.67em; margin-bottom: 0.67em }
+h2 { font-size: 1.5em; margin-top: 0.83em; margin-bottom: 0.83em }
+h3 { font-size: 1.17em; margin-top: 1em; margin-bottom: 1em }
+h4 { margin-top: 1.33em; margin-bottom: 1.33em }
+h5 { font-size: 0.83em; margin-top: 1.67em; margin-bottom: 1.67em }
+h6 { font-size: 0.67em; margin-top: 2.33em; margin-bottom: 2.33em }
+h1, h2, h3, h4, h5, h6 { font-weight: bold }
+
+/* Phrasing */
+b, strong { font-weight: bold }
+i, cite, em, var, dfn { font-style: italic }
+small { font-size: smaller }
+big { font-size: larger }
+sub, sup { font-size: smaller }
+mark { background-color: yellow; color: black }
+code, kbd, samp, tt, pre, listing, xmp, plaintext { font-family: monospace }
+a[href] { color: rgb(0, 0, 238) }

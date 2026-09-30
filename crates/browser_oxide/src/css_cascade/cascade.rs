@@ -38,9 +38,39 @@ pub fn cascade_sort(
     result
 }
 
+/// Everything the cascade orders a declaration by, without the declaration.
+///
+/// Split out so callers that hold their own payload (the raw text of a value, for
+/// `getComputedStyle`) are ordered by exactly the rules the typed path uses.
+#[derive(Debug, Clone, Copy)]
+pub struct CascadeKey {
+    pub important: bool,
+    pub origin: Origin,
+    pub layer: Option<LayerId>,
+    pub specificity: Specificity,
+    pub source_order: u32,
+}
+
+impl CascadeEntry {
+    pub fn key(&self) -> CascadeKey {
+        CascadeKey {
+            important: self.declaration.important,
+            origin: self.origin,
+            layer: self.layer,
+            specificity: self.specificity,
+            source_order: self.source_order,
+        }
+    }
+}
+
 fn cascade_compare(a: &CascadeEntry, b: &CascadeEntry) -> std::cmp::Ordering {
-    let a_important = a.declaration.important;
-    let b_important = b.declaration.important;
+    compare_keys(&a.key(), &b.key())
+}
+
+/// Order two declarations by cascade precedence: `Greater` means `a` wins.
+pub fn compare_keys(a: &CascadeKey, b: &CascadeKey) -> std::cmp::Ordering {
+    let a_important = a.important;
+    let b_important = b.important;
 
     // 1. Origin + importance
     let a_priority = origin_priority(a.origin, a_important);

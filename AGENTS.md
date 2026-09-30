@@ -36,7 +36,12 @@ reasoned allow only when the lint is a genuine false positive.
   `css_values`/`css_cascade`, `layout`, `protocol`, `host` — each with a
   single responsibility (see `docs/ARCHITECTURE.md`). The workspace
   publishes exactly two crates: `browser_oxide` and the `browser_oxide_mcp`
-  server. `browser_oxide_py` is a standalone (PyPI) workspace.
+  server. `browser_oxide_py` is a standalone (PyPI) workspace. A third member,
+  `browser_oxide_shell`, is the desktop window (`publish = false`, not a default
+  member — `cargo build` stays headless; build it with
+  `cargo build -p browser_oxide_shell`). The engine crate must never depend on a
+  window toolkit; CI checks its dependency tree. Drawing is behind the `paint`
+  feature (`Page::screenshot`), off by default.
 - **Per-vendor challenge solving is out of scope here.** The engine
   exposes a `browser_oxide::ChallengeSolver` trait + `Page::navigate_with_solvers`
   hook; concrete per-vendor solver implementations are out of scope for

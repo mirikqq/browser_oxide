@@ -23,6 +23,9 @@ pub struct DomState {
     pub external_stylesheets: Vec<String>,
     /// Parsed and simplified CSS rules for fast lookup
     pub cached_rules: Vec<CachedRule>,
+    /// The same rules with the cascade decided properly (origins, `!important`,
+    /// `@layer`, nesting), shared with the layout engine.
+    pub stylist: std::rc::Rc<crate::style::Stylist>,
     /// `getComputedStyle` results, keyed by (node, property). Matching a node
     /// against every stylesheet rule (potentially thousands on a real SPA,
     /// each selector re-walked including any `:has()` subtree scan) is not
@@ -120,6 +123,9 @@ impl DomState {
             stylesheets: Vec::new(),
             external_stylesheets: Vec::new(),
             cached_rules: Vec::new(),
+            stylist: std::rc::Rc::new(crate::style::Stylist::new(
+                crate::css_cascade::MediaFeatures::default(),
+            )),
             computed_style_cache: HashMap::new(),
             computed_style_cache_epoch: 0,
             messages_to_children: Vec::new(),
@@ -204,17 +210,15 @@ impl DomState {
                 }
             }
         }
-        // Layout resolves its own cascade and needs the same rules; without this the
-        // boxes stay at UA defaults while getComputedStyle reports author values.
-        let rules = self
-            .cached_rules
-            .iter()
-            .map(|r| crate::css_cascade::StyleRule {
-                selectors: r.selectors.clone(),
-                declarations: r.declarations.clone(),
-            })
-            .collect();
-        self.layout_engine.set_style_rules(rules);
+        // The cascade itself is decided by one `Stylist`, which layout reads; the
+        // `cached_rules` above remain for `getComputedStyle`'s text lookup.
+        let mut stylist = crate::style::Stylist::new(features);
+        for css_text in &self.stylesheets {
+            stylist.add_stylesheet(css_text, crate::css_cascade::Origin::Author);
+        }
+        self.stylist = std::rc::Rc::new(stylist);
+        self.layout_engine
+            .set_stylist(std::rc::Rc::clone(&self.stylist));
     }
 
     pub fn with_base_url(mut self, url: url::Url) -> Self {

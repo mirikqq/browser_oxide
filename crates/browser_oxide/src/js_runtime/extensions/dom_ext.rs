@@ -1069,18 +1069,31 @@ pub fn op_dom_class_list_remove(state: &mut OpState, #[smi] node_id: i32, #[stri
     }
 }
 
+/// A declared value in the form `getComputedStyle` reports: math functions
+/// evaluated and relative lengths (`2em`, `60vw`) turned into pixels.
+/// Percentages stay as authored — resolving them needs the containing block,
+/// which is layout's job, not this op's.
+fn computed_value_text(value: &str, ctx: &CalcContext) -> String {
+    let resolved = resolve_computed_value(value, ctx);
+    resolve_length_to_px(&resolved, ctx).unwrap_or(resolved)
+}
+
+/// A length in Chrome's `getComputedStyle` form: no trailing zeros, at most three
+/// decimals.
+fn format_px(v: f32) -> String {
+    let rounded = (f64::from(v) * 1000.0).round() / 1000.0;
+    if rounded.fract() == 0.0 {
+        format!("{}px", rounded as i64)
+    } else {
+        format!("{rounded}px")
+    }
+}
+
 /// Get computed style for an element.
 /// Checks: 1) inline style attribute, 2) `<style>` block rules, 3) CSS defaults.
 /// Uses selector matching for style block rules. Higher specificity wins.
 #[op2]
 #[serde]
-// explicit_counter_loop: `source_order` is a manual CSS source-order
-// counter used inside the nested selector-match loop; .enumerate()
-// would force a usize↔u32 cast against the stored specificity tuple.
-#[allow(
-    clippy::explicit_counter_loop,
-    reason = "explicit CSS source-order counter"
-)]
 pub fn op_dom_get_all_computed_styles(
     state: &mut OpState,
     #[smi] node_id: i32,
@@ -1090,34 +1103,19 @@ pub fn op_dom_get_all_computed_styles(
         state.update_cached_rules();
     }
     let id = NodeId::from_raw(node_id as u32);
-    let dom_el = if let Some(el) = DomElement::new(&state.dom, id) {
-        el
-    } else {
+    if DomElement::new(&state.dom, id).is_none() {
         return HashMap::new();
-    };
+    }
 
     let mut declarations: HashMap<String, (u32, u32, String)> = HashMap::new();
-    let mut source_order: u32 = 0;
 
-    for rule in &state.cached_rules {
-        for sel in &rule.selectors {
-            if crate::css_selectors::matches_selector(&dom_el, sel) {
-                let s = crate::css_selectors::compute_specificity(sel);
-                let spec = s.a * 10000 + s.b * 100 + s.c;
-                for (name, val) in &rule.declarations {
-                    // Expand at insertion so the generated longhands take part in the
-                    // same specificity/source-order contest as explicit ones — a later
-                    // `margin-top` still beats an earlier `margin`.
-                    for (prop, pval) in expand_shorthand(name, val) {
-                        let entry = declarations.entry(prop).or_insert((0, 0, String::new()));
-                        if spec > entry.0 || (spec == entry.0 && source_order >= entry.1) {
-                            *entry = (spec, source_order, pval);
-                        }
-                    }
-                }
-            }
+    // Weakest first, so a later declaration overwrites an earlier one. Expanding
+    // at insertion makes the generated longhands take part in the same contest as
+    // explicit ones — a later `margin-top` still beats an earlier `margin`.
+    for decl in state.stylist.matching_declarations(&state.dom, id) {
+        for (prop, pval) in expand_shorthand(&decl.name, &decl.value) {
+            declarations.insert(prop, (0, 0, pval));
         }
-        source_order += 1;
     }
 
     // Add inline styles (highest specificity)
@@ -1171,7 +1169,28 @@ pub fn op_dom_get_computed_style(
         state.update_cached_rules();
     }
     let id = NodeId::from_raw(node_id as u32);
-    let ctx = calc_context_from(state);
+    let mut ctx = calc_context_from(state);
+
+    // The style pass knows what the cascade alone cannot: the font size an
+    // element really has (inherited, `em`/`%` compounded), and the `display` its
+    // tag gives it. `None` for an element with no box (`display: none` above it).
+    let styled = {
+        let tree = state.layout_engine.style_tree(&state.dom);
+        tree.get(id).map(|style| {
+            let display = match style.get(&crate::css_values::property::PropertyId::Display) {
+                Some(crate::css_values::property::CssValue::Display(d)) => Some(d.as_css()),
+                _ => None,
+            };
+            (tree.font_size(id), tree.root_font_size(), display)
+        })
+    };
+    if let Some((font_size, root_font_size, _)) = styled {
+        ctx.font_size_px = font_size as f64;
+        ctx.root_font_size_px = root_font_size as f64;
+        if property == "font-size" {
+            return format_px(font_size);
+        }
+    }
 
     // 0. UA defaults that differ from the generic initial value. Layout hides
     //    `<head>` and its contents; `getComputedStyle` has to say the same
@@ -1202,7 +1221,7 @@ pub fn op_dom_get_computed_style(
 
     // 2. Check <style> block rules (matched by selector)
     if let Some(val) = get_stylesheet_value(state, id, property) {
-        return resolve_computed_value(&val, &ctx);
+        return computed_value_text(&val, &ctx);
     }
 
     // 3. CSS inheritance — walk up the DOM for inherited properties
@@ -1247,17 +1266,23 @@ pub fn op_dom_get_computed_style(
         while let Some(parent_id) = state.dom.get(current).and_then(|n| n.parent) {
             if let Some(val) = get_inline_style_value(&state.dom, parent_id, property) {
                 if !val.is_empty() {
-                    return resolve_computed_value(&val, &ctx);
+                    return computed_value_text(&val, &ctx);
                 }
             }
             if let Some(val) = get_stylesheet_value(state, parent_id, property) {
-                return resolve_computed_value(&val, &ctx);
+                return computed_value_text(&val, &ctx);
             }
             current = parent_id;
         }
     }
 
-    // 4. CSS default
+    // 4. CSS default. `display` is the exception: what an element's display is
+    //    depends on its tag, and only the style pass has applied that.
+    if property == "display" {
+        if let Some((_, _, Some(display))) = styled {
+            return display.to_string();
+        }
+    }
     crate::js_runtime::extensions::layout_ext::css_default(property)
 }
 
@@ -1286,9 +1311,8 @@ fn get_inline_style_value(dom: &crate::dom::Dom, id: NodeId, property: &str) -> 
     None
 }
 
-/// Search <style> block rules for a matching declaration.
-/// Returns the value from the highest-specificity matching rule.
-#[allow(clippy::explicit_counter_loop, reason = "CSS source-order counter")]
+/// Search the style rules (the user-agent sheet included) for a matching
+/// declaration. Returns the value of the cascade's winner.
 fn get_stylesheet_value(state: &mut DomState, id: NodeId, property: &str) -> Option<String> {
     // Safe only while nothing has mutated since the cache was filled. The
     // epoch only ever increases, so a mismatch here reliably means *some*
@@ -1306,39 +1330,7 @@ fn get_stylesheet_value(state: &mut DomState, id: NodeId, property: &str) -> Opt
         return cached.clone();
     }
 
-    let dom_el = DomElement::new(&state.dom, id)?;
-
-    // Collect all matching declarations: (specificity, source_order, value)
-    let mut matches: Vec<(u32, u32, String)> = Vec::new();
-    let mut source_order: u32 = 0;
-
-    for rule in &state.cached_rules {
-        let mut matched = false;
-        let mut best_spec: u32 = 0;
-        for sel in &rule.selectors {
-            if crate::css_selectors::matches_selector(&dom_el, sel) {
-                matched = true;
-                let s = crate::css_selectors::compute_specificity(sel);
-                let spec = s.a * 10000 + s.b * 100 + s.c;
-                if spec > best_spec {
-                    best_spec = spec;
-                }
-            }
-        }
-
-        if matched {
-            if let Some(val) = rule.declarations.get(property) {
-                matches.push((best_spec, source_order, val.clone()));
-            }
-        }
-        source_order += 1;
-    }
-
-    // Sort by specificity (ascending), then source order — last wins
-    matches.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-
-    // Winner is the last entry (highest specificity, latest source order)
-    let result = matches.last().map(|(_, _, val)| val.clone());
+    let result = state.stylist.winning_raw(&state.dom, id, property);
     state.computed_style_cache.insert(cache_key, result.clone());
     result
 }

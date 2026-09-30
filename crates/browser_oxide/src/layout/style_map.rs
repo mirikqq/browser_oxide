@@ -110,6 +110,21 @@ pub fn computed_to_taffy(style: &ComputedStyle, ctx: &ResolveContext) -> taffy::
         ts.flex_shrink = *v as f32;
     }
 
+    ts.flex_basis = css_to_dimension(style, &PropertyId::FlexBasis, ctx);
+
+    // Alignment. `normal` is the initial value and means "whatever the layout
+    // mode does by default", which is what leaving the taffy field unset does.
+    let align = |p: &PropertyId| match style.get(p) {
+        Some(CssValue::Alignment(a)) => Some(*a),
+        _ => None,
+    };
+    ts.align_items = align(&PropertyId::AlignItems).and_then(to_align_items);
+    ts.align_self = align(&PropertyId::AlignSelf).and_then(to_align_items);
+    ts.justify_items = align(&PropertyId::JustifyItems).and_then(to_align_items);
+    ts.justify_self = align(&PropertyId::JustifySelf).and_then(to_align_items);
+    ts.align_content = align(&PropertyId::AlignContent).and_then(to_align_content);
+    ts.justify_content = align(&PropertyId::JustifyContent).and_then(to_align_content);
+
     // Gap
     if let Some(CssValue::LengthPercentage(lp)) = style.get(&PropertyId::RowGap) {
         ts.gap.height =
@@ -130,6 +145,40 @@ pub fn computed_to_taffy(style: &ComputedStyle, ctx: &ResolveContext) -> taffy::
     }
 
     ts
+}
+
+fn to_align_items(a: crate::css_values::types::display::AlignmentValue) -> Option<taffy::AlignItems> {
+    use crate::css_values::types::display::AlignmentValue as A;
+    Some(match a {
+        A::Normal => return None,
+        A::Stretch => taffy::AlignItems::STRETCH,
+        A::Center => taffy::AlignItems::CENTER,
+        A::Start => taffy::AlignItems::START,
+        A::End => taffy::AlignItems::END,
+        A::FlexStart => taffy::AlignItems::FLEX_START,
+        A::FlexEnd => taffy::AlignItems::FLEX_END,
+        A::Baseline => taffy::AlignItems::BASELINE,
+        // The distribution keywords are not valid for single-item alignment.
+        A::SpaceBetween | A::SpaceAround | A::SpaceEvenly => return None,
+    })
+}
+
+fn to_align_content(
+    a: crate::css_values::types::display::AlignmentValue,
+) -> Option<taffy::AlignContent> {
+    use crate::css_values::types::display::AlignmentValue as A;
+    Some(match a {
+        A::Normal | A::Baseline => return None,
+        A::Stretch => taffy::AlignContent::STRETCH,
+        A::Center => taffy::AlignContent::CENTER,
+        A::Start => taffy::AlignContent::START,
+        A::End => taffy::AlignContent::END,
+        A::FlexStart => taffy::AlignContent::FLEX_START,
+        A::FlexEnd => taffy::AlignContent::FLEX_END,
+        A::SpaceBetween => taffy::AlignContent::SPACE_BETWEEN,
+        A::SpaceAround => taffy::AlignContent::SPACE_AROUND,
+        A::SpaceEvenly => taffy::AlignContent::SPACE_EVENLY,
+    })
 }
 
 fn css_to_dimension(

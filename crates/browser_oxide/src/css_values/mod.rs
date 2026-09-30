@@ -8,6 +8,7 @@ pub mod calc;
 pub mod error;
 pub mod parse;
 pub mod property;
+pub(crate) mod shorthand;
 pub mod types;
 
 pub use error::ValueError;

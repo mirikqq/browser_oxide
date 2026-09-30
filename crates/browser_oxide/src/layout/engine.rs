@@ -1,13 +1,16 @@
-use crate::css_cascade::{ComputedStyle, StyleRule};
+use crate::style::{StyleTree, Stylist};
 use crate::css_values::property::{CssValue, PropertyId};
 use crate::css_values::types::display::{Display, Position};
 use crate::dom::node::{NodeData, NodeId};
 use crate::dom::Dom;
+#[cfg(feature = "paint")]
+use crate::layout::paint_tree::PaintStyle;
 use crate::layout::query::DOMRect;
 use crate::layout::resolve::ResolveContext;
 use crate::layout::style_map::computed_to_taffy;
 use crate::layout::viewport::Viewport;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use taffy::prelude::*;
 
 /// Step limit for the iterative DOM walk in `build_node`. A correct DOM has
@@ -70,136 +73,10 @@ fn measure_text(
     }
 }
 
-/// Presentational size hints: `width` / `height` written as attributes.
-///
-/// `<svg width="44" height="46">` — and the same on `<img>`, `<canvas>`,
-/// `<iframe>` and friends — is how a great deal of markup states its size.
-/// Nothing mapped them into the cascade, so those elements computed
-/// `height: auto` and laid out zero pixels tall: an inline SVG logo occupied
-/// its width and no height at all, and everything drawn inside it collapsed
-/// with it. They enter the cascade below author CSS, which is where the spec
-/// puts presentational hints.
-fn presentational_declarations(
-    elem: &crate::dom::node::ElementData,
-) -> HashMap<PropertyId, CssValue> {
-    const SIZED: &[&str] = &[
-        "img", "svg", "canvas", "iframe", "embed", "object", "video", "input",
-    ];
-    use crate::css_values::types::length::{Length as CssLength, LengthPercentageAuto as CssLpa};
-    let mut out = HashMap::new();
-    if !SIZED.contains(&&*elem.name.local) {
-        return out;
-    }
-    for (attr, prop) in [("width", PropertyId::Width), ("height", PropertyId::Height)] {
-        let Some(raw) = elem
-            .attrs
-            .iter()
-            .find(|a| a.name.local == *attr)
-            .map(|a| a.value.trim())
-        else {
-            continue;
-        };
-        let value = if let Some(pct) = raw.strip_suffix('%') {
-            pct.trim()
-                .parse::<f64>()
-                .ok()
-                .map(|n| CssValue::LengthPercentageAuto(CssLpa::Percentage(n)))
-        } else {
-            raw.parse::<f64>()
-                .ok()
-                .map(|n| CssValue::LengthPercentageAuto(CssLpa::Length(CssLength::Px(n))))
-        };
-        if let Some(v) = value {
-            out.insert(prop, v);
-        }
-    }
-    out
-}
-
-/// Intrinsic replaced-element size for an outer SVG. Author CSS and explicit
-/// width/height attributes are appended later and therefore keep precedence.
-fn svg_intrinsic_declarations(
-    elem: &crate::dom::node::ElementData,
-) -> HashMap<PropertyId, CssValue> {
-    use crate::css_values::types::length::{Length as CssLength, LengthPercentageAuto as CssLpa};
-    let mut out = HashMap::new();
-    if !elem.name.local.eq_ignore_ascii_case("svg") {
-        return out;
-    }
-    let attr = |name: &str| elem.attrs.iter().find(|a| a.name.local == name);
-    let view_box = attr("viewBox").or_else(|| attr("viewbox")).map(|a| {
-        a.value
-            .split(|c: char| c.is_ascii_whitespace() || c == ',')
-            .filter_map(|part| part.parse::<f64>().ok())
-            .collect::<Vec<_>>()
-    });
-    let ratio = view_box
-        .as_deref()
-        .filter(|parts| parts.len() == 4 && parts[2] > 0.0 && parts[3] > 0.0)
-        .map(|parts| parts[2] / parts[3]);
-    let width = attr("width").and_then(|a| a.value.trim().parse::<f64>().ok());
-    let height = attr("height").and_then(|a| a.value.trim().parse::<f64>().ok());
-    let (fallback_width, fallback_height) = match (width, height, ratio) {
-        (Some(w), None, Some(r)) => (w, w / r),
-        (None, Some(h), Some(r)) => (h * r, h),
-        (None, None, Some(r)) => (300.0, 300.0 / r),
-        _ => (300.0, 150.0),
-    };
-    out.insert(
-        PropertyId::Width,
-        CssValue::LengthPercentageAuto(CssLpa::Length(CssLength::Px(fallback_width))),
-    );
-    out.insert(
-        PropertyId::Height,
-        CssValue::LengthPercentageAuto(CssLpa::Length(CssLength::Px(fallback_height))),
-    );
-    out
-}
-
-/// Elements the UA stylesheet hides.
-///
-/// Nothing supplied per-tag defaults, so `<head>` and everything in it was laid
-/// out as ordinary blocks — the text of every `<style>`, `<script>` and
-/// `<title>` was measured and given height, and `<body>` started that far down
-/// the page. Inside a captcha's frame that pushed its whole interface past the
-/// bottom edge, and every coordinate taken from it was off by the same amount.
-///
-/// The list is the `display: none` block of the HTML rendering spec:
-/// <https://html.spec.whatwg.org/multipage/rendering.html#hidden-elements>
-fn ua_declarations(tag: &str) -> HashMap<PropertyId, CssValue> {
-    const HIDDEN: &[&str] = &[
-        "head", "base", "basefont", "bgsound", "datalist", "link", "meta", "noembed", "noframes",
-        "param", "rp", "script", "style", "template", "title",
-    ];
-    use crate::css_values::types::length::{Length as CssLength, LengthPercentageAuto as CssLpa};
-    let mut out = HashMap::new();
-    if HIDDEN.contains(&tag) {
-        out.insert(PropertyId::Display, CssValue::Display(Display::None));
-    }
-    // Chrome's UA sheet gives the body an 8px margin, which is why a page's
-    // body measures `viewport - 16` wide and its rect starts at y=8. Without it
-    // every `document.body.getBoundingClientRect()` here started at 0,0 and
-    // spanned the full viewport — a one-line difference from any real browser.
-    if tag == "body" {
-        for prop in [
-            PropertyId::MarginTop,
-            PropertyId::MarginRight,
-            PropertyId::MarginBottom,
-            PropertyId::MarginLeft,
-        ] {
-            out.insert(
-                prop,
-                CssValue::LengthPercentageAuto(CssLpa::Length(CssLength::Px(8.0))),
-            );
-        }
-    }
-    out
-}
-
 /// The layout engine. Converts a DOM + styles into positioned elements.
 pub struct LayoutEngine {
-    tree: TaffyTree<TextBox>,
-    dom_to_taffy: HashMap<u32, taffy::NodeId>,
+    pub(super) tree: TaffyTree<TextBox>,
+    pub(super) dom_to_taffy: HashMap<u32, taffy::NodeId>,
     viewport: Viewport,
     dirty: bool,
     /// Bumped on every mutation that sets `dirty`, and never reset by
@@ -211,11 +88,19 @@ pub struct LayoutEngine {
     /// remains valid only while this value hasn't moved since it last
     /// checked.
     dirty_epoch: u64,
-    root_taffy: Option<taffy::NodeId>,
-    /// Author rules to cascade onto each element. Empty until the document's
-    /// stylesheets are parsed; without them every box falls back to UA defaults,
-    /// which is what made `getBoundingClientRect` report full-viewport widths.
-    rules: Vec<StyleRule>,
+    pub(super) root_taffy: Option<taffy::NodeId>,
+    /// What the painter reads from each element's cascaded style, keyed by DOM
+    /// node. Rebuilt with the tree on every `compute()`.
+    #[cfg(feature = "paint")]
+    pub(super) paint_styles: HashMap<u32, PaintStyle>,
+    /// Every style rule of the document, plus the user-agent sheet. Without the
+    /// author rules every box falls back to UA defaults, which is what made
+    /// `getBoundingClientRect` report full-viewport widths.
+    stylist: Rc<Stylist>,
+    /// The style pass, kept so `getComputedStyle` and layout share one result.
+    /// Valid while `styles_epoch` equals `dirty_epoch`.
+    styles: Option<StyleTree>,
+    styles_epoch: u64,
     /// Out-of-flow boxes waiting to be attached to their containing block,
     /// with a flag for `position: fixed`.
     ///
@@ -242,11 +127,15 @@ impl LayoutEngine {
             abs_pending: Vec::new(),
             css_position: HashMap::new(),
             css_display: HashMap::new(),
+            #[cfg(feature = "paint")]
+            paint_styles: HashMap::new(),
             viewport,
             dirty: true,
             dirty_epoch: 0,
             root_taffy: None,
-            rules: Vec::new(),
+            stylist: Rc::new(Stylist::new(crate::css_cascade::MediaFeatures::default())),
+            styles: None,
+            styles_epoch: 0,
         }
     }
 
@@ -264,10 +153,10 @@ impl LayoutEngine {
         self.set_dirty();
     }
 
-    /// Install the document's author rules. Marks layout dirty: geometry computed
+    /// Install the document's style rules. Marks layout dirty: geometry computed
     /// before the stylesheets arrived is wrong by definition.
-    pub fn set_style_rules(&mut self, rules: Vec<StyleRule>) {
-        self.rules = rules;
+    pub fn set_stylist(&mut self, stylist: Rc<Stylist>) {
+        self.stylist = stylist;
         self.set_dirty();
     }
 
@@ -299,16 +188,24 @@ impl LayoutEngine {
         self.abs_pending.clear();
         self.css_position.clear();
         self.css_display.clear();
+        #[cfg(feature = "paint")]
+        self.paint_styles.clear();
 
+        // The style pass: cascade and inheritance for the whole document, before
+        // any box is built.
+        self.style_tree(dom);
+        let Some(styles) = self.styles.take() else {
+            return;
+        };
         let ctx = ResolveContext {
-            font_size: 16.0,
-            root_font_size: 16.0,
+            font_size: crate::style::tree::DEFAULT_FONT_SIZE,
+            root_font_size: styles.root_font_size(),
             viewport_w: self.viewport.width,
             viewport_h: self.viewport.height,
         };
 
         // Build taffy tree from DOM
-        let root = self.build_node(dom, NodeId::DOCUMENT, &ctx);
+        let root = self.build_node(dom, NodeId::DOCUMENT, &ctx, &styles);
         self.root_taffy = root;
 
         // Run layout
@@ -322,7 +219,24 @@ impl LayoutEngine {
                 .ok();
         }
 
+        self.styles = Some(styles);
         self.dirty = false;
+    }
+
+    /// The document's computed styles, recomputed only if something changed
+    /// since they were last computed. Needs no layout.
+    pub fn style_tree(&mut self, dom: &Dom) -> &StyleTree {
+        if self.styles_epoch != self.dirty_epoch {
+            self.styles = None;
+            self.styles_epoch = self.dirty_epoch;
+        }
+        self.styles.get_or_insert_with(|| {
+            StyleTree::compute(
+                dom,
+                &self.stylist,
+                (self.viewport.width, self.viewport.height),
+            )
+        })
     }
 
     /// Ensure layout is computed (lazy).
@@ -397,6 +311,7 @@ impl LayoutEngine {
         dom: &Dom,
         root: NodeId,
         ctx: &ResolveContext,
+        styles: &StyleTree,
     ) -> Option<taffy::NodeId> {
         enum Work {
             Visit(NodeId),
@@ -441,7 +356,7 @@ impl LayoutEngine {
                     }
                 }
                 Work::Finish(node_id, mark) => {
-                    self.finish_node(dom, node_id, ctx, mark);
+                    self.finish_node(dom, node_id, ctx, styles, mark);
                 }
             }
         }
@@ -451,7 +366,14 @@ impl LayoutEngine {
     /// Build the taffy node for `node_id` using already-built children
     /// recorded in `self.dom_to_taffy` (set by prior Finish calls in
     /// post-order). Returns nothing — the result lives in `dom_to_taffy`.
-    fn finish_node(&mut self, dom: &Dom, node_id: NodeId, ctx: &ResolveContext, mark: usize) {
+    fn finish_node(
+        &mut self,
+        dom: &Dom,
+        node_id: NodeId,
+        doc_ctx: &ResolveContext,
+        styles: &StyleTree,
+        mark: usize,
+    ) {
         let node = match dom.get(node_id) {
             Some(n) => n,
             None => return,
@@ -485,7 +407,7 @@ impl LayoutEngine {
                 let style = taffy::Style {
                     display: taffy::Display::Block,
                     size: taffy::Size {
-                        width: Dimension::length(ctx.viewport_w),
+                        width: Dimension::length(doc_ctx.viewport_w),
                         height: Dimension::auto(),
                     },
                     ..Default::default()
@@ -496,19 +418,16 @@ impl LayoutEngine {
                 }
             }
             NodeData::Element(elem) => {
-                // Author rules first (specificity, then source order), inline last —
-                // inline always wins, matching the cascade.
-                // UA defaults go in first so author rules and inline styles
-                // still win over them.
-                let mut declarations = ua_declarations(&elem.name.local);
-                declarations.extend(svg_intrinsic_declarations(elem));
-                declarations.extend(presentational_declarations(elem));
-                declarations.extend(self.match_rules(dom, node_id));
-                declarations.extend(self.parse_inline_style(elem));
-                let computed = ComputedStyle::resolve(&declarations, None);
-                if let Some(CssValue::Display(Display::None)) = computed.get(&PropertyId::Display) {
+                // No entry means `display: none` on this element or an ancestor:
+                // no box.
+                let Some(computed) = styles.get(node_id) else {
                     return;
-                }
+                };
+                // Relative lengths on this element resolve against its own font size.
+                let ctx = &ResolveContext {
+                    font_size: styles.font_size(node_id),
+                    ..*doc_ctx
+                };
                 let position = match computed.get(&PropertyId::Position) {
                     Some(CssValue::Position(p)) => *p,
                     _ => Position::Static,
@@ -531,7 +450,10 @@ impl LayoutEngine {
                     _ => Display::Inline,
                 };
                 self.css_display.insert(node_id.to_raw(), display);
-                let mut taffy_style = computed_to_taffy(&computed, ctx);
+                #[cfg(feature = "paint")]
+                self.paint_styles
+                    .insert(node_id.to_raw(), PaintStyle::from_computed(computed));
+                let mut taffy_style = computed_to_taffy(computed, ctx);
 
                 // Quirks mode stretches the root boxes to the viewport. Chrome
                 // 153 on a doctype-less page: `documentElement.offsetHeight` is
@@ -595,6 +517,15 @@ impl LayoutEngine {
                 if text.trim().is_empty() {
                     return;
                 }
+                // Text under a `display: none` element has no style to inherit,
+                // and no box.
+                if let Some(parent) = node.parent {
+                    if dom.get(parent).is_some_and(|p| p.as_element().is_some())
+                        && styles.get(parent).is_none()
+                    {
+                        return;
+                    }
+                }
                 // Sized by the measure function, which can wrap it. A fixed
                 // width of `chars × 0.6em` never wrapped, so one long run of
                 // text made its container thousands of pixels wide and pushed
@@ -607,7 +538,9 @@ impl LayoutEngine {
                         .map(|w| w.chars().count())
                         .max()
                         .unwrap_or(0) as f32,
-                    font_size: ctx.font_size,
+                    font_size: node
+                        .parent
+                        .map_or(doc_ctx.font_size, |p| styles.font_size(p)),
                 };
                 match self
                     .tree
@@ -620,86 +553,6 @@ impl LayoutEngine {
             _ => return,
         };
         self.dom_to_taffy.insert(node_id.to_raw(), taffy_id);
-    }
-
-    /// Declarations from author rules that match `node_id`, resolved in cascade
-    /// order. Shorthands are expanded by `css_values::parse_property`, so a rule
-    /// like `margin: 15vh auto` lands as the four longhands layout actually reads.
-    fn match_rules(&self, dom: &Dom, node_id: NodeId) -> HashMap<PropertyId, CssValue> {
-        let mut out: HashMap<PropertyId, CssValue> = HashMap::new();
-        if self.rules.is_empty() {
-            return out;
-        }
-        let Some(element) = crate::dom::DomElement::new(dom, node_id) else {
-            return out;
-        };
-        // (specificity, source order) per property — later wins ties.
-        let mut winner: HashMap<PropertyId, (u32, usize)> = HashMap::new();
-        for (order, rule) in self.rules.iter().enumerate() {
-            let Some(spec) = rule
-                .selectors
-                .iter()
-                .filter(|sel| crate::css_selectors::matches_selector(&element, sel))
-                .map(|sel| {
-                    let s = crate::css_selectors::compute_specificity(sel);
-                    s.a * 10000 + s.b * 100 + s.c
-                })
-                .max()
-            else {
-                continue;
-            };
-            // Re-serialise and parse through the same path as inline styles so
-            // shorthands expand identically. `declarations` is a HashMap, so
-            // within-rule source order is already lost upstream — a rule mixing
-            // `margin` and `margin-top` can resolve either way.
-            let text: String = rule
-                .declarations
-                .iter()
-                .map(|(k, v)| format!("{k}:{v};"))
-                .collect();
-            let (decls, _) = crate::css_parser::parse_declaration_list(&text);
-            for decl in &decls {
-                let Ok(props) =
-                    crate::css_values::parse_property(decl.name, &decl.value, decl.important)
-                else {
-                    continue;
-                };
-                for prop in props {
-                    let beats = match winner.get(&prop.property) {
-                        Some(&(w_spec, w_order)) => {
-                            spec > w_spec || (spec == w_spec && order >= w_order)
-                        }
-                        None => true,
-                    };
-                    if beats {
-                        winner.insert(prop.property.clone(), (spec, order));
-                        out.insert(prop.property, prop.value);
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    fn parse_inline_style(
-        &self,
-        elem: &crate::dom::node::ElementData,
-    ) -> HashMap<PropertyId, CssValue> {
-        let mut map = HashMap::new();
-        let style_attr = elem.attrs.iter().find(|a| a.name.local == "style");
-        if let Some(attr) = style_attr {
-            let (decls, _) = crate::css_parser::parse_declaration_list(&attr.value);
-            for decl in &decls {
-                if let Ok(props) =
-                    crate::css_values::parse_property(decl.name, &decl.value, decl.important)
-                {
-                    for prop in props {
-                        map.insert(prop.property, prop.value);
-                    }
-                }
-            }
-        }
-        map
     }
 
     fn absolute_position(&self, taffy_id: taffy::NodeId) -> (f32, f32) {

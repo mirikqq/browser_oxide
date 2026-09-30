@@ -6,6 +6,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`paint` feature: `Page::screenshot`.** Rasterises the page from the engine's
+  own layout — backgrounds, borders, text, `overflow` clipping — onto the Skia
+  surface canvas already uses. Off by default; adds no dependencies. It draws
+  what layout believes, so it shows where layout is still approximate
+  (`docs/GUI_PLAN.md`, milestone M1). `EngineHandle::load_html` and
+  `EngineHandle::screenshot` expose it across the thread boundary, and
+  `examples/screenshot.rs` renders a URL or file to PNG.
+- **`browser_oxide_shell`: a desktop window** (address bar + the painted page).
+  A separate, unpublished workspace member and not a default one, so the
+  engine's dependency tree stays free of any window toolkit.
+
 ### Security
 - **Page script could mint `isTrusted` events.** The engine namespace hides
   from `Object.getOwnPropertySymbols(window)` only when called with one

@@ -98,6 +98,22 @@ jobs:
       - name: Build (debug)
         run: cargo build --workspace
 
+      # The engine crate must stay headless: the desktop shell's window toolkit
+      # may only appear in `browser_oxide_shell`'s own tree. Checked on Linux,
+      # where `cargo tree` is one bash line; the tree is the same everywhere.
+      - name: Headless engine carries no window toolkit
+        if: runner.os == 'Linux' && matrix.rust == 'stable'
+        run: |
+          if cargo tree -p browser_oxide -e normal,build | grep -Ei 'winit|egui|eframe|glutin|wgpu|softbuffer'; then
+            echo "::error::browser_oxide's dependency tree contains a window toolkit"
+            exit 1
+          fi
+
+      # `--workspace` builds unify `paint` on through the shell. Without it, the
+      # engine must still compile and pass its own lints, so the cfg gates hold.
+      - name: Check the engine without the paint feature
+        run: cargo check -p browser_oxide --all-targets
+
       # V8 isolates are per-thread — the project enforces single-threaded
       # tests (see CLAUDE.md). Network-bound and live anti-bot tests are
       # `#[ignore]` and not run here.
@@ -146,7 +162,9 @@ jobs:
           toolchain: "1.91"
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libfreetype6-dev
-      - run: cargo build --workspace
+      # The desktop shell's window toolkit needs a newer compiler than the engine
+      # (see its `rust-version`); the engine and MCP server are what 1.91 covers.
+      - run: cargo build --workspace --exclude browser_oxide_shell
 
   deny:
     name: cargo-deny (licenses + advisories + sources)

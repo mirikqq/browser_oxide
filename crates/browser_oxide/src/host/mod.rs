@@ -63,6 +63,18 @@ enum Cmd {
         selector: String,
         reply: Sender<Result<Option<String>, HostError>>,
     },
+    #[cfg(feature = "paint")]
+    LoadHtml {
+        html: String,
+        url: String,
+        profile: Box<StealthProfile>,
+        reply: Sender<Result<PageSnapshot, HostError>>,
+    },
+    #[cfg(feature = "paint")]
+    Screenshot {
+        full_page: bool,
+        reply: Sender<Result<crate::paint::Bitmap, HostError>>,
+    },
     Shutdown,
 }
 
@@ -124,6 +136,44 @@ impl EngineHandle {
                 js: js.to_string(),
                 reply,
             })
+            .map_err(|_| HostError::Disconnected)?;
+        rx.recv().map_err(|_| HostError::Disconnected)?
+    }
+
+    /// Load `html` as the current page, as if it had been fetched from `url`
+    /// (`feature = "paint"`). No network is involved, which is what a local file
+    /// or a test fixture wants.
+    #[cfg(feature = "paint")]
+    pub fn load_html(
+        &self,
+        html: &str,
+        url: &str,
+        profile: StealthProfile,
+    ) -> Result<PageSnapshot, HostError> {
+        let (reply, rx) = channel();
+        self.tx
+            .lock()
+            .map_err(|_| HostError::Disconnected)?
+            .send(Cmd::LoadHtml {
+                html: html.to_string(),
+                url: url.to_string(),
+                profile: Box::new(profile),
+                reply,
+            })
+            .map_err(|_| HostError::Disconnected)?;
+        rx.recv().map_err(|_| HostError::Disconnected)?
+    }
+
+    /// Rasterise the current page (`feature = "paint"`); see
+    /// [`crate::Page::screenshot`]. Blocks the caller until the engine thread
+    /// has drawn it, so call it from a worker thread, not a UI thread.
+    #[cfg(feature = "paint")]
+    pub fn screenshot(&self, full_page: bool) -> Result<crate::paint::Bitmap, HostError> {
+        let (reply, rx) = channel();
+        self.tx
+            .lock()
+            .map_err(|_| HostError::Disconnected)?
+            .send(Cmd::Screenshot { full_page, reply })
             .map_err(|_| HostError::Disconnected)?;
         rx.recv().map_err(|_| HostError::Disconnected)?
     }
@@ -193,6 +243,42 @@ fn engine_loop(rx: Receiver<Cmd>) {
                             Ok(snap)
                         }
                         Err(e) => Err(HostError::Engine(e.to_string())),
+                    };
+                    let _ = reply.send(res);
+                }
+                #[cfg(feature = "paint")]
+                Cmd::LoadHtml {
+                    html,
+                    url,
+                    profile,
+                    reply,
+                } => {
+                    let res =
+                        match crate::Page::from_html_with_url(&html, &url, Some(*profile)).await {
+                            Ok(mut page) => {
+                                let verdict = page.challenge_verdict();
+                                let snap = PageSnapshot {
+                                    url: page.url().to_string(),
+                                    title: page.title(),
+                                    html: page.content(),
+                                    text: page.text_content(),
+                                    verdict: verdict.as_str().to_string(),
+                                    is_challenge: verdict.is_challenge(),
+                                };
+                                current = Some(page);
+                                Ok(snap)
+                            }
+                            Err(e) => Err(HostError::Engine(e.to_string())),
+                        };
+                    let _ = reply.send(res);
+                }
+                #[cfg(feature = "paint")]
+                Cmd::Screenshot { full_page, reply } => {
+                    let res = match current.as_mut() {
+                        Some(p) => p
+                            .screenshot(&crate::paint::ScreenshotOptions { full_page })
+                            .map_err(HostError::Engine),
+                        None => Err(HostError::NoPage),
                     };
                     let _ = reply.send(res);
                 }

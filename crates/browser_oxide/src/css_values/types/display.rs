@@ -24,6 +24,35 @@ pub enum Display {
     TableCaption,
 }
 
+impl Display {
+    /// The keyword `getComputedStyle` reports.
+    pub fn as_css(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Block => "block",
+            Self::Inline => "inline",
+            Self::InlineBlock => "inline-block",
+            Self::Flex => "flex",
+            Self::InlineFlex => "inline-flex",
+            Self::Grid => "grid",
+            Self::InlineGrid => "inline-grid",
+            Self::Table => "table",
+            Self::InlineTable => "inline-table",
+            Self::ListItem => "list-item",
+            Self::FlowRoot => "flow-root",
+            Self::Contents => "contents",
+            Self::TableRow => "table-row",
+            Self::TableCell => "table-cell",
+            Self::TableColumn => "table-column",
+            Self::TableColumnGroup => "table-column-group",
+            Self::TableHeaderGroup => "table-header-group",
+            Self::TableFooterGroup => "table-footer-group",
+            Self::TableRowGroup => "table-row-group",
+            Self::TableCaption => "table-caption",
+        }
+    }
+}
+
 /// CSS `position` property values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Position {

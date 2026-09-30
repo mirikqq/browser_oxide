@@ -43,6 +43,11 @@ pub fn initial_value(property: &PropertyId) -> CssValue {
         | PropertyId::BorderLeftWidth => {
             CssValue::Length(Length::Px(3.0)) // medium
         }
+        // `currentcolor`: resolved against the element's own `color` when painted.
+        PropertyId::BorderTopColor
+        | PropertyId::BorderRightColor
+        | PropertyId::BorderBottomColor
+        | PropertyId::BorderLeftColor => CssValue::Color(Color::CurrentColor),
         PropertyId::BoxSizing => CssValue::BoxSizing(BoxSizing::ContentBox),
         PropertyId::OverflowX | PropertyId::OverflowY => CssValue::Overflow(Overflow::Visible),
         PropertyId::Float => CssValue::Float(Float::None),

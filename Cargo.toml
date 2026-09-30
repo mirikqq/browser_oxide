@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/browser_oxide", "crates/browser_oxide_mcp"]
+members = [
+  "crates/browser_oxide",
+  "crates/browser_oxide_mcp",
+  "crates/browser_oxide_shell",
+]
+# The desktop shell pulls in a window toolkit; a bare `cargo build` stays headless.
+# Build it explicitly: `cargo build -p browser_oxide_shell`.
+default-members = ["crates/browser_oxide", "crates/browser_oxide_mcp"]
 # browser_oxide_py is a STANDALONE workspace (own [workspace] in its Cargo.toml),
 # excluded here so `cargo build --workspace` for the engine skips the V8-cdylib.
 # On Linux it requires a from-source V8 build (V8_FROM_SOURCE=1) for a shared-lib-
