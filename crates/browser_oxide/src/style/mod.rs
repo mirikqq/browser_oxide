@@ -6,6 +6,7 @@
 //! declarations win, and a [`StyleTree`] turns the winners into computed styles
 //! with inheritance, the way a browser's style pass does.
 
+pub mod custom;
 pub(crate) mod hints;
 pub mod stylist;
 pub mod tree;

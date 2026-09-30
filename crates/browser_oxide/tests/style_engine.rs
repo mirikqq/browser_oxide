@@ -28,7 +28,10 @@ fn rect(p: &mut Page, id: &str) -> Vec<f64> {
 async fn ua_sheet_gives_tags_their_display() {
     let mut p = page("<div id=d></div><span id=s></span><h1 id=h>x</h1><li id=l></li>").await;
     let mut d = |id: &str| {
-        js(&mut p, &format!("getComputedStyle(document.getElementById('{id}')).display"))
+        js(
+            &mut p,
+            &format!("getComputedStyle(document.getElementById('{id}')).display"),
+        )
     };
     assert_eq!(d("d"), "block");
     assert_eq!(d("s"), "inline");
@@ -44,11 +47,18 @@ async fn font_size_inherits_and_compounds() {
     )
     .await;
     let fs = |p: &mut Page, id: &str| {
-        js(p, &format!("getComputedStyle(document.getElementById('{id}')).fontSize"))
+        js(
+            p,
+            &format!("getComputedStyle(document.getElementById('{id}')).fontSize"),
+        )
     };
     assert_eq!(fs(&mut p, "a"), "20px");
     assert_eq!(fs(&mut p, "b"), "30px");
-    assert_eq!(fs(&mut p, "c"), "30px", "a descendant inherits the computed size");
+    assert_eq!(
+        fs(&mut p, "c"),
+        "30px",
+        "a descendant inherits the computed size"
+    );
     assert_eq!(fs(&mut p, "h"), "32px", "h1 is 2em of the default 16px");
 }
 
@@ -56,7 +66,10 @@ async fn font_size_inherits_and_compounds() {
 async fn em_margins_use_the_elements_own_font_size() {
     let mut p = page("<style>#a{font-size:10px;margin-top:2em}</style><div id=a>x</div>").await;
     assert_eq!(
-        js(&mut p, "getComputedStyle(document.getElementById('a')).marginTop"),
+        js(
+            &mut p,
+            "getComputedStyle(document.getElementById('a')).marginTop"
+        ),
         "20px"
     );
 }
@@ -74,7 +87,10 @@ async fn important_and_layers_decide_the_winner() {
     )
     .await;
     let w = |p: &mut Page, id: &str| {
-        js(p, &format!("getComputedStyle(document.getElementById('{id}')).width"))
+        js(
+            p,
+            &format!("getComputedStyle(document.getElementById('{id}')).width"),
+        )
     };
     assert_eq!(w(&mut p, "a"), "200px", "the later layer wins");
     assert_eq!(w(&mut p, "b"), "10px", "!important beats a later rule");
@@ -143,7 +159,11 @@ async fn logical_margin_centres_a_block() {
     .await;
     let a = rect(&mut p, "a");
     let vw: f64 = js(&mut p, "innerWidth").parse().expect("innerWidth");
-    assert!((a[0] - (vw - 100.0) / 2.0).abs() < 0.5, "x={} vw={vw}", a[0]);
+    assert!(
+        (a[0] - (vw - 100.0) / 2.0).abs() < 0.5,
+        "x={} vw={vw}",
+        a[0]
+    );
 }
 
 #[tokio::test]

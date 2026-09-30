@@ -19,8 +19,9 @@ use crate::css_values::types::length::{Length, LengthPercentage};
 use crate::dom::node::{NodeData, NodeId};
 use crate::dom::Dom;
 use crate::layout::resolve::{resolve_length, ResolveContext};
+use crate::style::custom::CustomProps;
 use crate::style::hints::{presentational_declarations, svg_intrinsic_declarations};
-use crate::style::stylist::{entries_for, parse_inline_style, Stylist, HINT_ORDER};
+use crate::style::stylist::{entries_for, Stylist, HINT_ORDER};
 
 /// `font-size: medium`.
 pub const DEFAULT_FONT_SIZE: f32 = 16.0;
@@ -30,14 +31,19 @@ pub const DEFAULT_FONT_SIZE: f32 = 16.0;
 /// Elements with `display: none` and everything beneath them have no entry: they
 /// generate no box, and nothing in layout or paint reads their style.
 pub struct StyleTree {
-    styles: Vec<Option<ComputedStyle>>,
+    styles: Vec<Option<Styled>>,
     root_font_size: f32,
+}
+
+struct Styled {
+    style: ComputedStyle,
+    custom: CustomProps,
 }
 
 impl StyleTree {
     /// Style `dom`. `viewport` is `(width, height)` in px, for `vw`/`vh` units.
     pub fn compute(dom: &Dom, stylist: &Stylist, viewport: (f32, f32)) -> Self {
-        let mut styles: Vec<Option<ComputedStyle>> = vec![None; dom.len()];
+        let mut styles: Vec<Option<Styled>> = (0..dom.len()).map(|_| None).collect();
         let mut root_font_size = DEFAULT_FONT_SIZE;
         // Pre-order, so a parent is always styled before its children.
         let mut stack = vec![dom.document()];
@@ -54,20 +60,13 @@ impl StyleTree {
                         .and_then(|p| dom.get(p))
                         .is_some_and(|p| matches!(p.data, NodeData::Document));
 
-                    let style = compute_element(
-                        dom,
-                        stylist,
-                        node,
-                        elem,
-                        parent,
-                        root_font_size,
-                        viewport,
-                    );
+                    let style =
+                        compute_element(dom, stylist, node, elem, parent, root_font_size, viewport);
                     if is_root {
-                        root_font_size = font_px(&style).unwrap_or(DEFAULT_FONT_SIZE);
+                        root_font_size = font_px(&style.style).unwrap_or(DEFAULT_FONT_SIZE);
                     }
                     let hidden = matches!(
-                        style.get(&PropertyId::Display),
+                        style.style.get(&PropertyId::Display),
                         Some(CssValue::Display(Display::None))
                     );
                     if hidden {
@@ -91,7 +90,17 @@ impl StyleTree {
 
     /// The computed style of `node`, if it is an element that generates a box.
     pub fn get(&self, node: NodeId) -> Option<&ComputedStyle> {
-        self.styles.get(node.to_raw() as usize)?.as_ref()
+        Some(&self.styles.get(node.to_raw() as usize)?.as_ref()?.style)
+    }
+
+    /// The custom properties (`--name`) in effect on `node`, empty for a node with
+    /// no style.
+    pub fn custom(&self, node: NodeId) -> CustomProps {
+        self.styles
+            .get(node.to_raw() as usize)
+            .and_then(|s| s.as_ref())
+            .map(|s| s.custom.clone())
+            .unwrap_or_default()
     }
 
     /// Computed `font-size` of `node` in px, or the default for a node with no style.
@@ -120,12 +129,13 @@ fn compute_element(
     stylist: &Stylist,
     node: NodeId,
     elem: &crate::dom::node::ElementData,
-    parent: Option<&ComputedStyle>,
+    parent: Option<&Styled>,
     root_font_size: f32,
     viewport: (f32, f32),
-) -> ComputedStyle {
+) -> Styled {
     // Presentational hints sit above the user-agent sheet and below every
-    // author rule; the `style` attribute sits above everything unimportant.
+    // author rule; the stylist adds the `style` attribute above everything
+    // unimportant.
     let mut extra: Vec<CascadeEntry> = Vec::new();
     let as_decls = |map: std::collections::HashMap<PropertyId, CssValue>| {
         map.into_iter()
@@ -148,20 +158,14 @@ fn compute_element(
         Specificity::default(),
         HINT_ORDER + 1,
     ));
-    if let Some(attr) = elem.attrs.iter().find(|a| a.name.local == "style") {
-        extra.extend(entries_for(
-            parse_inline_style(&attr.value),
-            Origin::Author,
-            Specificity::new(u32::MAX, 0, 0),
-            u32::MAX,
-        ));
-    }
 
-    let cascaded = stylist.cascade(dom, node, extra);
-    let mut style = ComputedStyle::resolve(&cascaded, parent);
+    let inherited = parent.map(|p| p.custom.clone()).unwrap_or_default();
+    let (cascaded, custom) = stylist.cascade_with_custom(dom, node, extra, &inherited);
+    let parent_style = parent.map(|p| &p.style);
+    let mut style = ComputedStyle::resolve(&cascaded, parent_style);
 
     // Font size first: it is the base for every other relative length.
-    let parent_px = parent.and_then(font_px).unwrap_or(DEFAULT_FONT_SIZE);
+    let parent_px = parent_style.and_then(font_px).unwrap_or(DEFAULT_FONT_SIZE);
     let ctx = ResolveContext {
         font_size: parent_px,
         root_font_size,
@@ -169,7 +173,8 @@ fn compute_element(
         viewport_h: viewport.1,
     };
     let px = match cascaded.get(&PropertyId::FontSize) {
-        None | Some(CssValue::Inherit | CssValue::Unset | CssValue::Revert | CssValue::RevertLayer) => {
+        None
+        | Some(CssValue::Inherit | CssValue::Unset | CssValue::Revert | CssValue::RevertLayer) => {
             parent_px
         }
         Some(CssValue::Initial) => DEFAULT_FONT_SIZE,
@@ -180,8 +185,11 @@ fn compute_element(
         }
         Some(_) => parent_px,
     };
-    style.set(PropertyId::FontSize, CssValue::Length(Length::Px(px as f64)));
-    style
+    style.set(
+        PropertyId::FontSize,
+        CssValue::Length(Length::Px(px as f64)),
+    );
+    Styled { style, custom }
 }
 
 #[cfg(test)]
@@ -269,20 +277,19 @@ mod tests {
             "<p id=a style='width:10px'>x</p><p id=b style='width:10px'>y</p>",
             "p{width:99px} #b{width:50px !important}",
         );
-        let w = |n: &str| {
-            t.get(id(&dom, n))
-                .unwrap()
-                .get(&PropertyId::Width)
-                .cloned()
-        };
+        let w = |n: &str| t.get(id(&dom, n)).unwrap().get(&PropertyId::Width).cloned();
         use crate::css_values::types::length::LengthPercentageAuto as Lpa;
         assert_eq!(
             w("a"),
-            Some(CssValue::LengthPercentageAuto(Lpa::Length(Length::Px(10.0))))
+            Some(CssValue::LengthPercentageAuto(Lpa::Length(Length::Px(
+                10.0
+            ))))
         );
         assert_eq!(
             w("b"),
-            Some(CssValue::LengthPercentageAuto(Lpa::Length(Length::Px(50.0))))
+            Some(CssValue::LengthPercentageAuto(Lpa::Length(Length::Px(
+                50.0
+            ))))
         );
     }
 }

@@ -7,10 +7,12 @@
 //! winner ([`Stylist::winning_raw`]), so the two cannot disagree about which rule
 //! won.
 //!
-//! What it understands: origins (user agent / author), `!important`, `@layer`
-//! (registration order, unlayered-beats-layered, the reversal for important),
-//! `@media` against the profile's viewport, `@supports` (assumed true unless
-//! negated), and CSS nesting (`&`). Everything else an at-rule can carry
+//! What it understands: origins (user agent / author), `!important`, the `style`
+//! attribute (author origin, above every selector), `@layer` (registration
+//! order, unlayered-beats-layered, the reversal for important), `@media` against
+//! the profile's viewport, `@supports` (assumed true unless negated), CSS nesting
+//! (`&`), and custom properties with `var()` (see `custom.rs`: substituted as
+//! text, per element, in the rules that use them). Everything else an at-rule can carry
 //! (`@container`, `@scope`, `@font-face`, `@keyframes`, `@import`, …) is skipped.
 //!
 //! Matching goes through an index on the rightmost compound selector — id, class
@@ -18,13 +20,13 @@
 //! it, not against every rule in the document.
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use crate::css_cascade::{
     cascade_sort, compare_keys, evaluate_media_query, CascadeEntry, CascadeKey, LayerId,
     MediaFeatures, Origin,
 };
-use crate::css_parser::ast::{Block, Rule as AstRule};
+use crate::css_parser::ast::{Block, Declaration, Rule as AstRule};
 use crate::css_selectors::{
     compute_specificity, matches_selector, parse_selector_list, Component, SelectorList,
     SimpleSelector, Specificity,
@@ -34,9 +36,11 @@ use crate::dom::element::DomElement;
 use crate::dom::node::{NodeData, NodeId};
 use crate::dom::Dom;
 use crate::js_runtime::utils::tokens_to_string;
+use crate::style::custom::{self, CustomProps};
 
 /// The user-agent stylesheet, see `ua.css`.
 const UA_CSS: &str = include_str!("ua.css");
+
 
 /// Order given to presentational hints: above every rule of the user-agent sheet,
 /// below every author rule (the origin sees to the latter).
@@ -64,6 +68,7 @@ pub struct Rule {
     pub layer: Option<LayerId>,
     /// Position in the document's rules; later wins a tie.
     pub order: u32,
+    pub dynamic: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -77,9 +82,9 @@ struct Buckets {
 /// All the document's style rules.
 #[derive(Debug, Clone)]
 pub struct Stylist {
-    rules: Vec<Rule>,
-    buckets: Buckets,
-    layers: HashMap<String, LayerId>,
+    rules: Arc<Vec<Rule>>,
+    buckets: Arc<Buckets>,
+    layers: Arc<HashMap<String, LayerId>>,
     media: MediaFeatures,
 }
 
@@ -93,9 +98,9 @@ static UA_STYLIST: LazyLock<Stylist> = LazyLock::new(|| {
 impl Stylist {
     fn empty(media: MediaFeatures) -> Self {
         Self {
-            rules: Vec::new(),
-            buckets: Buckets::default(),
-            layers: HashMap::new(),
+            rules: Arc::default(),
+            buckets: Arc::default(),
+            layers: Arc::default(),
             media,
         }
     }
@@ -129,7 +134,7 @@ impl Stylist {
         // Ids are handed out in registration order, which is the order the
         // cascade sorts layers by.
         let id = self.layers.len() as LayerId + 1;
-        self.layers.insert(full_name.to_string(), id);
+        Arc::make_mut(&mut self.layers).insert(full_name.to_string(), id);
         id
     }
 
@@ -188,13 +193,9 @@ impl Stylist {
                                 );
                             }
                         }
-                        "layer" => self.add_layer(
-                            prelude,
-                            at.block.as_ref(),
-                            origin,
-                            layer_path,
-                            parent,
-                        ),
+                        "layer" => {
+                            self.add_layer(prelude, at.block.as_ref(), origin, layer_path, parent)
+                        }
                         // @container, @scope, @starting-style, @font-face,
                         // @keyframes, @import, @property, …: not style rules for
                         // the elements themselves, or not understood yet.
@@ -285,26 +286,26 @@ impl Stylist {
             let mut decls = Vec::new();
             let mut raw = Vec::new();
             for d in declarations {
-                raw.push(RawDecl {
-                    name: d.name.to_ascii_lowercase(),
-                    value: tokens_to_string(&d.value).trim().to_string(),
-                    important: d.important,
-                });
+                raw.push(raw_decl(d));
                 if let Ok(props) = crate::css_values::parse_property(d.name, &d.value, d.important)
                 {
                     decls.extend(props);
                 }
             }
+            let dynamic = raw
+                .iter()
+                .any(|d| d.name.starts_with("--") || custom::has_var(&d.value));
             if let Ok(selectors) = parse_selector_list(selector) {
                 let index = self.rules.len() as u32;
                 if self.index_rule(index, &selectors) {
-                    self.rules.push(Rule {
+                    Arc::make_mut(&mut self.rules).push(Rule {
                         selectors,
                         decls,
                         raw,
                         origin,
                         layer,
                         order: index,
+                        dynamic,
                     });
                 }
             }
@@ -318,6 +319,7 @@ impl Stylist {
     /// Returns false, registering nothing, if no selector can match an element
     /// (every one of them ends in a pseudo-element).
     fn index_rule(&mut self, index: u32, selectors: &SelectorList) -> bool {
+        let buckets = Arc::make_mut(&mut self.buckets);
         let mut any = false;
         for sel in selectors {
             let components = sel.components();
@@ -338,23 +340,22 @@ impl Stylist {
                     Component::Combinator(_) => None,
                 })
                 .collect();
-            let bucket = if let Some(SimpleSelector::Id(id)) = compound
-                .iter()
-                .find(|s| matches!(s, SimpleSelector::Id(_)))
+            let bucket = if let Some(SimpleSelector::Id(id)) =
+                compound.iter().find(|s| matches!(s, SimpleSelector::Id(_)))
             {
-                self.buckets.by_id.entry(id.clone()).or_default()
+                buckets.by_id.entry(id.clone()).or_default()
             } else if let Some(SimpleSelector::Class(c)) = compound
                 .iter()
                 .find(|s| matches!(s, SimpleSelector::Class(_)))
             {
-                self.buckets.by_class.entry(c.clone()).or_default()
+                buckets.by_class.entry(c.clone()).or_default()
             } else if let Some(SimpleSelector::Type(t)) = compound
                 .iter()
                 .find(|s| matches!(s, SimpleSelector::Type(_)))
             {
-                self.buckets.by_tag.entry(t.to_ascii_lowercase()).or_default()
+                buckets.by_tag.entry(t.to_ascii_lowercase()).or_default()
             } else {
-                &mut self.buckets.universal
+                &mut buckets.universal
             };
             if bucket.last() != Some(&index) {
                 bucket.push(index);
@@ -369,7 +370,11 @@ impl Stylist {
             return Vec::new();
         };
         let mut out: Vec<u32> = self.buckets.universal.clone();
-        if let Some(v) = self.buckets.by_tag.get(&elem.name.local.to_ascii_lowercase()) {
+        if let Some(v) = self
+            .buckets
+            .by_tag
+            .get(&elem.name.local.to_ascii_lowercase())
+        {
             out.extend_from_slice(v);
         }
         for attr in &elem.attrs {
@@ -419,16 +424,45 @@ impl Stylist {
     }
 
     /// The cascaded value of every property for `node`: the winner of each
-    /// property among the matching rules and `extra` (presentational hints,
-    /// the `style` attribute).
+    /// property among the matching rules, the `style` attribute and `extra`
+    /// (presentational hints). Custom properties are not inherited here; see
+    /// [`Stylist::cascade_with_custom`].
     pub fn cascade(
         &self,
         dom: &Dom,
         node: NodeId,
         extra: Vec<CascadeEntry>,
     ) -> HashMap<PropertyId, CssValue> {
+        self.cascade_with_custom(dom, node, extra, &CustomProps::default())
+            .0
+    }
+
+    /// [`Stylist::cascade`], with `var()` resolved against the custom properties
+    /// the element inherits (`inherited`) and declares itself. Also returns the
+    /// element's custom properties, for its children to inherit.
+    pub fn cascade_with_custom(
+        &self,
+        dom: &Dom,
+        node: NodeId,
+        extra: Vec<CascadeEntry>,
+        inherited: &CustomProps,
+    ) -> (HashMap<PropertyId, CssValue>, CustomProps) {
         let mut entries = extra;
+        let mut dynamic: Vec<(CascadeKey, RawDecl)> = Vec::new();
         for (rule, specificity) in self.matching(dom, node) {
+            if rule.dynamic {
+                for d in &rule.raw {
+                    let key = CascadeKey {
+                        important: d.important,
+                        origin: rule.origin,
+                        layer: rule.layer,
+                        specificity,
+                        source_order: rule.order,
+                    };
+                    dynamic.push((key, d.clone()));
+                }
+                continue;
+            }
             for decl in &rule.decls {
                 entries.push(CascadeEntry {
                     declaration: decl.clone(),
@@ -439,15 +473,46 @@ impl Stylist {
                 });
             }
         }
-        cascade_sort(&mut entries)
+        dynamic.extend(
+            inline_decls(dom, node)
+                .into_iter()
+                .map(|d| (inline_key(d.important), d)),
+        );
+        dynamic.sort_by(|a, b| compare_keys(&a.0, &b.0));
+
+        let declared: HashMap<String, String> = dynamic
+            .iter()
+            .filter(|(_, d)| d.name.starts_with("--"))
+            .map(|(_, d)| (d.name.clone(), d.value.clone()))
+            .collect();
+        let props = custom::inherit(inherited, declared);
+
+        for (key, d) in dynamic.iter().filter(|(_, d)| !d.name.starts_with("--")) {
+            let Some(value) = custom::substitute(&d.value, &mut |n| props.get(n).cloned()) else {
+                continue;
+            };
+            let important = if d.important { " !important" } else { "" };
+            let text = format!("{}:{}{}", d.name, value, important);
+            for declaration in parse_inline_style(&text) {
+                entries.push(CascadeEntry {
+                    declaration,
+                    origin: key.origin,
+                    layer: key.layer,
+                    specificity: key.specificity,
+                    source_order: key.source_order,
+                });
+            }
+        }
+        (cascade_sort(&mut entries), props)
     }
 
     /// Every declaration that applies to `node`, as written, weakest first: the
     /// last one to set a property is its cascade winner. Shorthands are left
     /// unexpanded, in the order they were written, so a caller that expands them
-    /// as it goes gets later-beats-earlier right within a rule too.
-    pub fn matching_declarations<'a>(&'a self, dom: &'a Dom, node: NodeId) -> Vec<&'a RawDecl> {
-        let mut found: Vec<(CascadeKey, usize, &RawDecl)> = Vec::new();
+    /// as it goes gets later-beats-earlier right within a rule too. The `style`
+    /// attribute is included, ranked as the cascade ranks it.
+    pub fn matching_declarations(&self, dom: &Dom, node: NodeId) -> Vec<RawDecl> {
+        let mut found: Vec<(CascadeKey, usize, RawDecl)> = Vec::new();
         for (rule, specificity) in self.matching(dom, node) {
             for decl in &rule.raw {
                 let key = CascadeKey {
@@ -457,8 +522,11 @@ impl Stylist {
                     specificity,
                     source_order: rule.order,
                 };
-                found.push((key, found.len(), decl));
+                found.push((key, found.len(), decl.clone()));
             }
+        }
+        for decl in inline_decls(dom, node) {
+            found.push((inline_key(decl.important), found.len(), decl));
         }
         // The running index keeps written order among declarations of one rule.
         found.sort_by(|a, b| compare_keys(&a.0, &b.0).then(a.1.cmp(&b.1)));
@@ -466,30 +534,77 @@ impl Stylist {
     }
 
     /// The text of the winning declaration of `name` (a CSS property name as
-    /// written, lowercase) from the style rules alone, or `None` if no rule sets
-    /// it. Ordered by the same comparison as [`Stylist::cascade`].
+    /// written, lowercase) from the style rules and the `style` attribute, or
+    /// `None` if nothing sets it. Ordered by the same comparison as
+    /// [`Stylist::cascade`]. The text is as written: a `var()` in it is not
+    /// resolved here.
     ///
     /// Shorthands are not expanded: asking for `margin-top` finds only rules that
     /// wrote `margin-top`.
     pub fn winning_raw(&self, dom: &Dom, node: NodeId, name: &str) -> Option<String> {
-        let mut found: Vec<(CascadeKey, &str)> = Vec::new();
+        let mut found: Vec<(CascadeKey, String)> = Vec::new();
         for (rule, specificity) in self.matching(dom, node) {
             for decl in rule.raw.iter().filter(|d| d.name == name) {
-                found.push((
-                    CascadeKey {
-                        important: decl.important,
-                        origin: rule.origin,
-                        layer: rule.layer,
-                        specificity,
-                        source_order: rule.order,
-                    },
-                    decl.value.as_str(),
-                ));
+                let key = CascadeKey {
+                    important: decl.important,
+                    origin: rule.origin,
+                    layer: rule.layer,
+                    specificity,
+                    source_order: rule.order,
+                };
+                found.push((key, decl.value.clone()));
             }
+        }
+        for decl in inline_decls(dom, node)
+            .into_iter()
+            .filter(|d| d.name == name)
+        {
+            found.push((inline_key(decl.important), decl.value));
         }
         // Stable, ascending, so among equals the later declaration is last.
         found.sort_by(|a, b| compare_keys(&a.0, &b.0));
-        found.last().map(|(_, v)| (*v).to_string())
+        found.pop().map(|(_, v)| v)
+    }
+}
+
+fn raw_decl(d: &Declaration<'_>) -> RawDecl {
+    RawDecl {
+        name: if d.name.starts_with("--") {
+            d.name.to_string()
+        } else {
+            d.name.to_ascii_lowercase()
+        },
+        value: tokens_to_string(&d.value).trim().to_string(),
+        important: d.important,
+    }
+}
+
+fn inline_decls(dom: &Dom, node: NodeId) -> Vec<RawDecl> {
+    let Some(NodeData::Element(elem)) = dom.get(node).map(|n| &n.data) else {
+        return Vec::new();
+    };
+    let Some(attr) = elem
+        .attrs
+        .iter()
+        .find(|a| a.name.local.eq_ignore_ascii_case("style"))
+    else {
+        return Vec::new();
+    };
+    let (decls, _) = crate::css_parser::parse_declaration_list(&attr.value);
+    decls
+        .iter()
+        .map(raw_decl)
+        .filter(|d| !d.value.is_empty())
+        .collect()
+}
+
+fn inline_key(important: bool) -> CascadeKey {
+    CascadeKey {
+        important,
+        origin: Origin::Author,
+        layer: None,
+        specificity: Specificity::new(u32::MAX, 0, 0),
+        source_order: u32::MAX,
     }
 }
 
@@ -658,8 +773,10 @@ mod tests {
     #[test]
     fn media_blocks_follow_the_viewport() {
         let dom = parse_html("<p id=a>x</p>");
-        let mut narrow = MediaFeatures::default();
-        narrow.width = 400.0;
+        let narrow = MediaFeatures {
+            width: 400.0,
+            ..Default::default()
+        };
         let mut s = Stylist::new(narrow);
         s.add_stylesheet(
             "@media (min-width: 800px){p{color:rgb(1,0,0)}} @media (max-width: 500px){p{color:rgb(2,0,0)}}",

@@ -393,7 +393,11 @@ fn font(p: &[&ComponentValue<'_>], important: bool) -> Parsed {
 
 /// The colour part of a `border`/`border-<side>` shorthand, as a declaration per
 /// side. `currentcolor` when the shorthand names none, as the spec resets it.
-pub(crate) fn border_colors(colour: Option<CssValue>, sides: &[&str], important: bool) -> Vec<PropertyDeclaration> {
+pub(crate) fn border_colors(
+    colour: Option<CssValue>,
+    sides: &[&str],
+    important: bool,
+) -> Vec<PropertyDeclaration> {
     let value = colour.unwrap_or(CssValue::Color(Color::CurrentColor));
     sides
         .iter()
@@ -472,13 +476,22 @@ mod tests {
             b: 0,
             a: 1.0,
         });
-        assert_eq!(get(&parse("background: red url(a.png) no-repeat"), "background-color"), &red);
+        assert_eq!(
+            get(
+                &parse("background: red url(a.png) no-repeat"),
+                "background-color"
+            ),
+            &red
+        );
         assert_eq!(
             get(&parse("background: url(a.png), red"), "background-color"),
             &red
         );
         assert_eq!(
-            get(&parse("background: linear-gradient(red, blue)"), "background-color"),
+            get(
+                &parse("background: linear-gradient(red, blue)"),
+                "background-color"
+            ),
             &CssValue::Color(Color::Transparent),
             "a gradient alone leaves the colour transparent"
         );
@@ -487,15 +500,30 @@ mod tests {
     #[test]
     fn border_colour_shorthand_and_longhands() {
         let d = parse("border-color: red blue");
-        let red = CssValue::Color(Color::Rgba { r: 255, g: 0, b: 0, a: 1.0 });
-        let blue = CssValue::Color(Color::Rgba { r: 0, g: 0, b: 255, a: 1.0 });
+        let red = CssValue::Color(Color::Rgba {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 1.0,
+        });
+        let blue = CssValue::Color(Color::Rgba {
+            r: 0,
+            g: 0,
+            b: 255,
+            a: 1.0,
+        });
         assert_eq!(get(&d, "border-top-color"), &red);
         assert_eq!(get(&d, "border-bottom-color"), &red);
         assert_eq!(get(&d, "border-left-color"), &blue);
         assert_eq!(get(&d, "border-right-color"), &blue);
 
         let d = parse("border: 1px solid #ccc");
-        let grey = CssValue::Color(Color::Rgba { r: 204, g: 204, b: 204, a: 1.0 });
+        let grey = CssValue::Color(Color::Rgba {
+            r: 204,
+            g: 204,
+            b: 204,
+            a: 1.0,
+        });
         assert_eq!(get(&d, "border-left-color"), &grey);
         assert_eq!(
             get(&d, "border-top-width"),
@@ -513,8 +541,14 @@ mod tests {
     #[test]
     fn border_width_and_style_shorthands() {
         let d = parse("border-width: 1px 2px; border-style: solid none");
-        assert_eq!(get(&d, "border-top-width"), &CssValue::Length(Length::Px(1.0)));
-        assert_eq!(get(&d, "border-left-width"), &CssValue::Length(Length::Px(2.0)));
+        assert_eq!(
+            get(&d, "border-top-width"),
+            &CssValue::Length(Length::Px(1.0))
+        );
+        assert_eq!(
+            get(&d, "border-left-width"),
+            &CssValue::Length(Length::Px(2.0))
+        );
         assert_eq!(
             get(&d, "border-top-style"),
             &CssValue::BorderStyle(crate::css_values::types::display::BorderStyle::Solid)
@@ -547,12 +581,18 @@ mod tests {
     #[test]
     fn font_shorthand() {
         let d = parse("font: italic bold 14px/1.5 Arial, sans-serif");
-        assert_eq!(get(&d, "font-weight"), &CssValue::FontWeight(FontWeight::Bold));
+        assert_eq!(
+            get(&d, "font-weight"),
+            &CssValue::FontWeight(FontWeight::Bold)
+        );
         assert_eq!(
             get(&d, "font-style"),
             &CssValue::FontStyle(crate::css_values::types::font::FontStyle::Italic)
         );
-        assert_eq!(get(&d, "font-size"), &CssValue::LengthPercentage(LengthPercentage::Length(Length::Px(14.0))));
+        assert_eq!(
+            get(&d, "font-size"),
+            &CssValue::LengthPercentage(LengthPercentage::Length(Length::Px(14.0)))
+        );
         let CssValue::FontFamily(f) = get(&d, "font-family") else {
             panic!("family")
         };

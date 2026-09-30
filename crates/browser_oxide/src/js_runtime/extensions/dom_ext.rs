@@ -1111,29 +1111,17 @@ pub fn op_dom_get_all_computed_styles(
 
     // Weakest first, so a later declaration overwrites an earlier one. Expanding
     // at insertion makes the generated longhands take part in the same contest as
-    // explicit ones — a later `margin-top` still beats an earlier `margin`.
+    // explicit ones — a later `margin-top` still beats an earlier `margin`. The
+    // `style` attribute is among them, ranked by the cascade.
+    let custom = state.layout_engine.style_tree(&state.dom).custom(id);
     for decl in state.stylist.matching_declarations(&state.dom, id) {
-        for (prop, pval) in expand_shorthand(&decl.name, &decl.value) {
+        let Some(value) =
+            crate::style::custom::substitute(&decl.value, &mut |n| custom.get(n).cloned())
+        else {
+            continue;
+        };
+        for (prop, pval) in expand_shorthand(&decl.name, &value) {
             declarations.insert(prop, (0, 0, pval));
-        }
-    }
-
-    // Add inline styles (highest specificity)
-    if let Some(el) = state.dom.get(id).and_then(|n| n.as_element()) {
-        if let Some(style) = el
-            .attrs
-            .iter()
-            .find(|a| a.name.local.eq_ignore_ascii_case("style"))
-        {
-            for decl in style.value.split(';') {
-                if let Some(colon) = decl.find(':') {
-                    let name = decl[..colon].trim();
-                    let val = decl[colon + 1..].trim();
-                    for (prop, pval) in expand_shorthand(name, val) {
-                        declarations.insert(prop, (999999, 999999, pval));
-                    }
-                }
-            }
         }
     }
 
@@ -1211,17 +1199,17 @@ pub fn op_dom_get_computed_style(
         }
     }
 
-    // 1. Check inline style (highest specificity)
-    let inline_val = get_inline_style_value(&state.dom, id, property);
-    if let Some(val) = &inline_val {
-        if !val.is_empty() {
-            return resolve_computed_value(val, &ctx);
-        }
+    // 1. Custom properties: the style pass has already inherited and resolved them.
+    if property.starts_with("--") {
+        let tree = state.layout_engine.style_tree(&state.dom);
+        return tree.custom(id).get(property).cloned().unwrap_or_default();
     }
 
-    // 2. Check <style> block rules (matched by selector)
+    // 2. The cascade's winner among the style rules and the `style` attribute.
     if let Some(val) = get_stylesheet_value(state, id, property) {
-        return computed_value_text(&val, &ctx);
+        if let Some(val) = resolve_vars(state, id, &val) {
+            return computed_value_text(&val, &ctx);
+        }
     }
 
     // 3. CSS inheritance — walk up the DOM for inherited properties
@@ -1264,13 +1252,10 @@ pub fn op_dom_get_computed_style(
     if INHERITED.contains(&property) {
         let mut current = id;
         while let Some(parent_id) = state.dom.get(current).and_then(|n| n.parent) {
-            if let Some(val) = get_inline_style_value(&state.dom, parent_id, property) {
-                if !val.is_empty() {
+            if let Some(val) = get_stylesheet_value(state, parent_id, property) {
+                if let Some(val) = resolve_vars(state, parent_id, &val) {
                     return computed_value_text(&val, &ctx);
                 }
-            }
-            if let Some(val) = get_stylesheet_value(state, parent_id, property) {
-                return computed_value_text(&val, &ctx);
             }
             current = parent_id;
         }
@@ -1284,6 +1269,15 @@ pub fn op_dom_get_computed_style(
         }
     }
     crate::js_runtime::extensions::layout_ext::css_default(property)
+}
+
+/// `value` with its `var()` references resolved against `id`'s custom properties.
+fn resolve_vars(state: &mut DomState, id: NodeId, value: &str) -> Option<String> {
+    if !crate::style::custom::has_var(value) {
+        return Some(value.to_string());
+    }
+    let custom = state.layout_engine.style_tree(&state.dom).custom(id);
+    crate::style::custom::substitute(value, &mut |n| custom.get(n).cloned())
 }
 
 /// Extract a property value from an element's inline style attribute.
