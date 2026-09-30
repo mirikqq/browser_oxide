@@ -36,24 +36,45 @@ taffy takes a tree of nodes with `Style` structs and computes `Layout` (position
 
 ```
 layout/
-├── src/
-│   ├── lib.rs              # LayoutEngine — compute + query
-│   ├── engine.rs           # DOM → taffy tree conversion
-│   ├── style_map.rs        # CSS computed styles → taffy::Style
-│   ├── viewport.rs         # Virtual viewport (1920x1080 default)
-│   ├── fonts.rs            # Font metrics (character widths for text sizing)
-│   └── query.rs            # getBoundingClientRect, offset*, client*, scroll*
-├── tests/
-│   ├── basic_layout.rs
-│   ├── flexbox.rs
-│   └── bounding_rect.rs
-└── Cargo.toml
+├── engine.rs        # LayoutEngine: DOM + StyleTree → taffy tree, compute, cache
+├── style_map.rs     # computed style → taffy::Style (display, sizes, flex, grid,
+│                    #   align-*/justify-*, gap, flex-basis, …)
+├── resolve.rs       # lengths → px (em/rem/%/vw/vh)
+├── viewport.rs      # Virtual viewport (1920x1080 default)
+├── query.rs         # getBoundingClientRect, offset*, client*, scroll*
+└── paint_tree.rs    # `paint` feature: flat list of boxes for the rasteriser
 ```
+
+## Two layouts
+
+`LayoutMode::Legacy` is the layout described below: taffy's block, flex and grid
+over one node per DOM element, with text sized at a fixed fraction of the font
+size. It is what headless users have today and it is frozen — a test
+(`layout_corpus::legacy_layout_is_frozen`) fails if its output moves.
+
+`LayoutMode::Full` (`layout/full/`) is being built toward Chrome's layout. Its tree
+(`tree.rs`) runs taffy's algorithms over nodes of our own; `build.rs` turns the
+DOM and its styles into boxes, giving each run of inline content between
+block-level children an anonymous block; `ifc.rs` lays that inline content out as
+lines. `tests/layout_corpus` compares both against Chrome. New behaviour goes into
+`Full` only.
+
+## Where Styles Come From
+
+Layout does not cascade. `LayoutEngine::style_tree` asks the document's
+`Stylist` (`style/`) for a `StyleTree` — one `ComputedStyle` per element that has
+a box, with inheritance applied and `font-size` already in px — and caches it
+per `dirty_epoch`. `getComputedStyle` reads the same `Stylist`, so the geometry
+layout computes and the values a script reads come from one cascade.
+
+The user-agent sheet is `style/ua.css`. Tables, form controls and the iframe
+frame are deliberately absent from it: layout has no table algorithm and no
+intrinsic size for controls yet (`docs/GUI_PLAN.md`, stage 3).
 
 ## How It Works
 
 ```
-DOM tree + computed styles
+DOM tree + StyleTree (computed styles)
         │
         ▼
   ┌─────────────┐

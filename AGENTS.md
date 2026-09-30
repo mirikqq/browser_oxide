@@ -33,8 +33,10 @@ reasoned allow only when the lint is a genuine false positive.
   single `browser_oxide` crate (`crates/browser_oxide`), organized into
   modules — `dom`, `html_parser`, `js_runtime`, `event_loop`, `net`,
   `stealth`, `canvas`, `workers`, `css_parser`/`css_selectors`/
-  `css_values`/`css_cascade`, `layout`, `protocol`, `host` — each with a
-  single responsibility (see `docs/ARCHITECTURE.md`). The workspace
+  `css_values`/`css_cascade`, `style`, `text`, `layout`, `protocol`, `host` — each
+  with a single responsibility (see `docs/ARCHITECTURE.md`). `style` is the
+  one place the cascade is decided: layout and `getComputedStyle` both read
+  it, so never add a second cascade. The workspace
   publishes exactly two crates: `browser_oxide` and the `browser_oxide_mcp`
   server. `browser_oxide_py` is a standalone (PyPI) workspace. A third member,
   `browser_oxide_shell`, is the desktop window (`publish = false`, not a default
@@ -62,6 +64,10 @@ reasoned allow only when the lint is a genuine false positive.
 
 - **Tests are single-threaded.** V8 isolates are per-thread; running
   multi-threaded crashes the test process. CI enforces `--test-threads=1`.
+- **Layout has two modes; `Legacy` is frozen.** Headless users' geometry
+  (`getBoundingClientRect`, `offset*`) comes from `layout::LayoutMode::Legacy`,
+  and changing its output changes fingerprints. New layout behaviour goes into
+  `LayoutMode::Full` (`layout/full/`) and is measured with `tests/layout_corpus`.
 - **Network tests are `#[ignore]`.** They require internet and live
   target sites. Run with `--ignored` locally only.
 - **CSS is ours.** The `css_parser`, `css_selectors`, `css_values`,

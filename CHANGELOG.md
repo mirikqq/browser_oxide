@@ -17,6 +17,63 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`browser_oxide_shell`: a desktop window** (address bar + the painted page).
   A separate, unpublished workspace member and not a default one, so the
   engine's dependency tree stays free of any window toolkit.
+- **One style engine (`style` module).** A `Stylist` holds every rule of the
+  document, indexed by the rightmost id/class/tag, and decides the cascade once:
+  origins (user agent / author), `!important`, the `style` attribute, `@layer`,
+  `@media`, `@supports` and CSS nesting. A `StyleTree` walks the document top
+  down and computes each element's style against its parent's. Layout and
+  `getComputedStyle` both read it, so what is drawn and what a script reads can no
+  longer come from two different cascades. The user-agent sheet is now a real
+  stylesheet (`style/ua.css`), with presentational attributes cascaded like
+  author hints.
+- **Custom properties and `var()`.** `--name` declarations inherit and resolve
+  (including references between them, fallbacks and cycles), and `var()` is
+  substituted before the value is parsed, in layout and in `getComputedStyle`
+  (`getPropertyValue('--name')` included).
+- **More shorthands:** `gap`, `flex`, `flex-flow`, `background` (colour only),
+  `border-color`/`-width`/`-style`, `font`, the logical `margin-inline` family
+  (horizontal LTR), `place-*`, and the CSS-wide keywords on any shorthand.
+  `border-{top,right,bottom,left}-color` are properties of their own, and
+  `hsl()` colours resolve.
+- **`text` module and per-character font fallback in `paint`.** The font stack
+  that lived under `canvas/text` (font database, `font` shorthand parser, metrics
+  tables, shaper, glyph rasteriser, and the bundled font files) is now a module of
+  its own, shared by canvas and painting; canvas output is unchanged. Painted
+  text takes each character the requested font lacks from the first fallback
+  face that has it: Arabic, Hebrew, Armenian, Georgian and more symbols from the
+  bundled faces, plus bundled Noto Sans Thai and Noto Sans Devanagari (OFL-1.1;
+  provenance in `text/fonts/SOURCES.txt`). An application can add faces with
+  `text::fallback::register_fallback_face` (the engine still never reads font
+  files itself); `browser_oxide_shell --host-fonts` and the `screenshot` example's
+  `--font` use it to draw CJK and colour emoji. The fallback faces are not in the
+  font database: canvas text, `document.fonts`, `FontFace.load` and `measureText`
+  see no difference. Painted text now follows the CSS `font-family` instead of
+  always being sans-serif.
+
+- **`LayoutMode::Full` — a layout built toward Chrome's** (opt-in; headless
+  keeps the legacy layout unless something selects `Full`:
+  `layout::set_default_mode` for a process, `Page::set_layout_mode` for a
+  page). It has its own layout tree over taffy's algorithms, resolves `calc()`
+  in lengths, understands `grid-template-columns`/`-rows`, floats, and tables
+  (automatic layout, `border-collapse`, `border-spacing`, `colspan`/`rowspan`),
+  and lays inline content out as lines: greedy wrapping at UAX #14
+  opportunities, whitespace collapsing for every `white-space` mode, inline
+  boxes that keep their padding and borders across wraps, inline-block and
+  replaced elements on the baseline, `text-align`, and Blink's rounding of font
+  ascent/descent and half-leading. Text is measured with the bundled faces and
+  the profile's metrics tables only, with fixed advances for scripts no bundled
+  face covers, so geometry does not depend on the host's fonts.
+  `getClientRects()` follows Blink: one rectangle per line for an element with
+  padding or borders, one per text fragment otherwise. `browser_oxide_shell`
+  and the `screenshot` example select it. `tests/layout_corpus` measures both
+  layouts against what a real Chrome reports for 42 local pages (140 elements
+  within 1px: legacy 53, full 138); `tests/layout_corpus/snapshot.mjs`
+  re-records Chrome's numbers. New dependencies: `unicode-linebreak`
+  (Apache-2.0), `unicode-width` (MIT OR Apache-2.0). New properties parsed:
+  `grid-template-columns`/`-rows`, `border-collapse`, `border-spacing`,
+  `vertical-align` (kept as text), and the `table-row-group`, `table-header-group`,
+  `table-footer-group`, `table-column`, `table-column-group`, `table-caption`
+  display values (the legacy layout still treats them as `inline`).
 
 ### Security
 - **Page script could mint `isTrusted` events.** The engine namespace hides
@@ -28,6 +85,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   page script runs and handed to engine code only as a call argument.
 
 ### Fixed
+- **Layout cascaded on its own, and got it wrong** — no inheritance (`color`,
+  `font-*`, `line-height`, `visibility` stopped at each element), every `em`
+  measured against 16px, `!important` and `@layer` ignored. It now takes
+  computed styles from the style engine. Headless geometry changes with it:
+  `getBoundingClientRect`, `offset*` and `client*` report the sizes the
+  corrected styles give (headings and paragraphs from the user-agent sheet
+  included).
+- **`gap`, `align-items`/`-self`/`-content`, `justify-items`/`-self`/`-content`
+  and `flex-basis` never reached layout** — the `gap` shorthand was never
+  expanded into the `row-gap`/`column-gap` layout reads, and the rest were not
+  read at all. Flex and grid containers that relied on them were laid out as if
+  they were absent.
+- **`getComputedStyle` let the `style` attribute beat an author `!important`
+  declaration**, for the element and for the ancestors it inherits from. It also
+  read a different cascade than layout did. Relative lengths (`em`, `rem`, `vw`)
+  are reported in px, as Chrome does, and `font-size` and `display` come from
+  the style pass.
 - **Warm-reused pages lost trusted input from their second navigation on**
   (pool, `navigate_warm_with_init`, devview): the minter was a single-use
   handle the first `humanize.js` install consumed. The Rust-held capabilities

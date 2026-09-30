@@ -38,10 +38,12 @@ browser_oxide/
 │   ├── css_selectors/            # Selectors Level 4 parser + matcher
 │   ├── css_values/               # CSS property value parsing + computed values
 │   ├── css_cascade/              # Cascade, specificity, inheritance, @layer, @media
+│   ├── style/                    # Stylist (all rules, one cascade) + StyleTree (inheritance); layout and getComputedStyle both read it
 │   ├── dom/                      # Mutable DOM tree + Web API interfaces + Shadow DOM
 │   ├── html_parser/              # html5ever integration + TreeSink → DOM
 │   ├── js_runtime/               # V8 engine (rusty_v8) + DOM bindings + WASM
 │   ├── canvas/                   # Canvas 2D API (tiny-skia backend) + WebGL stubs
+│   ├── text/                     # Fonts, shaping (rustybuzz), metrics tables, per-character fallback; canvas and paint share it
 │   ├── layout/                   # Box model via taffy (getBoundingClientRect)
 │   ├── net/                      # HTTP/1.1 + HTTP/2 + HTTP/3 + stealth TLS + cookies
 │   ├── event_loop/               # Timers, microtasks, Promises, rAF
