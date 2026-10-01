@@ -96,6 +96,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `counter-set`, `counter()`, `counters()`), flex baselines, and calc() lengths
   that do not depend on a percentage resolved before taffy sees them. Shared fix:
   nested functional pseudo-classes (`a:is(:not(.q)) .x`) in the selector parser.
+  Also in `Full`: the `grid-template` shorthand, `transform` (2D, applied to the
+  rectangles `getBoundingClientRect` and `getClientRects` report), `position:
+  sticky` at its static position, percentage heights in auto-height flex
+  containers counting as `auto`, and line breaks between ASCII symbols following
+  a table measured in Chrome (`text/breaks.rs`).
   New dependencies: `unicode-linebreak`
   (Apache-2.0), `unicode-width` (MIT OR Apache-2.0). New properties parsed:
   `grid-template-columns`/`-rows`, `border-collapse`, `border-spacing`,

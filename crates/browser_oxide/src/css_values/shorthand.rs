@@ -96,6 +96,11 @@ pub(crate) fn longhands_of(name: &str) -> Option<Vec<String>> {
         "inset-inline" => names(&["left", "right"]),
         "inset-block" => names(&["top", "bottom"]),
         "list-style" => names(&["list-style-type"]),
+        "grid-template" => names(&[
+            "grid-template-rows",
+            "grid-template-columns",
+            "grid-template-areas",
+        ]),
         "font" => names(&[
             "font-style",
             "font-weight",

@@ -36,6 +36,9 @@ pub struct FullLayout {
     pub dom_to_node: HashMap<u32, usize>,
     pub root: Option<usize>,
     block_in_inline: HashMap<u32, Vec<usize>>,
+    /// Where each node's own coordinates land in the document, for a page that
+    /// has a `transform` anywhere; empty otherwise.
+    matrices: Vec<[f32; 6]>,
     /// Fragments of inline elements and text nodes, by DOM id: the owning node
     /// and the fragment's index in it.
     inline: HashMap<u32, Vec<(usize, usize)>>,
@@ -69,6 +72,7 @@ impl FullLayout {
             dom_to_node: b.dom_to_node,
             root,
             block_in_inline,
+            matrices: Vec::new(),
             inline: HashMap::new(),
         };
         if let Some(root) = layout.root {
@@ -94,6 +98,7 @@ impl FullLayout {
                 );
             }
         }
+        layout.compute_matrices(viewport);
         for (n, node) in layout.tree.nodes.iter().enumerate() {
             for (f, frag) in node.frags.iter().enumerate() {
                 layout.inline.entry(frag.dom).or_default().push((n, f));
@@ -130,6 +135,69 @@ impl FullLayout {
         changed
     }
 
+    /// The matrix of every node, if any has a `transform`: the node's own
+    /// coordinates (origin at its border box's corner) to the document's. A
+    /// transform turns about the middle of the box.
+    fn compute_matrices(&mut self, viewport: Viewport) {
+        if self.tree.nodes.iter().all(|n| n.transform.is_none()) {
+            return;
+        }
+        let ctx = ResolveContext {
+            font_size: crate::style::tree::DEFAULT_FONT_SIZE,
+            root_font_size: crate::style::tree::DEFAULT_FONT_SIZE,
+            viewport_w: viewport.width,
+            viewport_h: viewport.height,
+        };
+        let mut all = vec![IDENTITY; self.tree.nodes.len()];
+        // Children are added before their parents: walk the nodes parents-first.
+        for n in (0..self.tree.nodes.len()).rev() {
+            let node = &self.tree.nodes[n];
+            let parent = node.parent.map_or(IDENTITY, |p| all[p]);
+            let (w, h) = (node.layout.size.width, node.layout.size.height);
+            let at = translation(node.layout.location.x, node.layout.location.y);
+            let own = match &node.transform {
+                Some(t) => {
+                    let m = transform_matrix(t, w, h, &ctx);
+                    multiply(
+                        translation(w / 2.0, h / 2.0),
+                        multiply(m, translation(-w / 2.0, -h / 2.0)),
+                    )
+                }
+                None => IDENTITY,
+            };
+            all[n] = multiply(parent, multiply(at, own));
+        }
+        self.matrices = all;
+    }
+
+    /// `rect` (`[x, y, w, h]`, in the coordinates of `node`'s border box) in the
+    /// document's: the box that holds it once transformed.
+    fn to_document(&self, node: usize, rect: [f32; 4]) -> [f32; 4] {
+        if self.matrices.is_empty() {
+            let (x, y) = self.absolute_position(node);
+            return [x + rect[0], y + rect[1], rect[2], rect[3]];
+        }
+        let m = self.matrices[node];
+        let corners = [
+            (rect[0], rect[1]),
+            (rect[0] + rect[2], rect[1]),
+            (rect[0], rect[1] + rect[3]),
+            (rect[0] + rect[2], rect[1] + rect[3]),
+        ]
+        .map(|(x, y)| (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]));
+        let min = |f: fn(&(f32, f32)) -> f32| corners.iter().map(f).fold(f32::INFINITY, f32::min);
+        let max =
+            |f: fn(&(f32, f32)) -> f32| corners.iter().map(f).fold(f32::NEG_INFINITY, f32::max);
+        let (x0, y0) = (min(|c| c.0), min(|c| c.1));
+        [x0, y0, max(|c| c.0) - x0, max(|c| c.1) - y0]
+    }
+
+    /// The border box of a node in document coordinates, transforms applied.
+    pub fn node_rect(&self, node: usize) -> [f32; 4] {
+        let size = self.tree.nodes[node].layout.size;
+        self.to_document(node, [0.0, 0.0, size.width, size.height])
+    }
+
     /// `(x, y)` of a node's border box in document coordinates.
     pub fn absolute_position(&self, node: usize) -> (f32, f32) {
         let (mut x, mut y) = (0.0, 0.0);
@@ -161,17 +229,19 @@ impl FullLayout {
             .iter()
             .filter_map(|&n| {
                 let parent = &self.tree.nodes[self.tree.nodes[n].parent?];
-                let (px, _) = self.absolute_position(self.tree.nodes[n].parent?);
-                let (_, y) = self.absolute_position(n);
                 let l = &parent.layout;
                 let left = l.padding.left + l.border.left;
                 let width = l.size.width - left - l.padding.right - l.border.right;
-                Some([
-                    px + left,
-                    y,
-                    width.max(0.0),
-                    self.tree.nodes[n].layout.size.height,
-                ])
+                let at = self.tree.nodes[n].layout.location.y;
+                Some(self.to_document(
+                    self.tree.nodes[n].parent?,
+                    [
+                        left,
+                        at,
+                        width.max(0.0),
+                        self.tree.nodes[n].layout.size.height,
+                    ],
+                ))
             })
             .collect()
     }
@@ -182,15 +252,8 @@ impl FullLayout {
         };
         out.extend(frags.iter().filter_map(|&(n, f)| {
             let frag = &self.tree.nodes[n].frags[f];
-            let (x, y) = self.absolute_position(n);
-            (frag.kind == ifc::FragKind::Box || self.is_text(dom_id)).then(|| {
-                [
-                    x + frag.rect[0],
-                    y + frag.rect[1],
-                    frag.rect[2],
-                    frag.rect[3],
-                ]
-            })
+            (frag.kind == ifc::FragKind::Box || self.is_text(dom_id))
+                .then(|| self.to_document(n, frag.rect))
         }));
     }
 
@@ -210,16 +273,7 @@ impl FullLayout {
             .flatten()
             .map(|&(n, f)| &self.tree.nodes[n].frags[f])
             .collect();
-        let abs = |&(n, f): &(usize, usize)| {
-            let frag = &self.tree.nodes[n].frags[f];
-            let (x, y) = self.absolute_position(n);
-            [
-                x + frag.rect[0],
-                y + frag.rect[1],
-                frag.rect[2],
-                frag.rect[3],
-            ]
-        };
+        let abs = |&(n, f): &(usize, usize)| self.to_document(n, self.tree.nodes[n].frags[f].rect);
         if own.iter().any(|f| f.kind == ifc::FragKind::Text) {
             // A text node: its line fragments.
             out.extend(frags.into_iter().flatten().map(abs));
@@ -325,4 +379,75 @@ fn apply_calc(tree: &mut Tree, computed: &ComputedStyle, ts: &mut taffy::Style, 
     set!(ts.padding.left, PropertyId::PaddingLeft, LengthPercentage);
     set!(ts.gap.height, PropertyId::RowGap, LengthPercentage);
     set!(ts.gap.width, PropertyId::ColumnGap, LengthPercentage);
+}
+
+const IDENTITY: [f32; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+fn translation(x: f32, y: f32) -> [f32; 6] {
+    [1.0, 0.0, 0.0, 1.0, x, y]
+}
+
+/// `a` after `b`: the matrix that applies `b` first.
+fn multiply(a: [f32; 6], b: [f32; 6]) -> [f32; 6] {
+    [
+        a[0] * b[0] + a[2] * b[1],
+        a[1] * b[0] + a[3] * b[1],
+        a[0] * b[2] + a[2] * b[3],
+        a[1] * b[2] + a[3] * b[3],
+        a[0] * b[4] + a[2] * b[5] + a[4],
+        a[1] * b[4] + a[3] * b[5] + a[5],
+    ]
+}
+
+/// The matrix of a `transform` list on a `w` by `h` box.
+fn transform_matrix(
+    list: &[crate::css_values::types::transform::TransformFunction],
+    w: f32,
+    h: f32,
+    ctx: &ResolveContext,
+) -> [f32; 6] {
+    use crate::css_values::types::length::LengthPercentage as Lp;
+    use crate::css_values::types::transform::TransformFunction as F;
+    let px = |v: &Lp, of: f32| match v {
+        Lp::Length(l) => crate::layout::resolve::resolve_length(l, ctx),
+        Lp::Percentage(p) => *p as f32 / 100.0 * of,
+        Lp::Calc(_) => 0.0,
+    };
+    let mut m = IDENTITY;
+    for f in list {
+        let step = match f {
+            F::Translate(x, y) => translation(px(x, w), px(y, h)),
+            F::TranslateX(x) => translation(px(x, w), 0.0),
+            F::TranslateY(y) => translation(0.0, px(y, h)),
+            F::Scale(x, y) => [*x as f32, 0.0, 0.0, *y as f32, 0.0, 0.0],
+            F::ScaleX(x) => [*x as f32, 0.0, 0.0, 1.0, 0.0, 0.0],
+            F::ScaleY(y) => [1.0, 0.0, 0.0, *y as f32, 0.0, 0.0],
+            F::Rotate(a) => {
+                let r = a.to_degrees().to_radians() as f32;
+                [r.cos(), r.sin(), -r.sin(), r.cos(), 0.0, 0.0]
+            }
+            F::SkewX(a) => [
+                1.0,
+                0.0,
+                (a.to_degrees().to_radians() as f32).tan(),
+                1.0,
+                0.0,
+                0.0,
+            ],
+            F::SkewY(a) => [
+                1.0,
+                (a.to_degrees().to_radians() as f32).tan(),
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+            ],
+            F::Matrix(a, b, c, d, e, f) => [
+                *a as f32, *b as f32, *c as f32, *d as f32, *e as f32, *f as f32,
+            ],
+            _ => IDENTITY,
+        };
+        m = multiply(m, step);
+    }
+    m
 }

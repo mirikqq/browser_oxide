@@ -332,13 +332,12 @@ impl LayoutEngine {
                     f64::from(y1 - y0),
                 );
             };
-            let size = full.tree.nodes[n].layout.size;
-            let (x, y) = full.absolute_position(n);
+            let r = full.node_rect(n);
             return DOMRect::new(
-                f64::from(x),
-                f64::from(y),
-                f64::from(size.width),
-                f64::from(size.height),
+                f64::from(r[0]),
+                f64::from(r[1]),
+                f64::from(r[2]),
+                f64::from(r[3]),
             );
         }
 

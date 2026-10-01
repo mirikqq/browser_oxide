@@ -662,6 +662,16 @@ impl<'a> Builder<'a> {
         }
 
         let mut style = computed_to_taffy(computed, &ctx);
+        if position == CssPosition::Sticky {
+            // At the top of the page a sticky box has not moved: it is where it
+            // would be if static, whatever its offsets.
+            style.inset = taffy::Rect {
+                left: taffy::LengthPercentageAuto::auto(),
+                right: taffy::LengthPercentageAuto::auto(),
+                top: taffy::LengthPercentageAuto::auto(),
+                bottom: taffy::LengthPercentageAuto::auto(),
+            };
+        }
         let control_baseline = if elem.is_some() {
             self.size_control(id, &tag, attrs, computed, font_size, &mut style)
         } else {
@@ -804,11 +814,30 @@ impl<'a> Builder<'a> {
             style.min_size.height = Dimension::length((ctx.viewport_h - margins).max(0.0));
         }
         let style_display = style.display;
+        // A percentage height needs a container whose height is known; a flex or
+        // grid container that takes its height from its items has none, so its
+        // items' percentages count as `auto` (taffy would use the height it finds).
+        if matches!(style_display, taffy::Display::Flex | taffy::Display::Grid)
+            && style.size.height.is_auto()
+            && style.position != taffy::Position::Absolute
+        {
+            for &c in &children {
+                let item = &mut self.tree.nodes[c].style;
+                if item.size.height.tag() == taffy::CompactLength::PERCENT_TAG {
+                    item.size.height = Dimension::auto();
+                }
+            }
+        }
         let id_node = self.tree.add(style, children);
         self.tree.nodes[id_node].role = role;
         self.tree.nodes[id_node].control_baseline = control_baseline;
         if self.level(id) == Level::Atomic {
             self.tree.nodes[id_node].lift = self.lift_of(id, computed);
+        }
+        if let Some(CssValue::Transform(t)) = computed.get(&PropertyId::Transform) {
+            if !t.is_empty() {
+                self.tree.nodes[id_node].transform = Some(t.clone());
+            }
         }
         if let Some(CssValue::CustomValue(o)) = computed.get(&PropertyId::Order) {
             self.tree.nodes[id_node].order = o.trim().parse().unwrap_or(0);

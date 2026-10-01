@@ -74,6 +74,8 @@ pub struct Node {
     pub lift: ifc::Lift,
     /// `order`, which sorts the items of a flex or grid container.
     pub order: i32,
+    /// `transform`, applied to the rectangles the box reports.
+    pub transform: Option<Vec<crate::css_values::types::transform::TransformFunction>>,
     cache: Cache,
     pub layout: Layout,
     pub children: Vec<usize>,
@@ -127,6 +129,7 @@ impl Tree {
             control_baseline: None,
             lift: ifc::Lift::default(),
             order: 0,
+            transform: None,
             cache: Cache::new(),
             layout: Layout::with_order(0),
             children,

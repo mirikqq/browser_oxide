@@ -424,9 +424,34 @@ fn units_of(text: &str, preserve: bool) -> Vec<Unit> {
     let mut units = Vec::new();
     let mut start = 0;
     let mut cuts: Vec<usize> = unicode_linebreak::linebreaks(text)
+        .filter(|&(i, opportunity)| {
+            if i == 0 {
+                return false;
+            }
+            // Between two printable ASCII characters Chrome's table decides.
+            let mut before = text[..i].chars().next_back();
+            let after = text[i..].chars().next();
+            if opportunity == unicode_linebreak::BreakOpportunity::Mandatory {
+                before = None;
+            }
+            match (before, after) {
+                (Some(a), Some(b)) => {
+                    crate::text::breaks::ascii_break_allowed(a, b).unwrap_or(true)
+                }
+                _ => true,
+            }
+        })
         .map(|(i, _)| i)
-        .filter(|&i| i > 0)
         .collect();
+    // Where the table opens a break the rules left closed.
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    for w in chars.windows(2) {
+        let (i, b) = (w[1].0, w[1].1);
+        if crate::text::breaks::ascii_break_allowed(w[0].1, b) == Some(true) {
+            cuts.push(i);
+        }
+    }
+    cuts.sort_unstable();
     if cuts.last() != Some(&text.len()) {
         cuts.push(text.len());
     }

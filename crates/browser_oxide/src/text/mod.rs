@@ -6,6 +6,7 @@
 //! individual glyphs via swash. `canvas::text` builds Canvas 2D's metrics and
 //! drawing on top of it.
 
+pub mod breaks;
 pub mod fallback;
 pub mod font_database;
 pub mod font_shorthand;

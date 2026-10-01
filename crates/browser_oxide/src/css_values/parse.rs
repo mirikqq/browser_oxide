@@ -54,6 +54,7 @@ pub fn parse_property(
         "padding" => return parse_box_shorthand(value_trimmed, important, "padding"),
         "overflow" => return parse_overflow_shorthand(value_trimmed, important),
         "inset" => return parse_box_shorthand(value_trimmed, important, "inset"),
+        "grid-template" => return Ok(parse_grid_template(value_trimmed, important)),
         "border" | "border-top" | "border-right" | "border-bottom" | "border-left" => {
             return parse_border_shorthand(value_trimmed, important, &name_lower)
         }
@@ -130,6 +131,7 @@ pub fn parse_property(
         "z-index" => parse_z_index(value_trimmed)?,
         "content-visibility" => parse_content_visibility(value_trimmed)?,
         "content" => parse_content(value_trimmed),
+        "transform" => parse_transform(value_trimmed),
         _ if name_lower.starts_with("--") => {
             CssValue::CustomValue(component_values_to_string(value_trimmed))
         }
@@ -926,6 +928,86 @@ fn unescape_css(s: &str) -> String {
     out
 }
 
+/// `transform`: the 2D functions (and the 3D ones that have a 2D reading). What
+/// cannot be read leaves the transform as `none`.
+fn parse_transform(value: &[ComponentValue<'_>]) -> CssValue {
+    use crate::css_values::types::length::{Angle, LengthPercentage};
+    use crate::css_values::types::transform::TransformFunction as F;
+    let mut out = Vec::new();
+    for cv in value {
+        let ComponentValue::Function(f) = cv else {
+            continue;
+        };
+        let args: Vec<&[ComponentValue<'_>]> = f
+            .arguments
+            .split(|a| {
+                matches!(
+                    a,
+                    ComponentValue::Token(Token {
+                        kind: TokenKind::Comma,
+                        ..
+                    })
+                )
+            })
+            .collect();
+        let lp = |i: usize| -> Option<LengthPercentage> {
+            args.get(i)?.iter().find_map(try_length_percentage)
+        };
+        let num = |i: usize| -> Option<f64> {
+            args.get(i)?.iter().find_map(|a| match a {
+                ComponentValue::Token(Token {
+                    kind: TokenKind::Number { value, .. },
+                    ..
+                }) => Some(*value),
+                _ => None,
+            })
+        };
+        let angle = |i: usize| -> Option<Angle> {
+            args.get(i)?.iter().find_map(|a| match a {
+                ComponentValue::Token(Token {
+                    kind: TokenKind::Dimension { value, unit, .. },
+                    ..
+                }) => match unit.to_ascii_lowercase().as_str() {
+                    "deg" => Some(Angle::Deg(*value)),
+                    "rad" => Some(Angle::Rad(*value)),
+                    "grad" => Some(Angle::Grad(*value)),
+                    "turn" => Some(Angle::Turn(*value)),
+                    _ => None,
+                },
+                ComponentValue::Token(Token {
+                    kind: TokenKind::Number { value, .. },
+                    ..
+                }) if *value == 0.0 => Some(Angle::Deg(0.0)),
+                _ => None,
+            })
+        };
+        let zero = || LengthPercentage::Length(crate::css_values::types::length::Length::Px(0.0));
+        let function = match f.name.to_ascii_lowercase().as_str() {
+            "translate" | "translate3d" => {
+                lp(0).map(|x| F::Translate(x, lp(1).unwrap_or_else(zero)))
+            }
+            "translatex" => lp(0).map(F::TranslateX),
+            "translatey" => lp(0).map(F::TranslateY),
+            "scale" | "scale3d" => num(0).map(|x| F::Scale(x, num(1).unwrap_or(x))),
+            "scalex" => num(0).map(F::ScaleX),
+            "scaley" => num(0).map(F::ScaleY),
+            "rotate" | "rotatez" => angle(0).map(F::Rotate),
+            "skewx" => angle(0).map(F::SkewX),
+            "skewy" => angle(0).map(F::SkewY),
+            "matrix" => (0..6)
+                .map(num)
+                .collect::<Option<Vec<f64>>>()
+                .map(|m| F::Matrix(m[0], m[1], m[2], m[3], m[4], m[5])),
+            _ => None,
+        };
+        match function {
+            Some(function) => out.push(function),
+            None => return CssValue::Transform(Vec::new()),
+        }
+    }
+    CssValue::Transform(out)
+}
+
 /// `content`: strings, `attr()`, `url()`, quotes and counters, up to an alt-text
 /// `/`. `none`, `normal` and anything unreadable give an empty list.
 fn parse_content(value: &[ComponentValue<'_>]) -> CssValue {
@@ -1276,6 +1358,82 @@ fn extract_numbers(args: &[ComponentValue<'_>]) -> Vec<f64> {
         }
     }
     nums
+}
+
+/// `grid-template: rows / columns`, where the rows may be written as strings (the
+/// areas) each followed by the size of its row.
+fn parse_grid_template(value: &[ComponentValue<'_>], important: bool) -> Vec<PropertyDeclaration> {
+    let slash = value.iter().position(|v| {
+        matches!(
+            v,
+            ComponentValue::Token(Token {
+                kind: TokenKind::Delim('/'),
+                ..
+            })
+        )
+    });
+    let (rows_part, columns_part) = match slash {
+        Some(i) => (&value[..i], &value[i + 1..]),
+        None => (value, &value[..0]),
+    };
+    let is_string = |v: &ComponentValue<'_>| {
+        matches!(
+            v,
+            ComponentValue::Token(Token {
+                kind: TokenKind::String(_),
+                ..
+            })
+        )
+    };
+    let (mut areas, mut rows) = (Vec::<String>::new(), Vec::<String>::new());
+    if rows_part.iter().any(is_string) {
+        let mut size: Vec<&ComponentValue<'_>> = Vec::new();
+        let flush = |size: &mut Vec<&ComponentValue<'_>>, rows: &mut Vec<String>| {
+            let text =
+                component_values_to_string(&size.iter().map(|v| (*v).clone()).collect::<Vec<_>>());
+            rows.push(if text.trim().is_empty() {
+                "auto".to_string()
+            } else {
+                text.trim().to_string()
+            });
+            size.clear();
+        };
+        for v in rows_part {
+            if let ComponentValue::Token(Token {
+                kind: TokenKind::String(s),
+                ..
+            }) = v
+            {
+                if !areas.is_empty() {
+                    flush(&mut size, &mut rows);
+                }
+                areas.push(format!("\"{s}\""));
+            } else {
+                size.push(v);
+            }
+        }
+        flush(&mut size, &mut rows);
+    }
+    let rows_text = if areas.is_empty() {
+        component_values_to_string(rows_part).trim().to_string()
+    } else {
+        rows.join(" ")
+    };
+    let none = rows_text.is_empty() || rows_text == "none";
+    let columns_text = component_values_to_string(columns_part).trim().to_string();
+    let make = |property: PropertyId, text: String| PropertyDeclaration {
+        property,
+        value: CssValue::CustomValue(if text.is_empty() { "none".into() } else { text }),
+        important,
+    };
+    vec![
+        make(
+            PropertyId::GridTemplateRows,
+            if none { String::new() } else { rows_text },
+        ),
+        make(PropertyId::GridTemplateColumns, columns_text),
+        make(PropertyId::GridTemplateAreas, areas.join(" ")),
+    ]
 }
 
 fn component_values_to_string(value: &[ComponentValue<'_>]) -> String {
