@@ -48,7 +48,14 @@ pub fn tokens_to_string(values: &[ComponentValue]) -> String {
                 s.push(')');
             }
             ComponentValue::SimpleBlock(b) => {
+                s.push(b.token);
                 s.push_str(&tokens_to_string(&b.value));
+                s.push(match b.token {
+                    '{' => '}',
+                    '[' => ']',
+                    '(' => ')',
+                    other => other,
+                });
             }
         }
     }
