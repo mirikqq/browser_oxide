@@ -63,6 +63,17 @@ pub fn initial_value(property: &PropertyId) -> CssValue {
         PropertyId::BorderCollapse => CssValue::CustomValue("separate".to_string()),
         PropertyId::BorderSpacing => CssValue::CustomValue("0px".to_string()),
         PropertyId::VerticalAlign => CssValue::CustomValue("baseline".to_string()),
+        PropertyId::GridTemplateAreas => CssValue::CustomValue("none".to_string()),
+        PropertyId::GridAutoFlow => CssValue::CustomValue("row".to_string()),
+        PropertyId::GridAutoRows
+        | PropertyId::GridAutoColumns
+        | PropertyId::GridArea
+        | PropertyId::GridRow
+        | PropertyId::GridColumn
+        | PropertyId::GridRowStart
+        | PropertyId::GridRowEnd
+        | PropertyId::GridColumnStart
+        | PropertyId::GridColumnEnd => CssValue::CustomValue("auto".to_string()),
         PropertyId::AlignItems => CssValue::Alignment(AlignmentValue::Normal),
         PropertyId::AlignSelf => CssValue::Alignment(AlignmentValue::Normal),
         PropertyId::AlignContent => CssValue::Alignment(AlignmentValue::Normal),

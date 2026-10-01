@@ -94,7 +94,18 @@ pub fn parse_property(
         | "grid-template-rows"
         | "border-collapse"
         | "border-spacing"
-        | "vertical-align" => CssValue::CustomValue(component_values_to_string(value_trimmed)),
+        | "vertical-align"
+        | "grid-template-areas"
+        | "grid-auto-flow"
+        | "grid-auto-rows"
+        | "grid-auto-columns"
+        | "grid-area"
+        | "grid-row"
+        | "grid-column"
+        | "grid-row-start"
+        | "grid-row-end"
+        | "grid-column-start"
+        | "grid-column-end" => CssValue::CustomValue(component_values_to_string(value_trimmed)),
         "align-items" | "align-self" | "align-content" | "justify-content" | "justify-items"
         | "justify-self" => parse_alignment(value_trimmed)?,
         "row-gap" | "column-gap" => parse_length_percentage(value_trimmed)?,

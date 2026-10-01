@@ -159,3 +159,159 @@ fn split_top_level(text: &str) -> Vec<String> {
     }
     out
 }
+
+/// `grid-template-areas`: `"a a" "b c"` → the rectangle each name covers.
+pub fn areas(text: &str) -> Vec<taffy::GridTemplateArea<String>> {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('"') {
+        let Some(len) = rest[open + 1..].find('"') else {
+            break;
+        };
+        rows.push(
+            rest[open + 1..open + 1 + len]
+                .split_whitespace()
+                .map(str::to_string)
+                .collect(),
+        );
+        rest = &rest[open + len + 2..];
+    }
+    let mut out: Vec<taffy::GridTemplateArea<String>> = Vec::new();
+    for (r, row) in rows.iter().enumerate() {
+        for (c, name) in row.iter().enumerate() {
+            if name.chars().all(|ch| ch == '.') {
+                continue;
+            }
+            let (r, c) = (r as u16, c as u16);
+            match out.iter_mut().find(|a| a.name == *name) {
+                Some(a) => {
+                    a.row_start = a.row_start.min(r + 1);
+                    a.row_end = a.row_end.max(r + 2);
+                    a.column_start = a.column_start.min(c + 1);
+                    a.column_end = a.column_end.max(c + 2);
+                }
+                None => out.push(taffy::GridTemplateArea {
+                    name: name.clone(),
+                    row_start: r + 1,
+                    row_end: r + 2,
+                    column_start: c + 1,
+                    column_end: c + 2,
+                }),
+            }
+        }
+    }
+    out
+}
+
+pub fn auto_flow(text: &str) -> taffy::GridAutoFlow {
+    let (mut column, mut dense) = (false, false);
+    for word in text.split_whitespace() {
+        match word {
+            "column" => column = true,
+            "dense" => dense = true,
+            _ => {}
+        }
+    }
+    match (column, dense) {
+        (false, false) => taffy::GridAutoFlow::Row,
+        (false, true) => taffy::GridAutoFlow::RowDense,
+        (true, false) => taffy::GridAutoFlow::Column,
+        (true, true) => taffy::GridAutoFlow::ColumnDense,
+    }
+}
+
+/// `grid-auto-rows` / `-columns`: the sizes of implicit tracks.
+pub fn auto_tracks(text: &str, ctx: &ResolveContext) -> Vec<TrackSizingFunction> {
+    split_top_level(text)
+        .iter()
+        .map(|t| track(t, ctx))
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Edge {
+    Start,
+    End,
+}
+
+/// One side of a placement: `auto`, a line number, `span n`, or an area name.
+fn line_placement(text: &str, edge: Edge) -> taffy::GridPlacement<String> {
+    use taffy::GridPlacement;
+    let text = text.trim();
+    if text.is_empty() || text == "auto" {
+        return GridPlacement::Auto;
+    }
+    if let Some(rest) = text.strip_prefix("span") {
+        return match rest.trim().parse::<u16>() {
+            Ok(n) if n > 0 => taffy::style_helpers::span(n),
+            _ => GridPlacement::Auto,
+        };
+    }
+    if let Ok(n) = text.parse::<i16>() {
+        return if n == 0 {
+            GridPlacement::Auto
+        } else {
+            taffy::style_helpers::line(n)
+        };
+    }
+    let suffix = if edge == Edge::Start { "start" } else { "end" };
+    GridPlacement::NamedLine(format!("{text}-{suffix}"), 1)
+}
+
+/// `grid-row` / `grid-column`: `start / end`, or one value.
+pub fn placement(text: &str) -> taffy::Line<taffy::GridPlacement<String>> {
+    use taffy::GridPlacement;
+    let mut parts = text.splitn(2, '/');
+    let start = parts.next().unwrap_or("").trim();
+    match parts.next() {
+        Some(end) => taffy::Line {
+            start: line_placement(start, Edge::Start),
+            end: line_placement(end, Edge::End),
+        },
+        // A single name stands for the whole area; a number or span for its start.
+        None => taffy::Line {
+            start: line_placement(start, Edge::Start),
+            end: if start.parse::<i16>().is_ok() || start.starts_with("span") || start == "auto" {
+                GridPlacement::Auto
+            } else {
+                line_placement(start, Edge::End)
+            },
+        },
+    }
+}
+
+/// `grid-area`: one name, or `row-start / column-start / row-end / column-end`.
+pub fn area(
+    text: &str,
+) -> (
+    taffy::Line<taffy::GridPlacement<String>>,
+    taffy::Line<taffy::GridPlacement<String>>,
+) {
+    use taffy::GridPlacement;
+    let parts: Vec<&str> = text.split('/').map(str::trim).collect();
+    if parts.len() == 1 {
+        let one = placement(parts[0]);
+        return (one.clone(), one);
+    }
+    let get = |i: usize, edge| {
+        parts
+            .get(i)
+            .map_or(GridPlacement::Auto, |p| line_placement(p, edge))
+    };
+    (
+        taffy::Line {
+            start: get(0, Edge::Start),
+            end: get(2, Edge::End),
+        },
+        taffy::Line {
+            start: get(1, Edge::Start),
+            end: get(3, Edge::End),
+        },
+    )
+}
+
+/// One side of a placement given on its own (`grid-row-start`, …).
+pub fn side(text: &str, end: bool) -> taffy::GridPlacement<String> {
+    line_placement(text, if end { Edge::End } else { Edge::Start })
+}

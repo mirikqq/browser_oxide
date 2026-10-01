@@ -121,7 +121,17 @@ impl<'a> Builder<'a> {
             .borrow_mut()
             .entry(key)
             .or_insert_with(|| {
-                let parsed = spec.parsed();
+                let mut parsed = spec.parsed();
+                if size <= 0.0 {
+                    // `font-size: 0` takes no room at all.
+                    parsed.size_px = 0.0;
+                    let none = Metrics {
+                        ascent: 0.0,
+                        descent: 0.0,
+                        line_gap: 0.0,
+                    };
+                    return (parsed, none);
+                }
                 let metrics = Metrics::of(&parsed, self.os);
                 (parsed, metrics)
             })
@@ -261,9 +271,11 @@ impl<'a> Builder<'a> {
                 children.extend(self.abs_pending.drain(..).map(|(n, _)| n));
                 let style = Style {
                     display: taffy::Display::Block,
+                    // The initial containing block is the size of the viewport, and
+                    // what `fixed` and unanchored `absolute` boxes are placed in.
                     size: Size {
                         width: Dimension::length(self.ctx.viewport_w),
-                        height: Dimension::auto(),
+                        height: Dimension::length(self.ctx.viewport_h),
                     },
                     ..Default::default()
                 };
@@ -346,6 +358,40 @@ impl<'a> Builder<'a> {
                     percentage_base_px: 0.0,
                 };
                 apply_calc(&mut self.tree, computed, &mut style, calc_ctx);
+                // Placement in a grid parent. Inert elsewhere.
+                {
+                    let text = |p: PropertyId| match computed.get(&p) {
+                        Some(CssValue::CustomValue(s)) => s.as_str(),
+                        _ => "auto",
+                    };
+                    let (row, column) = grid::area(text(PropertyId::GridArea));
+                    style.grid_row = row;
+                    style.grid_column = column;
+                    if text(PropertyId::GridRow) != "auto" {
+                        style.grid_row = grid::placement(text(PropertyId::GridRow));
+                    }
+                    if text(PropertyId::GridColumn) != "auto" {
+                        style.grid_column = grid::placement(text(PropertyId::GridColumn));
+                    }
+                    for (prop, set) in [
+                        (PropertyId::GridRowStart, 0),
+                        (PropertyId::GridRowEnd, 1),
+                        (PropertyId::GridColumnStart, 2),
+                        (PropertyId::GridColumnEnd, 3),
+                    ] {
+                        let t = text(prop);
+                        if t == "auto" {
+                            continue;
+                        }
+                        let p = grid::side(t, set % 2 == 1);
+                        match set {
+                            0 => style.grid_row.start = p,
+                            1 => style.grid_row.end = p,
+                            2 => style.grid_column.start = p,
+                            _ => style.grid_column.end = p,
+                        }
+                    }
+                }
                 if style.display == taffy::Display::Grid {
                     let text = |p: PropertyId| match computed.get(&p) {
                         Some(CssValue::CustomValue(s)) => s.as_str(),
@@ -357,6 +403,17 @@ impl<'a> Builder<'a> {
                             .collect();
                     style.grid_template_rows =
                         grid::template(text(PropertyId::GridTemplateRows), &ctx)
+                            .into_iter()
+                            .collect();
+                    style.grid_template_areas = grid::areas(text(PropertyId::GridTemplateAreas))
+                        .into_iter()
+                        .collect();
+                    style.grid_auto_flow = grid::auto_flow(text(PropertyId::GridAutoFlow));
+                    style.grid_auto_rows = grid::auto_tracks(text(PropertyId::GridAutoRows), &ctx)
+                        .into_iter()
+                        .collect();
+                    style.grid_auto_columns =
+                        grid::auto_tracks(text(PropertyId::GridAutoColumns), &ctx)
                             .into_iter()
                             .collect();
                 }
@@ -574,9 +631,16 @@ impl<'a> Builder<'a> {
         }
         match self.level(id) {
             Level::Inline => {
-                if self.tag(id) == "br" {
-                    b.line_break();
-                    return;
+                match self.tag(id).as_str() {
+                    "br" => {
+                        b.line_break();
+                        return;
+                    }
+                    "wbr" => {
+                        b.break_opportunity();
+                        return;
+                    }
+                    _ => {}
                 }
                 b.open(self.inline_box(id, computed));
                 for c in self.dom.children(id) {

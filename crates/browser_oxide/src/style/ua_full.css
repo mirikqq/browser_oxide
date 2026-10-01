@@ -12,3 +12,6 @@ tfoot { display: table-footer-group; vertical-align: middle }
 tr { display: table-row; vertical-align: inherit }
 td, th { display: table-cell; vertical-align: inherit; padding: 1px }
 th { font-weight: bold; text-align: center }
+
+/* A closed disclosure shows only its summary. */
+details:not([open]) > :not(summary) { display: none }

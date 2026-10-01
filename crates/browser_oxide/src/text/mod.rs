@@ -79,6 +79,56 @@ pub fn apply_family_metrics(
     run.width = total;
 }
 
+/// [`shape_run`] for layout. A claimed family still gets the profile's advance for
+/// every character, but the face's kerning and ligature adjustments are kept,
+/// because a browser kerns by default and the table does not know about pairs.
+pub fn shape_run_kerned(text: &str, font: &ParsedFont, os_name: &str) -> Option<shaper::ShapedRun> {
+    if text.is_empty() {
+        return None;
+    }
+    let (data, index) = resolve_face(font, os_name)?;
+    let mut run = shaper::shape(text, data, index, font.size_px);
+    let (Some(table), Some(face)) = (
+        metrics_table::lookup(&font.families, os_name),
+        shaper::face(data, index),
+    ) else {
+        return Some(run);
+    };
+    let face: &rustybuzz::ttf_parser::Face = face;
+    let upem = f32::from(face.units_per_em());
+    if upem <= 0.0 {
+        return Some(run);
+    }
+    let scale = font.size_px / upem;
+    let bytes = text.as_bytes();
+    let starts: Vec<usize> = run.glyphs.iter().map(|g| g.cluster as usize).collect();
+    let mut total = 0.0f32;
+    for (i, glyph) in run.glyphs.iter_mut().enumerate() {
+        let start = starts[i];
+        let end = starts
+            .get(i + 1)
+            .copied()
+            .filter(|&n| n > start)
+            .unwrap_or(bytes.len());
+        let natural = face
+            .glyph_hor_advance(rustybuzz::ttf_parser::GlyphId(glyph.glyph_id as u16))
+            .map_or(0.0, f32::from)
+            * scale;
+        let kerning = glyph.x_advance - natural;
+        let covered = bytes.get(start..end).unwrap_or(&[]);
+        let profile: Option<f32> = covered
+            .iter()
+            .map(|b| metrics_table::advance_px(table, *b, font.size_px))
+            .sum();
+        if let (false, Some(sum)) = (covered.is_empty(), profile) {
+            glyph.x_advance = sum + kerning;
+        }
+        total += glyph.x_advance;
+    }
+    run.width = total;
+    Some(run)
+}
+
 /// Resolve the font face + shape `text` via rustybuzz, returning the
 /// face bytes, TTC index, and the shaped run. Lets the canvas draw
 /// glyphs through Skia's own rasterizer (Chrome-parity by

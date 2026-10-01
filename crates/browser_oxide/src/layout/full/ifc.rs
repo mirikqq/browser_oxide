@@ -211,6 +211,15 @@ impl Builder {
         });
     }
 
+    /// `<wbr>`: a place where the line may end, and nothing else.
+    pub fn break_opportunity(&mut self) {
+        if let Some(last) = self.atoms.last_mut() {
+            if last.brk == Brk::None && !matches!(last.kind, AtomKind::Open(_)) {
+                last.brk = Brk::Allowed;
+            }
+        }
+    }
+
     pub fn line_break(&mut self) {
         self.visible = true;
         self.prev_space = true;
@@ -393,7 +402,7 @@ fn prefix_widths(text: &str, font: &ParsedFont, os: &str) -> Vec<f32> {
             // The profile's metrics table describes the regular weight.
             None if font.weight >= 600 || font.italic => crate::text::resolve_face(font, os)
                 .map(|(data, index)| shaper::shape(seg.text, data, index, size)),
-            None => crate::text::shape_run(seg.text, font, os).map(|(_, _, run)| run),
+            None => crate::text::shape_run_kerned(seg.text, font, os),
         };
         if let Some(run) = &run {
             for g in &run.glyphs {
@@ -971,7 +980,13 @@ fn run(tree: &mut Tree, idx: usize, ifc: &Ifc, inputs: LayoutInput) -> LayoutOut
         }
         tree.nodes[idx].frags = frags;
     }
-    tree.nodes[idx].baseline = placed.metrics.last().map(|&(top, _, asc)| top + asc);
+    // A line with no height has no baseline to speak of: an inline-block holding
+    // only such lines sits on its bottom edge instead.
+    tree.nodes[idx].baseline = placed
+        .metrics
+        .last()
+        .filter(|&&(_, height, _)| height > 0.0)
+        .map(|&(top, _, asc)| top + asc);
     let first_baseline = placed.metrics.first().map(|&(_, _, asc)| asc);
     LayoutOutput::from_sizes_and_baselines(
         Size { width, height },
