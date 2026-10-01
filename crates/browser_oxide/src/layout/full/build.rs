@@ -861,6 +861,46 @@ impl<'a> Builder<'a> {
                 .sum::<f32>();
             style.min_size.height = Dimension::length((ctx.viewport_h - margins).max(0.0));
         }
+        // A fieldset's legend sits where the top border is, as wide as it needs: a
+        // float pulled up over the border and padding, with a clearing box of the
+        // padding's height after it.
+        if tag == "fieldset" && elem.is_some() {
+            let legend = self
+                .dom
+                .children(id)
+                .into_iter()
+                .find(|&c| self.dom.get(c).is_some_and(|n| n.as_element().is_some()))
+                .filter(|&c| self.tag(c) == "legend")
+                .and_then(|c| self.dom_to_node.get(&c.to_raw()).copied())
+                .filter(|n| children.contains(n));
+            if let Some(legend) = legend {
+                let lp = |v: taffy::LengthPercentage| v.resolve_or_zero(None, |_, _| 0.0);
+                let (border, padding) = (lp(style.border.top), lp(style.padding.top));
+                let item = &mut self.tree.nodes[legend].style;
+                item.float = taffy::Float::Left;
+                let margin = item
+                    .margin
+                    .top
+                    .maybe_resolve(Some(0.0), |_, _| 0.0)
+                    .unwrap_or(0.0);
+                item.margin.top = taffy::LengthPercentageAuto::length(margin - border - padding);
+                let clear = Style {
+                    display: taffy::Display::Block,
+                    clear: taffy::Clear::Both,
+                    size: Size {
+                        width: Dimension::auto(),
+                        height: Dimension::length(padding),
+                    },
+                    ..Default::default()
+                };
+                let clear = self.tree.add(clear, Vec::new());
+                let at = children
+                    .iter()
+                    .position(|&c| c == legend)
+                    .map_or(0, |i| i + 1);
+                children.insert(at, clear);
+            }
+        }
         let style_display = style.display;
         // A percentage height needs a container whose height is known; a flex or
         // grid container that takes its height from its items has none, so its
@@ -1004,7 +1044,15 @@ impl<'a> Builder<'a> {
                 .iter()
                 .any(|m| f.contains(m))
         };
-        let (avg, extra) = if mono {
+        // Menlo, the `monospace` of macOS, is wider than Courier New by a little more
+        // than a pixel on a field.
+        let menlo = {
+            let f = family_list(computed).to_ascii_lowercase();
+            (f.contains("menlo") || f.contains("monospace")) && !f.contains("courier")
+        };
+        let (avg, extra) = if menlo {
+            ((0.6 * font_size).round(), (0.375 * font_size).round())
+        } else if mono {
             ((0.6 * font_size).round(), (0.25 * font_size).round())
         } else {
             ((0.5 * font_size).round(), (0.4 * font_size).round())
@@ -1021,8 +1069,11 @@ impl<'a> Builder<'a> {
         };
         // Border-box width and height the control asks for.
         let (w, h) = match kind.as_str() {
-            "checkbox" | "radio" | "hidden" | "image" | "range" | "color" | "file" | "date"
-            | "datetime-local" | "month" | "week" | "time" => return None,
+            // A checkbox or a radio button stands on its bottom border edge; its
+            // bottom margin hangs below the baseline.
+            "checkbox" | "radio" => return style.size.height.into_option(),
+            "hidden" | "image" | "range" | "color" | "file" | "date" | "datetime-local"
+            | "month" | "week" | "time" => return None,
             "button" | "submit" | "reset" => {
                 let default = match kind.as_str() {
                     "submit" => "Submit",
@@ -1042,7 +1093,7 @@ impl<'a> Builder<'a> {
             }
             "select" => return None,
             "textarea" => (
-                count("cols", 20.0) * avg + 16.0 + edges_w,
+                count("cols", 20.0) * avg + if menlo { 17.0 } else { 16.0 } + edges_w,
                 count("rows", 2.0) * lh + edges_h,
             ),
             _ => (count("size", 20.0) * avg + extra + edges_w, lh + edges_h),
@@ -1066,6 +1117,8 @@ impl<'a> Builder<'a> {
             "button" | "submit" | "reset" | "select" => {
                 (total_h - (metrics.ascent + metrics.descent)) / 2.0 + metrics.ascent
             }
+            // A text area stands on its bottom edge, as a box with no line of its own.
+            "textarea" => return None,
             _ => lp(style.border.top) + lp(style.padding.top) + asc_l,
         })
     }

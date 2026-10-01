@@ -765,6 +765,13 @@ impl Ifc {
                 i = j + 1;
                 continue;
             }
+            // The edges of closing inline boxes come after the space at the end of a
+            // line, which is dropped all the same.
+            if (i..=j).all(|k| matches!(self.atoms[k].kind, AtomKind::Close(_))) && has_content {
+                used += chunk;
+                i = j + 1;
+                continue;
+            }
             let forced = self.atoms[j].brk == Brk::Forced;
             let fits = !has_content || used + trailing + chunk <= avail + 0.001;
             if !fits {
@@ -1072,7 +1079,13 @@ fn fragments(
                     let u = &t.units[unit];
                     let (w, _) = ifc.weights(i, atomics);
                     let space = t.prefix[u.end] - t.prefix[u.content_end];
-                    let last_on_line = i + 1 == line.atoms.end;
+                    // Closing boxes after it do not count: the space is still at the
+                    // end of the line.
+                    let last_on_line = line
+                        .atoms
+                        .clone()
+                        .skip(i + 1 - line.atoms.start)
+                        .all(|k| matches!(ifc.atoms[k].kind, AtomKind::Close(_)));
                     let shown_end = if last_on_line { u.content_end } else { u.end };
                     let advance = if last_on_line { w } else { w + space };
                     match &mut text {

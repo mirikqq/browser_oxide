@@ -279,3 +279,62 @@ pub const CLAIMED_MACOS: &[&str] = &[
     "trebuchet ms",
     "verdana",
 ];
+
+/// The families `VERTICAL` has rows for, in the order of its rows.
+const VERTICAL_FAMILIES: [&str; 17] = [
+    "times",
+    "times new roman",
+    "helvetica",
+    "arial",
+    "courier",
+    "courier new",
+    "menlo",
+    "monaco",
+    "system-ui",
+    "georgia",
+    "verdana",
+    "helvetica neue",
+    "lucida grande",
+    "trebuchet ms",
+    "comic sans ms",
+    "impact",
+    "arial black",
+];
+
+/// What Chrome on macOS reports of each family's vertical metrics — ascent,
+/// descent and line gap, in whole px — for sizes 4 to 72 px in steps of 1/24 px
+/// (1633 rows of three bytes per family; 1/24 puts 10pt, 8pt, 11pt … on a step). Measured in Chrome (a zero-height
+/// inline-block on the baseline against the span around it, and the line box of
+/// `line-height: normal`); the numbers follow from how Core Text reports the
+/// fonts and Blink rounds them, which a bundled face cannot reproduce.
+static VERTICAL: &[u8] = include_bytes!("vmetrics_macos.bin");
+
+const VERTICAL_STEPS: usize = 1633;
+
+/// Ascent, descent and line gap (px, whole numbers) of the first family of
+/// `families` this profile has vertical metrics for, else the OS default (`Times`).
+/// `None` for an OS without a table.
+pub fn vertical(families: &[String], os_name: &str, size_px: f32) -> Option<(f32, f32, f32)> {
+    if os_name != "macOS" {
+        return None;
+    }
+    let alias = |key: &str| match key {
+        "serif" => "times".to_string(),
+        "sans-serif" | "ui-sans-serif" => "helvetica".to_string(),
+        "monospace" | "ui-monospace" => "menlo".to_string(),
+        "-apple-system" | "blinkmacsystemfont" | "ui-rounded" => "system-ui".to_string(),
+        other => other.to_string(),
+    };
+    let row = families
+        .iter()
+        .find_map(|f| {
+            let key = alias(&key_of(f));
+            VERTICAL_FAMILIES.iter().position(|n| *n == key)
+        })
+        .unwrap_or(0);
+    let step = (((size_px - 4.0) * 24.0).round().max(0.0) as usize).min(VERTICAL_STEPS - 1);
+    let at = (row * VERTICAL_STEPS + step) * 3;
+    let scale = if size_px > 72.0 { size_px / 72.0 } else { 1.0 };
+    let v = |i: usize| (f32::from(VERTICAL[at + i]) * scale).round();
+    Some((v(0), v(1), v(2)))
+}

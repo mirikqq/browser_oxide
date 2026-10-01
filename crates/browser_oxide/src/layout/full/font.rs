@@ -25,6 +25,7 @@ pub(crate) fn family_list(c: &ComputedStyle) -> String {
                 GenericFamily::Monospace | GenericFamily::UiMonospace => {
                     Some("monospace".to_string())
                 }
+                GenericFamily::SystemUi => Some("system-ui".to_string()),
                 GenericFamily::Cursive => Some("cursive".to_string()),
                 GenericFamily::Fantasy => Some("fantasy".to_string()),
                 _ => None,
@@ -115,12 +116,21 @@ impl Metrics {
                     }
                 })
             });
-        from_face.unwrap_or(Self {
+        let mut m = from_face.unwrap_or(Self {
             ascent: (size * 0.8).round(),
             descent: (size * 0.2).round(),
             line_gap: 0.0,
             x_height: size * 0.5,
-        })
+        });
+        // The profile's own numbers win over the bundled face's.
+        if let Some((ascent, descent, line_gap)) =
+            crate::text::metrics_table::vertical(&font.families, os_name, size)
+        {
+            m.ascent = ascent;
+            m.descent = descent;
+            m.line_gap = line_gap;
+        }
+        m
     }
 
     /// `line-height: normal`.
