@@ -66,9 +66,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `getClientRects()` follows Blink: one rectangle per line for an element with
   padding or borders, one per text fragment otherwise. `browser_oxide_shell`
   and the `screenshot` example select it. `tests/layout_corpus` measures both
-  layouts against what a real Chrome reports for 42 local pages (140 elements
-  within 1px: legacy 53, full 138); `tests/layout_corpus/snapshot.mjs`
-  re-records Chrome's numbers. New dependencies: `unicode-linebreak`
+  layouts against what a real Chrome reports for 44 local pages (149 elements
+  within 1px: legacy 53, full 147); `tests/layout_corpus/snapshot.mjs`
+  re-records Chrome's numbers.
+  Also in `Full`: placement in a grid (`grid-template-areas`, `grid-area`,
+  `grid-row`/`-column` and their `-start`/`-end`, `grid-auto-flow`,
+  `grid-auto-rows`/`-columns`), `<wbr>` as a place where a line may end, the
+  contents of a closed `<details>` not being laid out, kerning kept when the
+  profile's advances are used, and an initial containing block the size of the
+  viewport for `fixed` and unanchored `absolute` boxes. Local saved pages can
+  be compared with Chrome too (`tests/layout_corpus/prepare.mjs`,
+  `snapshot.mjs --real`, `probe.mjs`, test `layout_corpus_real`); the pages
+  are kept out of git.
+  New dependencies: `unicode-linebreak`
   (Apache-2.0), `unicode-width` (MIT OR Apache-2.0). New properties parsed:
   `grid-template-columns`/`-rows`, `border-collapse`, `border-spacing`,
   `vertical-align` (kept as text), and the `table-row-group`, `table-header-group`,
@@ -85,6 +95,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   page script runs and handed to engine code only as a call argument.
 
 ### Fixed
+- **Values with parentheses lost them** when a declaration was turned back into
+  text: `calc((16px - 0.57rem) / 2)` became `calc(16px - 0.57rem / 2)`, which
+  changed its meaning, made a rule that also uses `var()` drop such a
+  declaration, and made `getComputedStyle` report the wrong text.
 - **Layout cascaded on its own, and got it wrong** — no inheritance (`color`,
   `font-*`, `line-height`, `visibility` stopped at each element), every `em`
   measured against 16px, `!important` and `@layer` ignored. It now takes
