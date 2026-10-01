@@ -176,6 +176,9 @@ fn all_property_ids() -> Vec<PropertyId> {
         PropertyId::Content,
         PropertyId::ListStyleType,
         PropertyId::Order,
+        PropertyId::CounterReset,
+        PropertyId::CounterIncrement,
+        PropertyId::CounterSet,
         PropertyId::Transform,
     ]
 }

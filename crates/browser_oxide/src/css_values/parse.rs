@@ -96,6 +96,9 @@ pub fn parse_property(
         | "border-spacing"
         | "list-style-type"
         | "order"
+        | "counter-reset"
+        | "counter-increment"
+        | "counter-set"
         | "vertical-align"
         | "grid-template-areas"
         | "grid-auto-flow"
@@ -944,17 +947,47 @@ fn parse_content(value: &[ComponentValue<'_>]) -> CssValue {
                 _ => {}
             },
             ComponentValue::Function(f) => {
-                let first = f.arguments.iter().find_map(|a| match a {
-                    ComponentValue::Token(Token {
-                        kind: TokenKind::Ident(n) | TokenKind::String(n),
-                        ..
-                    }) => Some(n.to_string()),
-                    _ => None,
-                });
-                match (f.name.to_ascii_lowercase().as_str(), first) {
-                    ("attr", Some(name)) => items.push(ContentItem::Attr(name)),
-                    ("url", Some(u)) => items.push(ContentItem::Url(u)),
-                    ("counter" | "counters", Some(name)) => items.push(ContentItem::Counter(name)),
+                // The arguments, split at commas: each an identifier or a string.
+                let args: Vec<String> = f
+                    .arguments
+                    .split(|a| {
+                        matches!(
+                            a,
+                            ComponentValue::Token(Token {
+                                kind: TokenKind::Comma,
+                                ..
+                            })
+                        )
+                    })
+                    .map(|part| {
+                        part.iter()
+                            .find_map(|a| match a {
+                                ComponentValue::Token(Token {
+                                    kind: TokenKind::Ident(n),
+                                    ..
+                                }) => Some(n.to_string()),
+                                ComponentValue::Token(Token {
+                                    kind: TokenKind::String(n),
+                                    ..
+                                }) => Some(unescape_css(n)),
+                                _ => None,
+                            })
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                let arg = |i: usize| args.get(i).cloned().unwrap_or_default();
+                match f.name.to_ascii_lowercase().as_str() {
+                    "attr" if !arg(0).is_empty() => items.push(ContentItem::Attr(arg(0))),
+                    "url" if !arg(0).is_empty() => items.push(ContentItem::Url(arg(0))),
+                    "counter" if !arg(0).is_empty() => items.push(ContentItem::Counter {
+                        name: arg(0),
+                        style: arg(1),
+                    }),
+                    "counters" if !arg(0).is_empty() => items.push(ContentItem::Counters {
+                        name: arg(0),
+                        sep: arg(1),
+                        style: arg(2),
+                    }),
                     _ => {}
                 }
             }

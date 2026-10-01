@@ -10,7 +10,16 @@ pub enum ContentItem {
     CloseQuote,
     NoOpenQuote,
     NoCloseQuote,
-    /// `counter(name)` and `counters(name, sep)`; counters are not tracked yet, so
-    /// layout puts nothing in their place.
-    Counter(String),
+    /// `counter(name, style)`: the innermost counter of that name.
+    Counter {
+        name: String,
+        style: String,
+    },
+    /// `counters(name, sep, style)`: every counter of that name in scope, outermost
+    /// first, joined by `sep`.
+    Counters {
+        name: String,
+        sep: String,
+        style: String,
+    },
 }

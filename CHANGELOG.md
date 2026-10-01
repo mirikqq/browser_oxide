@@ -91,6 +91,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   their containing block, sizes and baselines of form controls after Blink, text
   wrapping around floats, and generated images with the natural size of an SVG,
   PNG or GIF given as a `data:` URL.
+  Also: `vertical-align` on inline boxes and atomic inlines, `order` on flex and
+  grid items, `list-style-type`, CSS counters (`counter-reset`, `counter-increment`,
+  `counter-set`, `counter()`, `counters()`), flex baselines, and calc() lengths
+  that do not depend on a percentage resolved before taffy sees them. Shared fix:
+  nested functional pseudo-classes (`a:is(:not(.q)) .x`) in the selector parser.
   New dependencies: `unicode-linebreak`
   (Apache-2.0), `unicode-width` (MIT OR Apache-2.0). New properties parsed:
   `grid-template-columns`/`-rows`, `border-collapse`, `border-spacing`,

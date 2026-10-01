@@ -108,6 +108,9 @@ pub fn initial_value(property: &PropertyId) -> CssValue {
         PropertyId::Content => CssValue::Content(Vec::new()),
         PropertyId::ListStyleType => CssValue::CustomValue("disc".to_string()),
         PropertyId::Order => CssValue::CustomValue("0".to_string()),
+        PropertyId::CounterReset | PropertyId::CounterIncrement | PropertyId::CounterSet => {
+            CssValue::CustomValue("none".to_string())
+        }
         PropertyId::Transform => CssValue::Transform(vec![]),
         PropertyId::Custom(_) => CssValue::Inherit, // custom properties inherit by default
     }

@@ -55,9 +55,83 @@ enum Part {
 
 enum Work {
     Visit(DomId),
-    /// The node, and how many out-of-flow boxes were pending when its subtree
-    /// began: everything past that mark came from inside it.
-    Finish(DomId, usize),
+    /// The node, how many out-of-flow boxes were pending when its subtree began
+    /// (everything past that mark came from inside it), and how many counters were
+    /// in scope once the node had made its own: those made inside end with it.
+    Finish(DomId, usize, usize),
+}
+
+/// A counter of CSS counters, in scope.
+struct Counter {
+    name: String,
+    value: i32,
+}
+
+/// What a pseudo-element's `content` made.
+enum Generated {
+    Text(String),
+    Image(f32, f32),
+}
+
+/// A counter value as text, in a `list-style-type`.
+fn format_counter(n: i32, style: &str) -> String {
+    let alpha = |upper: bool| {
+        if n < 1 {
+            return n.to_string();
+        }
+        let (mut out, mut k) = (Vec::new(), n as u32);
+        while k > 0 {
+            k -= 1;
+            out.push(((k % 26) as u8 + if upper { b'A' } else { b'a' }) as char);
+            k /= 26;
+        }
+        out.iter().rev().collect::<String>()
+    };
+    let roman = |upper: bool| {
+        if !(1..4000).contains(&n) {
+            return n.to_string();
+        }
+        let table = [
+            (1000, "m"),
+            (900, "cm"),
+            (500, "d"),
+            (400, "cd"),
+            (100, "c"),
+            (90, "xc"),
+            (50, "l"),
+            (40, "xl"),
+            (10, "x"),
+            (9, "ix"),
+            (5, "v"),
+            (4, "iv"),
+            (1, "i"),
+        ];
+        let mut rest = n;
+        let mut out = String::new();
+        for (v, s) in table {
+            while rest >= v {
+                out.push_str(s);
+                rest -= v;
+            }
+        }
+        if upper {
+            out.to_uppercase()
+        } else {
+            out
+        }
+    };
+    match style.trim().to_ascii_lowercase().as_str() {
+        "lower-alpha" | "lower-latin" => alpha(false),
+        "upper-alpha" | "upper-latin" => alpha(true),
+        "lower-roman" => roman(false),
+        "upper-roman" => roman(true),
+        "decimal-leading-zero" => format!("{n:02}"),
+        "disc" => "\u{2022}".to_string(),
+        "circle" => "\u{25E6}".to_string(),
+        "square" => "\u{25AA}".to_string(),
+        "none" => String::new(),
+        _ => n.to_string(),
+    }
 }
 
 pub(super) struct Builder<'a> {
@@ -82,6 +156,10 @@ pub(super) struct Builder<'a> {
     pub static_pending: Vec<(usize, usize)>,
     /// Parsed fonts and their metrics, by what makes them different.
     fonts: RefCell<HashMap<FontKey, (ParsedFont, Metrics)>>,
+    /// The CSS counters in scope where the walk is.
+    counters: Vec<Counter>,
+    /// The content of each pseudo-element, made where the walk met it.
+    pseudo_parts: HashMap<u32, Vec<Generated>>,
 }
 
 /// Families, size in bits, weight, italic.
@@ -122,6 +200,8 @@ impl<'a> Builder<'a> {
             vertical_percent: Vec::new(),
             static_pending: Vec::new(),
             fonts: RefCell::new(HashMap::new()),
+            counters: Vec::new(),
+            pseudo_parts: HashMap::new(),
         }
     }
 
@@ -168,7 +248,15 @@ impl<'a> Builder<'a> {
                     }
                     steps += 1;
                     assert!(steps <= BUILD_LIMIT, "layout build cycle at {id:?}");
-                    stack.push(Work::Finish(id, self.abs_pending.len()));
+                    self.enter_counters(id);
+                    if self.styles.is_pseudo(id) {
+                        self.fill_generated(id);
+                    }
+                    stack.push(Work::Finish(
+                        id,
+                        self.abs_pending.len(),
+                        self.counters.len(),
+                    ));
                     // An outer SVG is a replaced element: its graphics tree has its
                     // own viewport and must not size the box around it.
                     let is_svg = self
@@ -182,7 +270,10 @@ impl<'a> Builder<'a> {
                         }
                     }
                 }
-                Work::Finish(id, mark) => self.finish(id, mark, on_style),
+                Work::Finish(id, mark, counters) => {
+                    self.finish(id, mark, on_style);
+                    self.counters.truncate(counters);
+                }
             }
         }
     }
@@ -311,18 +402,77 @@ impl<'a> Builder<'a> {
         self.dom.get(id).and_then(|n| n.parent)
     }
 
-    /// The text of a pseudo-element's `content`. Images and counters are not
-    /// generated: there is nothing to draw, and nothing counted.
+    /// What a pseudo-element's `content` made when the walk reached it.
     fn generated(&self, pseudo: DomId) -> Vec<Part> {
+        self.pseudo_parts
+            .get(&pseudo.to_raw())
+            .map(|parts| {
+                parts
+                    .iter()
+                    .map(|p| match p {
+                        Generated::Text(t) => Part::Text(pseudo, t.clone()),
+                        Generated::Image(w, h) => Part::Image(*w, *h),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The counters of `id`: `counter-reset` makes new ones, `counter-increment`
+    /// adds to the innermost of that name (making one if there is none), and
+    /// `counter-set` sets it.
+    fn enter_counters(&mut self, id: DomId) {
+        let Some(c) = self.styles.get(id) else { return };
+        let ops = |prop: PropertyId, default: i32| -> Vec<(String, i32)> {
+            let Some(CssValue::CustomValue(text)) = c.get(&prop) else {
+                return Vec::new();
+            };
+            let words: Vec<&str> = text.split_whitespace().collect();
+            let (mut out, mut i) = (Vec::new(), 0);
+            while i < words.len() {
+                let name = words[i];
+                let value = words.get(i + 1).and_then(|w| w.parse::<i32>().ok());
+                i += if value.is_some() { 2 } else { 1 };
+                if name != "none" {
+                    out.push((name.to_string(), value.unwrap_or(default)));
+                }
+            }
+            out
+        };
+        let (reset, increment, set) = (
+            ops(PropertyId::CounterReset, 0),
+            ops(PropertyId::CounterIncrement, 1),
+            ops(PropertyId::CounterSet, 0),
+        );
+        for (name, value) in reset {
+            self.counters.push(Counter { name, value });
+        }
+        for (name, by) in increment {
+            match self.counters.iter_mut().rev().find(|c| c.name == name) {
+                Some(c) => c.value += by,
+                None => self.counters.push(Counter { name, value: by }),
+            }
+        }
+        for (name, to) in set {
+            match self.counters.iter_mut().rev().find(|c| c.name == name) {
+                Some(c) => c.value = to,
+                None => self.counters.push(Counter { name, value: to }),
+            }
+        }
+    }
+
+    /// Work out the `content` of the pseudo-element `pseudo` where the walk is:
+    /// the counters are what they are here.
+    fn fill_generated(&mut self, pseudo: DomId) {
         let Some(CssValue::Content(items)) = self
             .styles
             .get(pseudo)
             .and_then(|c| c.get(&PropertyId::Content))
         else {
-            return Vec::new();
+            return;
         };
         let owner = self.styles.owner(pseudo).and_then(|o| self.dom.get(o));
-        items
+        let parts: Vec<Generated> = items
             .iter()
             .filter_map(|item| {
                 let text = match item {
@@ -339,15 +489,36 @@ impl<'a> Builder<'a> {
                     ContentItem::OpenQuote => "\u{201C}".to_string(),
                     ContentItem::CloseQuote => "\u{201D}".to_string(),
                     ContentItem::Url(url) => {
-                        return super::image::natural_size(url).map(|(w, h)| Part::Image(w, h))
+                        return super::image::natural_size(url).map(|(w, h)| Generated::Image(w, h))
                     }
-                    ContentItem::NoOpenQuote
-                    | ContentItem::NoCloseQuote
-                    | ContentItem::Counter(_) => return None,
+                    ContentItem::NoOpenQuote | ContentItem::NoCloseQuote => return None,
+                    ContentItem::Counter { name, style } => {
+                        let value = self
+                            .counters
+                            .iter()
+                            .rev()
+                            .find(|c| &c.name == name)
+                            .map_or(0, |c| c.value);
+                        format_counter(value, style)
+                    }
+                    ContentItem::Counters { name, sep, style } => {
+                        let values: Vec<String> = self
+                            .counters
+                            .iter()
+                            .filter(|c| &c.name == name)
+                            .map(|c| format_counter(c.value, style))
+                            .collect();
+                        if values.is_empty() {
+                            format_counter(0, style)
+                        } else {
+                            values.join(sep)
+                        }
+                    }
                 };
-                Some(Part::Text(pseudo, text))
+                Some(Generated::Text(text))
             })
-            .collect()
+            .collect();
+        self.pseudo_parts.insert(pseudo.to_raw(), parts);
     }
 
     /// Move the out-of-flow children of `id` to the pending list.
