@@ -1,4 +1,5 @@
 pub mod color;
+pub mod content;
 pub mod custom;
 pub mod display;
 pub mod font;

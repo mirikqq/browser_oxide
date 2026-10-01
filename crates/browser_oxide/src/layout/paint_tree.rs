@@ -156,6 +156,9 @@ pub struct PaintBox {
     pub clip: Option<[f32; 4]>,
 }
 
+/// The tag of a box that belongs to a pseudo-element: it is drawn like an element.
+const PSEUDO_TAG: &str = "::pseudo";
+
 /// What flows from parent to child while the tree is walked: only what the
 /// style pass cannot have done for us, because it is not inherited — `opacity`
 /// compounds and `overflow` clips accumulate.
@@ -245,11 +248,49 @@ impl LayoutEngine {
             let (w, h) = (layout.size.width, layout.size.height);
             let mut child_inh = inh.clone();
 
-            let node_data = dom_of
-                .get(&tid)
-                .copied()
+            let dom_id_of = dom_of.get(&tid).copied();
+            let node_data = dom_id_of
                 .map(|dom_id| (dom_id, NodeId::from_raw(dom_id)))
                 .and_then(|(dom_id, node)| dom.get(node).map(|n| (dom_id, node, n)));
+            // A pseudo-element has a style and a box but no node in the document.
+            if let (None, Some(dom_id)) = (&node_data, dom_id_of) {
+                if let Some(style) = self.paint_styles.get(&dom_id) {
+                    child_inh.opacity = inh.opacity * style.opacity;
+                    out.push(PaintBox {
+                        node: NodeId::from_raw(dom_id),
+                        x,
+                        y,
+                        width: w,
+                        height: h,
+                        tag: Some(PSEUDO_TAG.to_string()),
+                        text: None,
+                        text_baseline: None,
+                        background: style.background,
+                        color: style.color,
+                        font_size: style.font_size,
+                        font_family: style.font_family.clone(),
+                        bold: style.bold,
+                        italic: style.italic,
+                        border: [
+                            layout.border.top,
+                            layout.border.right,
+                            layout.border.bottom,
+                            layout.border.left,
+                        ],
+                        border_color: style.border_color,
+                        visible: !style.hidden,
+                        opacity: child_inh.opacity,
+                        clip: inh.clip,
+                    });
+                    if style.clips {
+                        let own = [x, y, w, h];
+                        child_inh.clip = Some(match inh.clip {
+                            Some(c) => intersect(c, own),
+                            None => own,
+                        });
+                    }
+                }
+            }
             if let Some((dom_id, node, n)) = node_data {
                 match &n.data {
                     NodeData::Element(elem) => {
@@ -333,11 +374,12 @@ impl LayoutEngine {
                 let (fx, fy) = (x + f.rect[0], y + f.rect[1]);
                 match f.kind {
                     FragKind::Box => {
-                        let Some(elem) = dom
-                            .get(NodeId::from_raw(f.dom))
-                            .and_then(|n| n.as_element())
-                        else {
-                            continue;
+                        let tag = match dom.get(NodeId::from_raw(f.dom)) {
+                            Some(n) => match n.as_element() {
+                                Some(elem) => Some(elem.name.local.to_ascii_lowercase()),
+                                None => continue,
+                            },
+                            None => Some(PSEUDO_TAG.to_string()),
                         };
                         out.push(PaintBox {
                             node: NodeId::from_raw(f.dom),
@@ -345,7 +387,7 @@ impl LayoutEngine {
                             y: fy,
                             width: f.rect[2],
                             height: f.rect[3],
-                            tag: Some(elem.name.local.to_ascii_lowercase()),
+                            tag,
                             text: None,
                             text_baseline: None,
                             background: style.background,

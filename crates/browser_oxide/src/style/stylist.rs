@@ -28,8 +28,8 @@ use crate::css_cascade::{
 };
 use crate::css_parser::ast::{Block, Declaration, Rule as AstRule};
 use crate::css_selectors::{
-    compute_specificity, matches_selector, parse_selector_list, Component, SelectorList,
-    SimpleSelector, Specificity,
+    compute_specificity, matches_selector, parse_selector_list, Component, PseudoElement, Selector,
+    SelectorList, SimpleSelector, Specificity,
 };
 use crate::css_values::property::{CssValue, PropertyDeclaration, PropertyId};
 use crate::dom::element::DomElement;
@@ -58,6 +58,22 @@ pub struct RawDecl {
     pub important: bool,
 }
 
+/// The pseudo-elements that generate a box: `::before` and `::after`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Pseudo {
+    Before,
+    After,
+}
+
+impl Pseudo {
+    fn slot(self) -> usize {
+        match self {
+            Self::Before => 0,
+            Self::After => 1,
+        }
+    }
+}
+
 /// One style rule: selectors, and the declarations they apply.
 #[derive(Debug, Clone)]
 pub struct Rule {
@@ -71,6 +87,9 @@ pub struct Rule {
     /// Position in the document's rules; later wins a tie.
     pub order: u32,
     pub dynamic: bool,
+    /// The rule styles this pseudo-element of the elements `selectors` match, with
+    /// the pseudo-element itself already taken off them. Only `Full` keeps these.
+    pub pseudo: Option<Pseudo>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -86,6 +105,8 @@ struct Buckets {
 pub struct Stylist {
     rules: Arc<Vec<Rule>>,
     buckets: Arc<Buckets>,
+    /// The same index for the rules of `::before` and `::after`.
+    pseudo_buckets: Arc<[Buckets; 2]>,
     layers: Arc<HashMap<String, LayerId>>,
     media: MediaFeatures,
     /// Built for `LayoutMode::Full`: `@media` is evaluated to the letter of the spec,
@@ -102,6 +123,7 @@ static UA_STYLIST: LazyLock<Stylist> = LazyLock::new(|| {
 
 static UA_FULL_STYLIST: LazyLock<Stylist> = LazyLock::new(|| {
     let mut s = Stylist::empty(MediaFeatures::default());
+    s.full = true;
     s.add_stylesheet(UA_CSS, Origin::UserAgent);
     s.add_stylesheet(UA_FULL_CSS, Origin::UserAgent);
     s
@@ -112,6 +134,7 @@ impl Stylist {
         Self {
             rules: Arc::default(),
             buckets: Arc::default(),
+            pseudo_buckets: Arc::default(),
             layers: Arc::default(),
             media,
             full: false,
@@ -331,8 +354,32 @@ impl Stylist {
                 .iter()
                 .any(|d| d.name.starts_with("--") || custom::has_var(&d.value));
             if let Ok(selectors) = parse_selector_list(selector) {
+                if self.full {
+                    for pseudo in [Pseudo::Before, Pseudo::After] {
+                        let stripped = strip_pseudo(&selectors, pseudo);
+                        if stripped.is_empty() {
+                            continue;
+                        }
+                        let index = self.rules.len() as u32;
+                        index_selectors(
+                            &mut Arc::make_mut(&mut self.pseudo_buckets)[pseudo.slot()],
+                            index,
+                            &stripped,
+                        );
+                        Arc::make_mut(&mut self.rules).push(Rule {
+                            selectors: stripped,
+                            decls: decls.clone(),
+                            raw: raw.clone(),
+                            origin,
+                            layer,
+                            order: index,
+                            dynamic,
+                            pseudo: Some(pseudo),
+                        });
+                    }
+                }
                 let index = self.rules.len() as u32;
-                if self.index_rule(index, &selectors) {
+                if index_selectors(Arc::make_mut(&mut self.buckets), index, &selectors) {
                     Arc::make_mut(&mut self.rules).push(Rule {
                         selectors,
                         decls,
@@ -341,6 +388,7 @@ impl Stylist {
                         layer,
                         order: index,
                         dynamic,
+                        pseudo: None,
                     });
                 }
             }
@@ -350,78 +398,25 @@ impl Stylist {
         }
     }
 
-    /// Register `selectors` in the lookup buckets under the rule index `index`.
-    /// Returns false, registering nothing, if no selector can match an element
-    /// (every one of them ends in a pseudo-element).
-    fn index_rule(&mut self, index: u32, selectors: &SelectorList) -> bool {
-        let buckets = Arc::make_mut(&mut self.buckets);
-        let mut any = false;
-        for sel in selectors {
-            let components = sel.components();
-            if components
-                .iter()
-                .any(|c| matches!(c, Component::Simple(SimpleSelector::PseudoElement(_))))
-            {
-                continue;
-            }
-            any = true;
-            // Components run right to left: the key compound is everything up to
-            // the first combinator.
-            let compound: Vec<&SimpleSelector> = components
-                .iter()
-                .take_while(|c| !matches!(c, Component::Combinator(_)))
-                .filter_map(|c| match c {
-                    Component::Simple(s) => Some(s),
-                    Component::Combinator(_) => None,
-                })
-                .collect();
-            let bucket = if let Some(SimpleSelector::Id(id)) =
-                compound.iter().find(|s| matches!(s, SimpleSelector::Id(_)))
-            {
-                buckets.by_id.entry(id.clone()).or_default()
-            } else if let Some(SimpleSelector::Class(c)) = compound
-                .iter()
-                .find(|s| matches!(s, SimpleSelector::Class(_)))
-            {
-                buckets.by_class.entry(c.clone()).or_default()
-            } else if let Some(SimpleSelector::Type(t)) = compound
-                .iter()
-                .find(|s| matches!(s, SimpleSelector::Type(_)))
-            {
-                buckets.by_tag.entry(t.to_ascii_lowercase()).or_default()
-            } else {
-                &mut buckets.universal
-            };
-            if bucket.last() != Some(&index) {
-                bucket.push(index);
-            }
-        }
-        any
-    }
-
-    /// Indices of the rules that could apply to `node`, ascending.
-    fn candidates(&self, dom: &Dom, node: NodeId) -> Vec<u32> {
+    /// Indices of the rules in `buckets` that could apply to `node`, ascending.
+    fn candidates(buckets: &Buckets, dom: &Dom, node: NodeId) -> Vec<u32> {
         let Some(NodeData::Element(elem)) = dom.get(node).map(|n| &n.data) else {
             return Vec::new();
         };
-        let mut out: Vec<u32> = self.buckets.universal.clone();
-        if let Some(v) = self
-            .buckets
-            .by_tag
-            .get(&elem.name.local.to_ascii_lowercase())
-        {
+        let mut out: Vec<u32> = buckets.universal.clone();
+        if let Some(v) = buckets.by_tag.get(&elem.name.local.to_ascii_lowercase()) {
             out.extend_from_slice(v);
         }
         for attr in &elem.attrs {
             match &*attr.name.local {
                 "id" => {
-                    if let Some(v) = self.buckets.by_id.get(attr.value.as_str()) {
+                    if let Some(v) = buckets.by_id.get(attr.value.as_str()) {
                         out.extend_from_slice(v);
                     }
                 }
                 "class" => {
                     for class in attr.value.split_ascii_whitespace() {
-                        if let Some(v) = self.buckets.by_class.get(class) {
+                        if let Some(v) = buckets.by_class.get(class) {
                             out.extend_from_slice(v);
                         }
                     }
@@ -440,11 +435,31 @@ impl Stylist {
         dom: &'a Dom,
         node: NodeId,
     ) -> impl Iterator<Item = (&'a Rule, Specificity)> {
+        self.matching_in(dom, node, None)
+    }
+
+    /// The same for the rules of a pseudo-element of `node`.
+    fn matching_in<'a>(
+        &'a self,
+        dom: &'a Dom,
+        node: NodeId,
+        pseudo: Option<Pseudo>,
+    ) -> impl Iterator<Item = (&'a Rule, Specificity)> {
         let element = DomElement::new(dom, node);
+        let buckets = match pseudo {
+            None => &*self.buckets,
+            Some(p) => &self.pseudo_buckets[p.slot()],
+        };
         let candidates = if element.is_some() {
-            self.candidates(dom, node)
+            Self::candidates(buckets, dom, node)
         } else {
             Vec::new()
+        };
+        // The pseudo-element itself counts as a type selector.
+        let extra = if pseudo.is_some() {
+            Specificity::new(0, 0, 1)
+        } else {
+            Specificity::default()
         };
         candidates.into_iter().filter_map(move |i| {
             let element = element.as_ref()?;
@@ -454,7 +469,7 @@ impl Stylist {
                 .filter(|sel| matches_selector(element, sel))
                 .map(compute_specificity)
                 .max()
-                .map(|spec| (rule, spec))
+                .map(|spec| (rule, spec + extra))
         })
     }
 
@@ -482,9 +497,22 @@ impl Stylist {
         extra: Vec<CascadeEntry>,
         inherited: &CustomProps,
     ) -> (HashMap<PropertyId, CssValue>, CustomProps) {
+        self.cascade_pseudo(dom, node, None, extra, inherited)
+    }
+
+    /// [`Stylist::cascade_with_custom`] for a pseudo-element of `node` (`None`: the
+    /// element itself). The `style` attribute styles only the element.
+    pub fn cascade_pseudo(
+        &self,
+        dom: &Dom,
+        node: NodeId,
+        pseudo: Option<Pseudo>,
+        extra: Vec<CascadeEntry>,
+        inherited: &CustomProps,
+    ) -> (HashMap<PropertyId, CssValue>, CustomProps) {
         let mut entries = extra;
         let mut dynamic: Vec<(CascadeKey, RawDecl)> = Vec::new();
-        for (rule, specificity) in self.matching(dom, node) {
+        for (rule, specificity) in self.matching_in(dom, node, pseudo) {
             if rule.dynamic {
                 for d in &rule.raw {
                     let key = CascadeKey {
@@ -508,11 +536,13 @@ impl Stylist {
                 });
             }
         }
-        dynamic.extend(
-            inline_decls(dom, node)
-                .into_iter()
-                .map(|d| (inline_key(d.important), d)),
-        );
+        if pseudo.is_none() {
+            dynamic.extend(
+                inline_decls(dom, node)
+                    .into_iter()
+                    .map(|d| (inline_key(d.important), d)),
+            );
+        }
         dynamic.sort_by(|a, b| compare_keys(&a.0, &b.0));
 
         let declared: HashMap<String, String> = dynamic
@@ -687,6 +717,93 @@ pub fn parse_inline_style(style: &str) -> Vec<PropertyDeclaration> {
         }
     }
     out
+}
+
+/// Register `selectors` in the lookup `buckets` under the rule index `index`.
+/// Returns false, registering nothing, if no selector can match an element
+/// (every one of them carries a pseudo-element).
+fn index_selectors(buckets: &mut Buckets, index: u32, selectors: &SelectorList) -> bool {
+    let mut any = false;
+    for sel in selectors {
+        let components = sel.components();
+        if components
+            .iter()
+            .any(|c| matches!(c, Component::Simple(SimpleSelector::PseudoElement(_))))
+        {
+            continue;
+        }
+        any = true;
+        // Components run right to left: the key compound is everything up to
+        // the first combinator.
+        let compound: Vec<&SimpleSelector> = components
+            .iter()
+            .take_while(|c| !matches!(c, Component::Combinator(_)))
+            .filter_map(|c| match c {
+                Component::Simple(s) => Some(s),
+                Component::Combinator(_) => None,
+            })
+            .collect();
+        let bucket = if let Some(SimpleSelector::Id(id)) =
+            compound.iter().find(|s| matches!(s, SimpleSelector::Id(_)))
+        {
+            buckets.by_id.entry(id.clone()).or_default()
+        } else if let Some(SimpleSelector::Class(c)) = compound
+            .iter()
+            .find(|s| matches!(s, SimpleSelector::Class(_)))
+        {
+            buckets.by_class.entry(c.clone()).or_default()
+        } else if let Some(SimpleSelector::Type(t)) = compound
+            .iter()
+            .find(|s| matches!(s, SimpleSelector::Type(_)))
+        {
+            buckets.by_tag.entry(t.to_ascii_lowercase()).or_default()
+        } else {
+            &mut buckets.universal
+        };
+        if bucket.last() != Some(&index) {
+            bucket.push(index);
+        }
+    }
+    any
+}
+
+/// The selectors of `list` that end in `pseudo`, with it taken off, so that they
+/// match the element the pseudo-element belongs to.
+fn strip_pseudo(list: &SelectorList, pseudo: Pseudo) -> SelectorList {
+    let wanted = match pseudo {
+        Pseudo::Before => PseudoElement::Before,
+        Pseudo::After => PseudoElement::After,
+    };
+    list.iter()
+        .filter_map(|sel| {
+            let components = sel.components();
+            let compound_end = components
+                .iter()
+                .position(|c| matches!(c, Component::Combinator(_)))
+                .unwrap_or(components.len());
+            let mut kept: Vec<Component> = Vec::with_capacity(components.len());
+            let mut found = false;
+            for (i, c) in components.iter().enumerate() {
+                match c {
+                    Component::Simple(SimpleSelector::PseudoElement(p)) => {
+                        // Only the last compound may carry it, and only this one.
+                        if i >= compound_end || *p != wanted || found {
+                            return None;
+                        }
+                        found = true;
+                    }
+                    other => kept.push(other.clone()),
+                }
+            }
+            if !found {
+                return None;
+            }
+            if kept.is_empty() || matches!(kept[0], Component::Combinator(_)) {
+                kept.insert(0, Component::Simple(SimpleSelector::Universal));
+            }
+            Some(Selector::new(kept, sel.specificity()))
+        })
+        .collect()
 }
 
 /// Cascade entries for declarations that do not come from a rule.

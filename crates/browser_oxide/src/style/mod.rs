@@ -11,5 +11,5 @@ pub(crate) mod hints;
 pub mod stylist;
 pub mod tree;
 
-pub use stylist::{parse_inline_style, RawDecl, Rule, Stylist};
+pub use stylist::{parse_inline_style, Pseudo, RawDecl, Rule, Stylist};
 pub use tree::StyleTree;

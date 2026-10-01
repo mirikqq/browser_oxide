@@ -17,6 +17,7 @@ use super::tree::{GroupKind, Role, TableStyle, Tree, VAlign};
 use super::{apply_calc, grid};
 use crate::css_cascade::ComputedStyle;
 use crate::css_values::property::{CssValue, PropertyId};
+use crate::css_values::types::content::ContentItem;
 use crate::css_values::types::display::{
     Clear as CssClear, Display as CssDisplay, Float as CssFloat, Overflow, Position as CssPosition,
     TextAlign, WhiteSpace,
@@ -26,7 +27,7 @@ use crate::dom::node::{NodeData, NodeId as DomId};
 use crate::dom::Dom;
 use crate::layout::resolve::ResolveContext;
 use crate::layout::style_map::computed_to_taffy;
-use crate::style::StyleTree;
+use crate::style::{Pseudo, StyleTree};
 use crate::text::ParsedFont;
 
 /// Step limit for the DOM walk: a cycle in the arena panics with a clear message
@@ -41,6 +42,13 @@ enum Level {
     Atomic,
     /// Has no box: its content joins the run that contains it.
     Inline,
+}
+
+/// One thing a box is made of.
+enum Part {
+    Node(DomId),
+    /// Text a pseudo-element generates, in the style of the given pseudo-element.
+    Text(DomId, String),
 }
 
 enum Work {
@@ -162,7 +170,7 @@ impl<'a> Builder<'a> {
                         .and_then(|n| n.as_element())
                         .is_some_and(|e| e.name.local.eq_ignore_ascii_case("svg"));
                     if !is_svg {
-                        for c in self.dom.children(id).into_iter().rev() {
+                        for c in self.child_ids(id).into_iter().rev() {
                             stack.push(Work::Visit(c));
                         }
                     }
@@ -219,7 +227,7 @@ impl<'a> Builder<'a> {
             return Level::Block;
         }
         // Children of a flex or grid container are blockified.
-        let parent_blockifies = self.dom.get(id).and_then(|n| n.parent).is_some_and(|p| {
+        let parent_blockifies = self.parent_of(id).is_some_and(|p| {
             matches!(
                 self.display_of(p),
                 CssDisplay::Flex
@@ -249,9 +257,80 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// What `id` is made of, in order: the box of its `::before`, its children, the
+    /// box of its `::after`. A pseudo-element holds the text its `content` makes.
+    fn parts(&self, id: DomId) -> Vec<Part> {
+        if self.styles.is_pseudo(id) {
+            return self.generated(id);
+        }
+        let mut out = Vec::new();
+        out.extend(self.styles.pseudo(id, Pseudo::Before).map(Part::Node));
+        out.extend(self.dom.children(id).into_iter().map(Part::Node));
+        out.extend(self.styles.pseudo(id, Pseudo::After).map(Part::Node));
+        out
+    }
+
+    /// The boxes below `id` that the walk visits.
+    fn child_ids(&self, id: DomId) -> Vec<DomId> {
+        if self.styles.is_pseudo(id) {
+            return Vec::new();
+        }
+        self.parts(id)
+            .into_iter()
+            .filter_map(|p| match p {
+                Part::Node(c) => Some(c),
+                Part::Text(..) => None,
+            })
+            .collect()
+    }
+
+    fn parent_of(&self, id: DomId) -> Option<DomId> {
+        if self.styles.is_pseudo(id) {
+            return self.styles.owner(id);
+        }
+        self.dom.get(id).and_then(|n| n.parent)
+    }
+
+    /// The text of a pseudo-element's `content`. Images and counters are not
+    /// generated: there is nothing to draw, and nothing counted.
+    fn generated(&self, pseudo: DomId) -> Vec<Part> {
+        let Some(CssValue::Content(items)) = self
+            .styles
+            .get(pseudo)
+            .and_then(|c| c.get(&PropertyId::Content))
+        else {
+            return Vec::new();
+        };
+        let owner = self.styles.owner(pseudo).and_then(|o| self.dom.get(o));
+        items
+            .iter()
+            .filter_map(|item| {
+                let text = match item {
+                    ContentItem::Str(s) => s.clone(),
+                    ContentItem::Attr(name) => owner
+                        .and_then(|n| n.as_element())
+                        .and_then(|e| {
+                            e.attrs
+                                .iter()
+                                .find(|a| a.name.local.eq_ignore_ascii_case(name))
+                        })
+                        .map(|a| a.value.to_string())
+                        .unwrap_or_default(),
+                    ContentItem::OpenQuote => "\u{201C}".to_string(),
+                    ContentItem::CloseQuote => "\u{201D}".to_string(),
+                    ContentItem::Url(_)
+                    | ContentItem::NoOpenQuote
+                    | ContentItem::NoCloseQuote
+                    | ContentItem::Counter(_) => return None,
+                };
+                Some(Part::Text(pseudo, text))
+            })
+            .collect()
+    }
+
     /// Move the out-of-flow children of `id` to the pending list.
     fn take_out_of_flow(&mut self, id: DomId) {
-        for cid in self.dom.children(id) {
+        for cid in self.child_ids(id) {
             let Some(child) = self.dom_to_node.get(&cid.to_raw()).copied() else {
                 continue;
             };
@@ -264,7 +343,14 @@ impl<'a> Builder<'a> {
     }
 
     fn finish(&mut self, id: DomId, mark: usize, on_style: &mut dyn FnMut(DomId, &ComputedStyle)) {
-        let Some(node) = self.dom.get(id) else { return };
+        let Some(node) = self.dom.get(id) else {
+            if self.styles.is_pseudo(id) {
+                if let Some(n) = self.finish_element(id, mark, None, on_style) {
+                    self.dom_to_node.insert(id.to_raw(), n);
+                }
+            }
+            return;
+        };
         let built = match &node.data {
             NodeData::Document | NodeData::DocumentFragment => {
                 let mut children = self.assemble(id);
@@ -284,220 +370,227 @@ impl<'a> Builder<'a> {
                 };
                 self.tree.add(style, children)
             }
-            NodeData::Element(elem) => {
-                let Some(computed) = self.styles.get(id) else {
-                    return;
-                };
-                let position = self.position_of(id);
-                self.css_position.insert(id.to_raw(), position);
-                self.css_display.insert(id.to_raw(), self.display_of(id));
-                on_style(id, computed);
-                self.take_out_of_flow(id);
-                if self.level(id) == Level::Inline {
-                    return;
-                }
-                let font_size = self.styles.font_size(id);
-                let ctx = ResolveContext {
-                    font_size,
-                    ..*self.ctx
-                };
-                let replaced = is_replaced(&elem.name.local.to_ascii_lowercase());
-                let role = match self.display_of(id) {
-                    CssDisplay::Table | CssDisplay::InlineTable => Role::Table,
-                    CssDisplay::TableHeaderGroup => Role::Group(GroupKind::Header),
-                    CssDisplay::TableFooterGroup => Role::Group(GroupKind::Footer),
-                    CssDisplay::TableRowGroup => Role::Group(GroupKind::Body),
-                    CssDisplay::TableRow => Role::Row,
-                    CssDisplay::TableCell => Role::Cell,
-                    // Columns are not boxes; captions are not laid out yet.
-                    CssDisplay::TableColumn
-                    | CssDisplay::TableColumnGroup
-                    | CssDisplay::TableCaption => return,
-                    _ => Role::None,
-                };
-                let mut children = if replaced {
-                    Vec::new()
-                } else if matches!(role, Role::Table | Role::Group(_) | Role::Row) {
-                    self.table_children(id)
-                } else {
-                    self.assemble(id)
-                };
-                // A positioned box is a containing block for the absolutes beneath
-                // it; `fixed` keeps rising to the viewport.
-                if !matches!(position, CssPosition::Static) {
-                    let mut i = mark;
-                    while i < self.abs_pending.len() {
-                        if self.abs_pending[i].1 {
-                            i += 1;
-                        } else {
-                            children.push(self.abs_pending.remove(i).0);
-                        }
-                    }
-                }
-
-                let mut style = computed_to_taffy(computed, &ctx);
-                // A box that starts a block formatting context keeps the margins of
-                // its children inside; taffy does that for scroll containers.
-                let clips = [PropertyId::OverflowX, PropertyId::OverflowY]
-                    .iter()
-                    .any(|p| {
-                        matches!(
-                            computed.get(p),
-                            Some(CssValue::Overflow(o)) if !matches!(o, Overflow::Visible | Overflow::Clip)
-                        )
-                    });
-                if clips
-                    || &*elem.name.local == "html"
-                    || self.float_of(id) != CssFloat::None
-                    || matches!(position, CssPosition::Absolute | CssPosition::Fixed)
-                    || matches!(
-                        self.display_of(id),
-                        CssDisplay::FlowRoot
-                            | CssDisplay::InlineBlock
-                            | CssDisplay::InlineFlex
-                            | CssDisplay::InlineGrid
-                            | CssDisplay::TableCell
-                    )
-                {
-                    style.overflow = taffy::Point {
-                        x: taffy::Overflow::Hidden,
-                        y: taffy::Overflow::Hidden,
-                    };
-                }
-                if !matches!(position, CssPosition::Absolute | CssPosition::Fixed) {
-                    style.float = match self.float_of(id) {
-                        CssFloat::Left | CssFloat::InlineStart => taffy::Float::Left,
-                        CssFloat::Right | CssFloat::InlineEnd => taffy::Float::Right,
-                        CssFloat::None => taffy::Float::None,
-                    };
-                    if let Some(CssValue::Clear(c)) = computed.get(&PropertyId::Clear) {
-                        style.clear = match c {
-                            CssClear::Left | CssClear::InlineStart => taffy::Clear::Left,
-                            CssClear::Right | CssClear::InlineEnd => taffy::Clear::Right,
-                            CssClear::Both => taffy::Clear::Both,
-                            CssClear::None => taffy::Clear::None,
-                        };
-                    }
-                }
-                let calc_ctx = CalcContext {
-                    viewport_w: f64::from(self.ctx.viewport_w),
-                    viewport_h: f64::from(self.ctx.viewport_h),
-                    root_font_size_px: f64::from(self.ctx.root_font_size),
-                    font_size_px: f64::from(font_size),
-                    container_w: f64::from(self.ctx.viewport_w),
-                    container_h: f64::from(self.ctx.viewport_h),
-                    percentage_base_px: 0.0,
-                };
-                apply_calc(&mut self.tree, computed, &mut style, calc_ctx);
-                // Placement in a grid parent. Inert elsewhere.
-                {
-                    let text = |p: PropertyId| match computed.get(&p) {
-                        Some(CssValue::CustomValue(s)) => s.as_str(),
-                        _ => "auto",
-                    };
-                    let (row, column) = grid::area(text(PropertyId::GridArea));
-                    style.grid_row = row;
-                    style.grid_column = column;
-                    if text(PropertyId::GridRow) != "auto" {
-                        style.grid_row = grid::placement(text(PropertyId::GridRow));
-                    }
-                    if text(PropertyId::GridColumn) != "auto" {
-                        style.grid_column = grid::placement(text(PropertyId::GridColumn));
-                    }
-                    for (prop, set) in [
-                        (PropertyId::GridRowStart, 0),
-                        (PropertyId::GridRowEnd, 1),
-                        (PropertyId::GridColumnStart, 2),
-                        (PropertyId::GridColumnEnd, 3),
-                    ] {
-                        let t = text(prop);
-                        if t == "auto" {
-                            continue;
-                        }
-                        let p = grid::side(t, set % 2 == 1);
-                        match set {
-                            0 => style.grid_row.start = p,
-                            1 => style.grid_row.end = p,
-                            2 => style.grid_column.start = p,
-                            _ => style.grid_column.end = p,
-                        }
-                    }
-                }
-                if style.display == taffy::Display::Grid {
-                    let text = |p: PropertyId| match computed.get(&p) {
-                        Some(CssValue::CustomValue(s)) => s.as_str(),
-                        _ => "none",
-                    };
-                    style.grid_template_columns =
-                        grid::template(text(PropertyId::GridTemplateColumns), &ctx)
-                            .into_iter()
-                            .collect();
-                    style.grid_template_rows =
-                        grid::template(text(PropertyId::GridTemplateRows), &ctx)
-                            .into_iter()
-                            .collect();
-                    style.grid_template_areas = grid::areas(text(PropertyId::GridTemplateAreas))
-                        .into_iter()
-                        .collect();
-                    style.grid_auto_flow = grid::auto_flow(text(PropertyId::GridAutoFlow));
-                    style.grid_auto_rows = grid::auto_tracks(text(PropertyId::GridAutoRows), &ctx)
-                        .into_iter()
-                        .collect();
-                    style.grid_auto_columns =
-                        grid::auto_tracks(text(PropertyId::GridAutoColumns), &ctx)
-                            .into_iter()
-                            .collect();
-                }
-
-                let is_percent =
-                    |v: taffy::LengthPercentage| v.maybe_resolve(None, |_, _| 0.0).is_none();
-                let is_percent_auto = |v: taffy::LengthPercentageAuto| {
-                    v.maybe_resolve(None, |_, _| 0.0).is_none() && !v.is_auto()
-                };
-                let has_vertical_percent = is_percent(style.padding.top)
-                    || is_percent(style.padding.bottom)
-                    || is_percent_auto(style.margin.top)
-                    || is_percent_auto(style.margin.bottom);
-
-                // Quirks mode stretches the root boxes to the viewport.
-                if self.dom.quirks()
-                    && matches!(&*elem.name.local, "html" | "body")
-                    && style.size.height.is_auto()
-                {
-                    let margins = [style.margin.top, style.margin.bottom]
-                        .iter()
-                        .map(|m| {
-                            m.resolve_to_option(ctx.viewport_h, |_, _| 0.0)
-                                .unwrap_or(0.0)
-                        })
-                        .sum::<f32>();
-                    style.min_size.height = Dimension::length((ctx.viewport_h - margins).max(0.0));
-                }
-                let id_node = self.tree.add(style, children);
-                self.tree.nodes[id_node].role = role;
-                if role == Role::Table {
-                    self.tree.nodes[id_node].table = Some(self.table_style(computed));
-                }
-                if role == Role::Cell {
-                    let span = |name: &str| {
-                        elem.attrs
-                            .iter()
-                            .find(|a| a.name.local.eq_ignore_ascii_case(name))
-                            .and_then(|a| a.value.trim().parse::<usize>().ok())
-                            .unwrap_or(1)
-                            .clamp(1, 1000)
-                    };
-                    self.tree.nodes[id_node].span = (span("colspan"), span("rowspan"));
-                    self.tree.nodes[id_node].valign = self.valign_of(computed);
-                }
-                if has_vertical_percent {
-                    self.vertical_percent.push(id_node);
-                }
-                id_node
-            }
+            NodeData::Element(elem) => match self.finish_element(id, mark, Some(elem), on_style) {
+                Some(n) => n,
+                None => return,
+            },
             _ => return,
         };
         self.dom_to_node.insert(id.to_raw(), built);
+    }
+
+    /// The layout node of an element, or of a pseudo-element (`elem` is `None`).
+    /// `None` when the element has no box of its own.
+    fn finish_element(
+        &mut self,
+        id: DomId,
+        mark: usize,
+        elem: Option<&crate::dom::node::ElementData>,
+        on_style: &mut dyn FnMut(DomId, &ComputedStyle),
+    ) -> Option<usize> {
+        let tag = self.tag(id);
+        let attrs: &[crate::dom::node::Attribute] = elem.map_or(&[], |e| &e.attrs[..]);
+        let computed = self.styles.get(id)?;
+        let position = self.position_of(id);
+        self.css_position.insert(id.to_raw(), position);
+        self.css_display.insert(id.to_raw(), self.display_of(id));
+        on_style(id, computed);
+        self.take_out_of_flow(id);
+        if self.level(id) == Level::Inline {
+            return None;
+        }
+        let font_size = self.styles.font_size(id);
+        let ctx = ResolveContext {
+            font_size,
+            ..*self.ctx
+        };
+        let replaced = is_replaced(&tag);
+        let role = match self.display_of(id) {
+            CssDisplay::Table | CssDisplay::InlineTable => Role::Table,
+            CssDisplay::TableHeaderGroup => Role::Group(GroupKind::Header),
+            CssDisplay::TableFooterGroup => Role::Group(GroupKind::Footer),
+            CssDisplay::TableRowGroup => Role::Group(GroupKind::Body),
+            CssDisplay::TableRow => Role::Row,
+            CssDisplay::TableCell => Role::Cell,
+            // Columns are not boxes; captions are not laid out yet.
+            CssDisplay::TableColumn | CssDisplay::TableColumnGroup | CssDisplay::TableCaption => {
+                return None
+            }
+            _ => Role::None,
+        };
+        let mut children = if replaced {
+            Vec::new()
+        } else if matches!(role, Role::Table | Role::Group(_) | Role::Row) {
+            self.table_children(id)
+        } else {
+            self.assemble(id)
+        };
+        // A positioned box is a containing block for the absolutes beneath
+        // it; `fixed` keeps rising to the viewport.
+        if !matches!(position, CssPosition::Static) {
+            let mut i = mark;
+            while i < self.abs_pending.len() {
+                if self.abs_pending[i].1 {
+                    i += 1;
+                } else {
+                    children.push(self.abs_pending.remove(i).0);
+                }
+            }
+        }
+
+        let mut style = computed_to_taffy(computed, &ctx);
+        // A box that starts a block formatting context keeps the margins of
+        // its children inside; taffy does that for scroll containers.
+        let clips = [PropertyId::OverflowX, PropertyId::OverflowY]
+            .iter()
+            .any(|p| {
+                matches!(
+                    computed.get(p),
+                    Some(CssValue::Overflow(o)) if !matches!(o, Overflow::Visible | Overflow::Clip)
+                )
+            });
+        if clips
+            || tag == "html"
+            || self.float_of(id) != CssFloat::None
+            || matches!(position, CssPosition::Absolute | CssPosition::Fixed)
+            || matches!(
+                self.display_of(id),
+                CssDisplay::FlowRoot
+                    | CssDisplay::InlineBlock
+                    | CssDisplay::InlineFlex
+                    | CssDisplay::InlineGrid
+                    | CssDisplay::TableCell
+            )
+        {
+            style.overflow = taffy::Point {
+                x: taffy::Overflow::Hidden,
+                y: taffy::Overflow::Hidden,
+            };
+        }
+        if !matches!(position, CssPosition::Absolute | CssPosition::Fixed) {
+            style.float = match self.float_of(id) {
+                CssFloat::Left | CssFloat::InlineStart => taffy::Float::Left,
+                CssFloat::Right | CssFloat::InlineEnd => taffy::Float::Right,
+                CssFloat::None => taffy::Float::None,
+            };
+            if let Some(CssValue::Clear(c)) = computed.get(&PropertyId::Clear) {
+                style.clear = match c {
+                    CssClear::Left | CssClear::InlineStart => taffy::Clear::Left,
+                    CssClear::Right | CssClear::InlineEnd => taffy::Clear::Right,
+                    CssClear::Both => taffy::Clear::Both,
+                    CssClear::None => taffy::Clear::None,
+                };
+            }
+        }
+        let calc_ctx = CalcContext {
+            viewport_w: f64::from(self.ctx.viewport_w),
+            viewport_h: f64::from(self.ctx.viewport_h),
+            root_font_size_px: f64::from(self.ctx.root_font_size),
+            font_size_px: f64::from(font_size),
+            container_w: f64::from(self.ctx.viewport_w),
+            container_h: f64::from(self.ctx.viewport_h),
+            percentage_base_px: 0.0,
+        };
+        apply_calc(&mut self.tree, computed, &mut style, calc_ctx);
+        // Placement in a grid parent. Inert elsewhere.
+        {
+            let text = |p: PropertyId| match computed.get(&p) {
+                Some(CssValue::CustomValue(s)) => s.as_str(),
+                _ => "auto",
+            };
+            let (row, column) = grid::area(text(PropertyId::GridArea));
+            style.grid_row = row;
+            style.grid_column = column;
+            if text(PropertyId::GridRow) != "auto" {
+                style.grid_row = grid::placement(text(PropertyId::GridRow));
+            }
+            if text(PropertyId::GridColumn) != "auto" {
+                style.grid_column = grid::placement(text(PropertyId::GridColumn));
+            }
+            for (prop, set) in [
+                (PropertyId::GridRowStart, 0),
+                (PropertyId::GridRowEnd, 1),
+                (PropertyId::GridColumnStart, 2),
+                (PropertyId::GridColumnEnd, 3),
+            ] {
+                let t = text(prop);
+                if t == "auto" {
+                    continue;
+                }
+                let p = grid::side(t, set % 2 == 1);
+                match set {
+                    0 => style.grid_row.start = p,
+                    1 => style.grid_row.end = p,
+                    2 => style.grid_column.start = p,
+                    _ => style.grid_column.end = p,
+                }
+            }
+        }
+        if style.display == taffy::Display::Grid {
+            let text = |p: PropertyId| match computed.get(&p) {
+                Some(CssValue::CustomValue(s)) => s.as_str(),
+                _ => "none",
+            };
+            style.grid_template_columns =
+                grid::template(text(PropertyId::GridTemplateColumns), &ctx)
+                    .into_iter()
+                    .collect();
+            style.grid_template_rows = grid::template(text(PropertyId::GridTemplateRows), &ctx)
+                .into_iter()
+                .collect();
+            style.grid_template_areas = grid::areas(text(PropertyId::GridTemplateAreas))
+                .into_iter()
+                .collect();
+            style.grid_auto_flow = grid::auto_flow(text(PropertyId::GridAutoFlow));
+            style.grid_auto_rows = grid::auto_tracks(text(PropertyId::GridAutoRows), &ctx)
+                .into_iter()
+                .collect();
+            style.grid_auto_columns = grid::auto_tracks(text(PropertyId::GridAutoColumns), &ctx)
+                .into_iter()
+                .collect();
+        }
+
+        let is_percent = |v: taffy::LengthPercentage| v.maybe_resolve(None, |_, _| 0.0).is_none();
+        let is_percent_auto = |v: taffy::LengthPercentageAuto| {
+            v.maybe_resolve(None, |_, _| 0.0).is_none() && !v.is_auto()
+        };
+        let has_vertical_percent = is_percent(style.padding.top)
+            || is_percent(style.padding.bottom)
+            || is_percent_auto(style.margin.top)
+            || is_percent_auto(style.margin.bottom);
+
+        // Quirks mode stretches the root boxes to the viewport.
+        if self.dom.quirks() && matches!(&*tag, "html" | "body") && style.size.height.is_auto() {
+            let margins = [style.margin.top, style.margin.bottom]
+                .iter()
+                .map(|m| {
+                    m.resolve_to_option(ctx.viewport_h, |_, _| 0.0)
+                        .unwrap_or(0.0)
+                })
+                .sum::<f32>();
+            style.min_size.height = Dimension::length((ctx.viewport_h - margins).max(0.0));
+        }
+        let id_node = self.tree.add(style, children);
+        self.tree.nodes[id_node].role = role;
+        if role == Role::Table {
+            self.tree.nodes[id_node].table = Some(self.table_style(computed));
+        }
+        if role == Role::Cell {
+            let span = |name: &str| {
+                attrs
+                    .iter()
+                    .find(|a| a.name.local.eq_ignore_ascii_case(name))
+                    .and_then(|a| a.value.trim().parse::<usize>().ok())
+                    .unwrap_or(1)
+                    .clamp(1, 1000)
+            };
+            self.tree.nodes[id_node].span = (span("colspan"), span("rowspan"));
+            self.tree.nodes[id_node].valign = self.valign_of(computed);
+        }
+        if has_vertical_percent {
+            self.vertical_percent.push(id_node);
+        }
+        Some(id_node)
     }
 
     /// The children of a table, row group or row that are table parts.
@@ -544,39 +637,46 @@ impl<'a> Builder<'a> {
     fn assemble(&mut self, cont: DomId) -> Vec<usize> {
         let mut out = Vec::new();
         let mut run: Option<(ifc::Builder, Vec<usize>)> = None;
-        for c in self.dom.children(cont) {
-            let Some(child) = self.dom.get(c) else {
-                continue;
-            };
-            match &child.data {
-                NodeData::Text(text) => {
+        for part in self.parts(cont) {
+            let c = match part {
+                Part::Text(owner, text) => {
                     let (b, _) = run.get_or_insert_with(|| (self.run_builder(cont), Vec::new()));
-                    self.add_text(b, c, text, cont);
+                    self.add_text(b, owner, &text, cont);
+                    continue;
                 }
-                NodeData::Element(_) => {
-                    if self.styles.get(c).is_none() {
-                        continue;
-                    }
-                    if matches!(
-                        self.position_of(c),
-                        CssPosition::Absolute | CssPosition::Fixed
-                    ) {
-                        continue;
-                    }
-                    match self.level(c) {
-                        Level::Block => {
-                            self.flush(&mut run, &mut out);
-                            if let Some(&n) = self.dom_to_node.get(&c.to_raw()) {
-                                out.push(n);
-                            }
-                        }
-                        Level::Atomic | Level::Inline => {
-                            run.get_or_insert_with(|| (self.run_builder(cont), Vec::new()));
-                            self.collect(cont, &mut run, &mut out, &mut Vec::new(), c);
-                        }
+                Part::Node(c) => c,
+            };
+            let text = match self.dom.get(c).map(|n| &n.data) {
+                Some(NodeData::Text(text)) => Some(text),
+                Some(NodeData::Element(_)) => None,
+                None if self.styles.is_pseudo(c) => None,
+                _ => continue,
+            };
+            if let Some(text) = text {
+                let (b, _) = run.get_or_insert_with(|| (self.run_builder(cont), Vec::new()));
+                self.add_text(b, c, text, cont);
+                continue;
+            }
+            if self.styles.get(c).is_none() {
+                continue;
+            }
+            if matches!(
+                self.position_of(c),
+                CssPosition::Absolute | CssPosition::Fixed
+            ) {
+                continue;
+            }
+            match self.level(c) {
+                Level::Block => {
+                    self.flush(&mut run, &mut out);
+                    if let Some(&n) = self.dom_to_node.get(&c.to_raw()) {
+                        out.push(n);
                     }
                 }
-                _ => {}
+                Level::Atomic | Level::Inline => {
+                    run.get_or_insert_with(|| (self.run_builder(cont), Vec::new()));
+                    self.collect(cont, &mut run, &mut out, &mut Vec::new(), c);
+                }
             }
         }
         self.flush(&mut run, &mut out);
@@ -691,15 +791,25 @@ impl<'a> Builder<'a> {
                     b.open(boxed);
                 }
                 open.push(id);
-                for c in self.dom.children(id) {
-                    match self.dom.get(c).map(|n| &n.data) {
-                        Some(NodeData::Text(t)) => {
+                for part in self.parts(id) {
+                    match part {
+                        Part::Text(owner, t) => {
                             if let Some((b, _)) = run.as_mut() {
-                                self.add_text(b, c, t, id);
+                                self.add_text(b, owner, &t, id);
                             }
                         }
-                        Some(NodeData::Element(_)) => self.collect(cont, run, out, open, c),
-                        _ => {}
+                        Part::Node(c) => match self.dom.get(c).map(|n| &n.data) {
+                            Some(NodeData::Text(t)) => {
+                                if let Some((b, _)) = run.as_mut() {
+                                    self.add_text(b, c, t, id);
+                                }
+                            }
+                            Some(NodeData::Element(_)) => self.collect(cont, run, out, open, c),
+                            None if self.styles.is_pseudo(c) => {
+                                self.collect(cont, run, out, open, c)
+                            }
+                            _ => {}
+                        },
                     }
                 }
                 open.pop();

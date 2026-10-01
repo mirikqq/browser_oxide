@@ -105,6 +105,7 @@ pub fn initial_value(property: &PropertyId) -> CssValue {
         PropertyId::Opacity => CssValue::Number(1.0),
         PropertyId::ZIndex => CssValue::Integer(0),
         PropertyId::ContentVisibility => CssValue::ContentVisibility(ContentVisibility::Visible),
+        PropertyId::Content => CssValue::Content(Vec::new()),
         PropertyId::Transform => CssValue::Transform(vec![]),
         PropertyId::Custom(_) => CssValue::Inherit, // custom properties inherit by default
     }

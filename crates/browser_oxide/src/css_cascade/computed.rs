@@ -173,6 +173,7 @@ fn all_property_ids() -> Vec<PropertyId> {
         PropertyId::Opacity,
         PropertyId::ZIndex,
         PropertyId::ContentVisibility,
+        PropertyId::Content,
         PropertyId::Transform,
     ]
 }

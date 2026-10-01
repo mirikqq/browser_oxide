@@ -1,4 +1,5 @@
 use crate::css_values::types::color::Color;
+use crate::css_values::types::content::ContentItem;
 use crate::css_values::types::custom::VarReference;
 use crate::css_values::types::display::*;
 use crate::css_values::types::font::*;
@@ -95,6 +96,7 @@ pub enum PropertyId {
     Opacity,
     ZIndex,
     ContentVisibility,
+    Content,
     Transform,
     Custom(String),
 }
@@ -182,6 +184,7 @@ impl PropertyId {
             "opacity" => Self::Opacity,
             "z-index" => Self::ZIndex,
             "content-visibility" => Self::ContentVisibility,
+            "content" => Self::Content,
             "transform" => Self::Transform,
             name if name.starts_with("--") => Self::Custom(name.to_string()),
             _ => Self::Custom(name.to_string()),
@@ -209,6 +212,8 @@ pub enum CssValue {
     Visibility(Visibility),
     BorderStyle(BorderStyle),
     ContentVisibility(ContentVisibility),
+    /// `content`; empty for `none` and `normal`.
+    Content(Vec<ContentItem>),
 
     // Sizing
     Length(Length),

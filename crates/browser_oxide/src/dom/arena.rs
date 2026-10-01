@@ -76,6 +76,13 @@ impl Dom {
         self.len() == 0
     }
 
+    /// One past the largest id ever handed out: the size of anything indexed by
+    /// node id. `len` counts only the live nodes, which is fewer once any were
+    /// removed.
+    pub fn arena_len(&self) -> usize {
+        self.nodes.len()
+    }
+
     // --- Node creation ---
 
     fn allocate(&mut self, data: NodeData) -> NodeId {

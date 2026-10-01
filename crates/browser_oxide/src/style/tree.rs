@@ -24,7 +24,7 @@ use crate::style::hints::{
     presentational_declarations, svg_intrinsic_declarations, table_hints_css,
 };
 use crate::style::stylist::parse_inline_style;
-use crate::style::stylist::{entries_for, Stylist, HINT_ORDER};
+use crate::style::stylist::{entries_for, Pseudo, Stylist, HINT_ORDER};
 
 /// `font-size: medium`.
 pub const DEFAULT_FONT_SIZE: f32 = 16.0;
@@ -36,6 +36,13 @@ pub const DEFAULT_FONT_SIZE: f32 = 16.0;
 pub struct StyleTree {
     styles: Vec<Option<Styled>>,
     root_font_size: f32,
+    /// The pseudo-elements that generate a box, by owner and kind. They are styled
+    /// like elements, under ids past the end of the document's.
+    pseudos: std::collections::HashMap<(u32, Pseudo), u32>,
+    /// The first id that belongs to a pseudo-element.
+    base: u32,
+    /// The owner of each pseudo-element, in the order their ids were handed out.
+    owners: Vec<u32>,
 }
 
 struct Styled {
@@ -46,7 +53,10 @@ struct Styled {
 impl StyleTree {
     /// Style `dom`. `viewport` is `(width, height)` in px, for `vw`/`vh` units.
     pub fn compute(dom: &Dom, stylist: &Stylist, viewport: (f32, f32)) -> Self {
-        let mut styles: Vec<Option<Styled>> = (0..dom.len()).map(|_| None).collect();
+        let mut styles: Vec<Option<Styled>> = (0..dom.arena_len()).map(|_| None).collect();
+        let base = styles.len() as u32;
+        let mut pseudos = std::collections::HashMap::new();
+        let mut owners = Vec::new();
         let mut root_font_size = DEFAULT_FONT_SIZE;
         // Pre-order, so a parent is always styled before its children.
         let mut stack = vec![dom.document()];
@@ -75,8 +85,32 @@ impl StyleTree {
                     if hidden {
                         continue;
                     }
+                    let generated: Vec<(Pseudo, Styled)> = if stylist.is_full() {
+                        [Pseudo::Before, Pseudo::After]
+                            .into_iter()
+                            .filter_map(|p| {
+                                pseudo_style(
+                                    dom,
+                                    stylist,
+                                    node,
+                                    p,
+                                    &style,
+                                    root_font_size,
+                                    viewport,
+                                )
+                                .map(|s| (p, s))
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     if let Some(slot) = styles.get_mut(node.to_raw() as usize) {
                         *slot = Some(style);
+                    }
+                    for (p, s) in generated {
+                        pseudos.insert((node.to_raw(), p), styles.len() as u32);
+                        owners.push(node.to_raw());
+                        styles.push(Some(s));
                     }
                 }
                 NodeData::Document | NodeData::DocumentFragment => {}
@@ -88,7 +122,29 @@ impl StyleTree {
         Self {
             styles,
             root_font_size,
+            pseudos,
+            base,
+            owners,
         }
+    }
+
+    /// The element a pseudo-element belongs to.
+    pub fn owner(&self, pseudo: NodeId) -> Option<NodeId> {
+        let i = pseudo.to_raw().checked_sub(self.base)? as usize;
+        self.owners.get(i).map(|&o| NodeId::from_raw(o))
+    }
+
+    /// The id the `::before` or `::after` of `owner` is styled under, if it
+    /// generates a box. Such an id is past the end of the document's.
+    pub fn pseudo(&self, owner: NodeId, kind: Pseudo) -> Option<NodeId> {
+        self.pseudos
+            .get(&(owner.to_raw(), kind))
+            .map(|&id| NodeId::from_raw(id))
+    }
+
+    /// Whether `id` names a pseudo-element rather than a node of the document.
+    pub fn is_pseudo(&self, id: NodeId) -> bool {
+        id.to_raw() >= self.base
     }
 
     /// The computed style of `node`, if it is an element that generates a box.
@@ -178,6 +234,51 @@ fn compute_element(
 
     let inherited = parent.map(|p| p.custom.clone()).unwrap_or_default();
     let (cascaded, custom) = stylist.cascade_with_custom(dom, node, extra, &inherited);
+    resolve_styled(cascaded, custom, parent, root_font_size, viewport)
+}
+
+/// The style of the `::before` or `::after` of `owner`, if it has `content` and
+/// is not `display: none`.
+fn pseudo_style(
+    dom: &Dom,
+    stylist: &Stylist,
+    owner: NodeId,
+    kind: Pseudo,
+    owner_style: &Styled,
+    root_font_size: f32,
+    viewport: (f32, f32),
+) -> Option<Styled> {
+    let (cascaded, custom) =
+        stylist.cascade_pseudo(dom, owner, Some(kind), Vec::new(), &owner_style.custom);
+    let generates = matches!(
+        cascaded.get(&PropertyId::Content),
+        Some(CssValue::Content(items)) if !items.is_empty()
+    );
+    if !generates {
+        return None;
+    }
+    let styled = resolve_styled(
+        cascaded,
+        custom,
+        Some(owner_style),
+        root_font_size,
+        viewport,
+    );
+    let hidden = matches!(
+        styled.style.get(&PropertyId::Display),
+        Some(CssValue::Display(Display::None))
+    );
+    (!hidden).then_some(styled)
+}
+
+/// Turn what the cascade decided into a computed style, inheriting from `parent`.
+fn resolve_styled(
+    cascaded: std::collections::HashMap<PropertyId, CssValue>,
+    custom: CustomProps,
+    parent: Option<&Styled>,
+    root_font_size: f32,
+    viewport: (f32, f32),
+) -> Styled {
     let parent_style = parent.map(|p| &p.style);
     let mut style = ComputedStyle::resolve(&cascaded, parent_style);
 

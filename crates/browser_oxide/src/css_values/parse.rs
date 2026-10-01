@@ -124,6 +124,7 @@ pub fn parse_property(
         "opacity" => parse_number(value_trimmed)?,
         "z-index" => parse_z_index(value_trimmed)?,
         "content-visibility" => parse_content_visibility(value_trimmed)?,
+        "content" => parse_content(value_trimmed),
         _ if name_lower.starts_with("--") => {
             CssValue::CustomValue(component_values_to_string(value_trimmed))
         }
@@ -874,6 +875,91 @@ fn parse_z_index(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
         }
     }
     Err(ValueError::InvalidValue("expected z-index value".into()))
+}
+
+/// CSS escapes in a string token: `\201C `, `\"`, a backslash before a newline.
+fn unescape_css(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            None => {}
+            Some('\n') => {
+                chars.next();
+            }
+            Some(h) if h.is_ascii_hexdigit() => {
+                let mut hex = String::new();
+                while hex.len() < 6 {
+                    match chars.peek() {
+                        Some(d) if d.is_ascii_hexdigit() => {
+                            hex.push(*d);
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                if chars.peek().is_some_and(|w| w.is_whitespace()) {
+                    chars.next();
+                }
+                let code = u32::from_str_radix(&hex, 16).unwrap_or(0xFFFD);
+                out.push(
+                    char::from_u32(code)
+                        .filter(|c| *c != '\0')
+                        .unwrap_or('\u{FFFD}'),
+                );
+            }
+            Some(other) => {
+                out.push(other);
+                chars.next();
+            }
+        }
+    }
+    out
+}
+
+/// `content`: strings, `attr()`, `url()`, quotes and counters, up to an alt-text
+/// `/`. `none`, `normal` and anything unreadable give an empty list.
+fn parse_content(value: &[ComponentValue<'_>]) -> CssValue {
+    use crate::css_values::types::content::ContentItem;
+    let mut items = Vec::new();
+    for cv in value {
+        match cv {
+            ComponentValue::Token(Token { kind, .. }) => match kind {
+                TokenKind::String(s) => items.push(ContentItem::Str(unescape_css(s))),
+                TokenKind::Url(u) => items.push(ContentItem::Url(u.to_string())),
+                TokenKind::Delim('/') => break,
+                TokenKind::Ident(name) => match name.to_ascii_lowercase().as_str() {
+                    "open-quote" => items.push(ContentItem::OpenQuote),
+                    "close-quote" => items.push(ContentItem::CloseQuote),
+                    "no-open-quote" => items.push(ContentItem::NoOpenQuote),
+                    "no-close-quote" => items.push(ContentItem::NoCloseQuote),
+                    _ => {}
+                },
+                _ => {}
+            },
+            ComponentValue::Function(f) => {
+                let first = f.arguments.iter().find_map(|a| match a {
+                    ComponentValue::Token(Token {
+                        kind: TokenKind::Ident(n) | TokenKind::String(n),
+                        ..
+                    }) => Some(n.to_string()),
+                    _ => None,
+                });
+                match (f.name.to_ascii_lowercase().as_str(), first) {
+                    ("attr", Some(name)) => items.push(ContentItem::Attr(name)),
+                    ("url", Some(u)) => items.push(ContentItem::Url(u)),
+                    ("counter" | "counters", Some(name)) => items.push(ContentItem::Counter(name)),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    CssValue::Content(items)
 }
 
 fn parse_content_visibility(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
