@@ -20,7 +20,10 @@ use crate::dom::node::{NodeData, NodeId};
 use crate::dom::Dom;
 use crate::layout::resolve::{resolve_length, ResolveContext};
 use crate::style::custom::CustomProps;
-use crate::style::hints::{presentational_declarations, svg_intrinsic_declarations};
+use crate::style::hints::{
+    presentational_declarations, svg_intrinsic_declarations, table_hints_css,
+};
+use crate::style::stylist::parse_inline_style;
 use crate::style::stylist::{entries_for, Stylist, HINT_ORDER};
 
 /// `font-size: medium`.
@@ -158,6 +161,20 @@ fn compute_element(
         Specificity::default(),
         HINT_ORDER + 1,
     ));
+
+    if stylist.is_full() {
+        let css = table_hints_css(dom, node, elem);
+        if !css.is_empty() {
+            extra.extend(entries_for(
+                parse_inline_style(&css),
+                Origin::UserAgent,
+                // Above the rules of the user-agent sheet, which the attributes
+                // of old markup override.
+                Specificity::new(1, 0, 0),
+                HINT_ORDER + 2,
+            ));
+        }
+    }
 
     let inherited = parent.map(|p| p.custom.clone()).unwrap_or_default();
     let (cascaded, custom) = stylist.cascade_with_custom(dom, node, extra, &inherited);

@@ -107,6 +107,8 @@ pub struct Root {
     pub descent: f32,
     pub asc_l: f32,
     pub desc_l: f32,
+    /// Quirks mode: a line with nothing but images has no strut.
+    pub quirks: bool,
 }
 
 #[derive(Debug)]
@@ -200,6 +202,18 @@ impl Builder {
                 brk: Brk::None,
             });
         }
+    }
+
+    /// Close the innermost box because a block interrupts it: it has no right edge
+    /// on this side of the break.
+    pub fn close_sliced(&mut self) {
+        if let Some(&id) = self.stack.last() {
+            let b = &mut self.boxes[id];
+            b.margin_right = 0.0;
+            b.border_right = 0.0;
+            b.padding_right = 0.0;
+        }
+        self.close();
     }
 
     pub fn atomic(&mut self, node: usize) {
@@ -563,10 +577,13 @@ fn size_atomic(tree: &mut Tree, node: usize, fit: f32, basis: f32) -> AtomicBox 
             max.min(min.max(room))
         }
     };
+    // Laid out in full rather than only measured: taffy loses the collapsed
+    // margins of nested blocks when it only measures, and the baseline is known
+    // only once the content has been laid out.
     let out = tree.compute_child_layout(
         id,
         input(
-            RunMode::ComputeSize,
+            RunMode::PerformLayout,
             Size {
                 width: Some(w),
                 height: known_h,
@@ -576,23 +593,6 @@ fn size_atomic(tree: &mut Tree, node: usize, fit: f32, basis: f32) -> AtomicBox 
         ),
     );
     let h = known_h.unwrap_or(out.size.height);
-    // Its baseline is where its own last line sits, which is known only once its
-    // content has been laid out.
-    tree.compute_child_layout(
-        id,
-        input(
-            RunMode::PerformLayout,
-            Size {
-                width: Some(w),
-                height: Some(h),
-            },
-            basis,
-            Size {
-                width: AvailableSpace::Definite(w),
-                height: AvailableSpace::Definite(h),
-            },
-        ),
-    );
     AtomicBox {
         w,
         h,
@@ -705,8 +705,16 @@ fn place(ifc: &Ifc, atomics: &[AtomicBox], avail: f32) -> Placed {
     let mut open: Vec<usize> = Vec::new();
     let mut top = 0.0f32;
     for line in &lines {
-        let mut asc = ifc.root.asc_l;
-        let mut desc = ifc.root.desc_l;
+        let text = line
+            .atoms
+            .clone()
+            .any(|i| matches!(ifc.atoms[i].kind, AtomKind::Text { .. } | AtomKind::Break));
+        let strut = text || !ifc.root.quirks;
+        let (mut asc, mut desc) = if strut {
+            (ifc.root.asc_l, ifc.root.desc_l)
+        } else {
+            (0.0, 0.0)
+        };
         let mut touched: Vec<usize> = open.clone();
         for i in line.atoms.clone() {
             match ifc.atoms[i].kind {
@@ -728,8 +736,11 @@ fn place(ifc: &Ifc, atomics: &[AtomicBox], avail: f32) -> Placed {
             }
         }
         for b in touched {
-            asc = asc.max(ifc.boxes[b].asc_l);
-            desc = desc.max(ifc.boxes[b].desc_l);
+            let bx = &ifc.boxes[b];
+            if strut || bx.left() > 0.0 || bx.right() > 0.0 {
+                asc = asc.max(bx.asc_l);
+                desc = desc.max(bx.desc_l);
+            }
         }
         metrics.push((top, asc + desc, asc));
         top += asc + desc;

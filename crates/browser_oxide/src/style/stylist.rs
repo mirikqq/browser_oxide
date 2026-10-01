@@ -23,8 +23,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use crate::css_cascade::{
-    cascade_sort, compare_keys, evaluate_media_query, CascadeEntry, CascadeKey, LayerId,
-    MediaFeatures, Origin,
+    cascade_sort, compare_keys, evaluate_media_query, evaluate_media_query_strict, CascadeEntry,
+    CascadeKey, LayerId, MediaFeatures, Origin,
 };
 use crate::css_parser::ast::{Block, Declaration, Rule as AstRule};
 use crate::css_selectors::{
@@ -88,6 +88,9 @@ pub struct Stylist {
     buckets: Arc<Buckets>,
     layers: Arc<HashMap<String, LayerId>>,
     media: MediaFeatures,
+    /// Built for `LayoutMode::Full`: `@media` is evaluated to the letter of the spec,
+    /// and the table attributes of old markup act as style.
+    full: bool,
 }
 
 /// The user-agent rules, parsed once for the process.
@@ -111,6 +114,7 @@ impl Stylist {
             buckets: Arc::default(),
             layers: Arc::default(),
             media,
+            full: false,
         }
     }
 
@@ -130,7 +134,13 @@ impl Stylist {
             crate::layout::LayoutMode::Legacy => UA_STYLIST.clone(),
         };
         s.media = media;
+        s.full = mode == crate::layout::LayoutMode::Full;
         s
+    }
+
+    /// Whether this stylist was built for `LayoutMode::Full`.
+    pub fn is_full(&self) -> bool {
+        self.full
     }
 
     pub fn rule_count(&self) -> usize {
@@ -192,7 +202,12 @@ impl Stylist {
                     let prelude = prelude.trim();
                     match at.name.to_ascii_lowercase().as_str() {
                         "media" => {
-                            if evaluate_media_query(&at.prelude, &self.media) {
+                            let matches = if self.full {
+                                evaluate_media_query_strict(&at.prelude, &self.media)
+                            } else {
+                                evaluate_media_query(&at.prelude, &self.media)
+                            };
+                            if matches {
                                 self.walk_block(
                                     at.block.as_ref(),
                                     origin,

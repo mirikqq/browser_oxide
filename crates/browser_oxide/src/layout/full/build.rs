@@ -18,7 +18,7 @@ use super::{apply_calc, grid};
 use crate::css_cascade::ComputedStyle;
 use crate::css_values::property::{CssValue, PropertyId};
 use crate::css_values::types::display::{
-    Clear as CssClear, Display as CssDisplay, Float as CssFloat, Position as CssPosition,
+    Clear as CssClear, Display as CssDisplay, Float as CssFloat, Overflow, Position as CssPosition,
     TextAlign, WhiteSpace,
 };
 use crate::css_values::types::length::CalcContext;
@@ -57,6 +57,8 @@ pub(super) struct Builder<'a> {
     pub os: &'a str,
     pub tree: Tree,
     pub dom_to_node: HashMap<u32, usize>,
+    /// The blocks that cut each inline element in two.
+    pub block_in_inline: HashMap<u32, Vec<usize>>,
     /// Out-of-flow boxes waiting for their containing block; the flag marks
     /// `position: fixed`.
     abs_pending: Vec<(usize, bool)>,
@@ -100,6 +102,7 @@ impl<'a> Builder<'a> {
             os,
             tree: Tree::default(),
             dom_to_node: HashMap::new(),
+            block_in_inline: HashMap::new(),
             abs_pending: Vec::new(),
             css_position: HashMap::new(),
             css_display: HashMap::new(),
@@ -333,6 +336,34 @@ impl<'a> Builder<'a> {
                 }
 
                 let mut style = computed_to_taffy(computed, &ctx);
+                // A box that starts a block formatting context keeps the margins of
+                // its children inside; taffy does that for scroll containers.
+                let clips = [PropertyId::OverflowX, PropertyId::OverflowY]
+                    .iter()
+                    .any(|p| {
+                        matches!(
+                            computed.get(p),
+                            Some(CssValue::Overflow(o)) if !matches!(o, Overflow::Visible | Overflow::Clip)
+                        )
+                    });
+                if clips
+                    || &*elem.name.local == "html"
+                    || self.float_of(id) != CssFloat::None
+                    || matches!(position, CssPosition::Absolute | CssPosition::Fixed)
+                    || matches!(
+                        self.display_of(id),
+                        CssDisplay::FlowRoot
+                            | CssDisplay::InlineBlock
+                            | CssDisplay::InlineFlex
+                            | CssDisplay::InlineGrid
+                            | CssDisplay::TableCell
+                    )
+                {
+                    style.overflow = taffy::Point {
+                        x: taffy::Overflow::Hidden,
+                        y: taffy::Overflow::Hidden,
+                    };
+                }
                 if !matches!(position, CssPosition::Absolute | CssPosition::Fixed) {
                     style.float = match self.float_of(id) {
                         CssFloat::Left | CssFloat::InlineStart => taffy::Float::Left,
@@ -540,9 +571,8 @@ impl<'a> Builder<'a> {
                             }
                         }
                         Level::Atomic | Level::Inline => {
-                            let (b, atomics) =
-                                run.get_or_insert_with(|| (self.run_builder(cont), Vec::new()));
-                            self.collect(b, atomics, c);
+                            run.get_or_insert_with(|| (self.run_builder(cont), Vec::new()));
+                            self.collect(cont, &mut run, &mut out, &mut Vec::new(), c);
                         }
                     }
                 }
@@ -601,6 +631,7 @@ impl<'a> Builder<'a> {
                 descent: metrics.descent,
                 asc_l,
                 desc_l,
+                quirks: self.dom.quirks(),
             },
             self.os,
         )
@@ -618,8 +649,17 @@ impl<'a> Builder<'a> {
         b.text(text_id.to_raw(), text, &font, white);
     }
 
-    /// Add the inline-level element `id` to the run being built.
-    fn collect(&self, b: &mut ifc::Builder, atomics: &mut Vec<usize>, id: DomId) {
+    /// Add the inline-level element `id` to the run being built. `open` holds the
+    /// inline elements around it; a block among them ends the run, goes to `out`,
+    /// and the elements open again in a new run after it.
+    fn collect(
+        &mut self,
+        cont: DomId,
+        run: &mut Option<(ifc::Builder, Vec<usize>)>,
+        out: &mut Vec<usize>,
+        open: &mut Vec<DomId>,
+        id: DomId,
+    ) {
         let Some(computed) = self.styles.get(id) else {
             return;
         };
@@ -633,28 +673,73 @@ impl<'a> Builder<'a> {
             Level::Inline => {
                 match self.tag(id).as_str() {
                     "br" => {
-                        b.line_break();
+                        if let Some((b, _)) = run.as_mut() {
+                            b.line_break();
+                        }
                         return;
                     }
                     "wbr" => {
-                        b.break_opportunity();
+                        if let Some((b, _)) = run.as_mut() {
+                            b.break_opportunity();
+                        }
                         return;
                     }
                     _ => {}
                 }
-                b.open(self.inline_box(id, computed));
+                let boxed = self.inline_box(id, computed);
+                if let Some((b, _)) = run.as_mut() {
+                    b.open(boxed);
+                }
+                open.push(id);
                 for c in self.dom.children(id) {
                     match self.dom.get(c).map(|n| &n.data) {
-                        Some(NodeData::Text(t)) => self.add_text(b, c, t, id),
-                        Some(NodeData::Element(_)) => self.collect(b, atomics, c),
+                        Some(NodeData::Text(t)) => {
+                            if let Some((b, _)) = run.as_mut() {
+                                self.add_text(b, c, t, id);
+                            }
+                        }
+                        Some(NodeData::Element(_)) => self.collect(cont, run, out, open, c),
                         _ => {}
                     }
                 }
-                b.close();
+                open.pop();
+                if let Some((b, _)) = run.as_mut() {
+                    b.close();
+                }
             }
-            // A block inside an inline is rare; it is placed in the line as an atom.
+            Level::Block if self.float_of(id) == CssFloat::None && !open.is_empty() => {
+                let Some(&n) = self.dom_to_node.get(&id.to_raw()) else {
+                    return;
+                };
+                if let Some((b, _)) = run.as_mut() {
+                    for _ in open.iter() {
+                        b.close_sliced();
+                    }
+                }
+                self.flush(run, out);
+                out.push(n);
+                for a in open.iter() {
+                    self.block_in_inline.entry(a.to_raw()).or_default().push(n);
+                }
+                let mut next = (self.run_builder(cont), Vec::new());
+                for &ancestor in open.iter() {
+                    if let Some(c) = self.styles.get(ancestor) {
+                        let continued = InlineBox {
+                            margin_left: 0.0,
+                            border_left: 0.0,
+                            padding_left: 0.0,
+                            ..self.inline_box(ancestor, c)
+                        };
+                        next.0.open(continued);
+                    }
+                }
+                *run = Some(next);
+            }
+            // A float or an atomic inline sits in the line as an atom.
             Level::Atomic | Level::Block => {
-                if let Some(&n) = self.dom_to_node.get(&id.to_raw()) {
+                if let (Some(&n), Some((b, atomics))) =
+                    (self.dom_to_node.get(&id.to_raw()), run.as_mut())
+                {
                     atomics.push(n);
                     b.atomic(n);
                 }

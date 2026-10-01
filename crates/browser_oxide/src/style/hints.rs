@@ -92,3 +92,141 @@ pub(crate) fn svg_intrinsic_declarations(
     );
     out
 }
+
+/// The leading digits of an attribute value, as a CSS length: `85%` stays a
+/// percentage, `100` and `100px` become pixels.
+fn attr_length(value: &str) -> Option<String> {
+    let v = value.trim();
+    let digits: String = v
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    Some(if v[digits.len()..].trim_start().starts_with('%') {
+        format!("{digits}%")
+    } else {
+        format!("{digits}px")
+    })
+}
+
+/// The presentational attributes of the old table markup, as CSS text:
+/// `width`, `height`, `cellspacing`, `cellpadding`, `border`, `align`, `valign`,
+/// `nowrap` and `bgcolor`. Only `LayoutMode::Full` has tables to apply them to.
+pub(crate) fn table_hints_css(
+    dom: &crate::dom::Dom,
+    node: crate::dom::node::NodeId,
+    elem: &crate::dom::node::ElementData,
+) -> String {
+    let attr = |e: &crate::dom::node::ElementData, name: &str| -> Option<String> {
+        e.attrs
+            .iter()
+            .find(|a| a.name.local.eq_ignore_ascii_case(name))
+            .map(|a| a.value.trim().to_string())
+    };
+    let tag = elem.name.local.to_ascii_lowercase();
+    // The table a cell belongs to, for the attributes that live on it.
+    let table_of = || {
+        let mut up = dom.get(node).and_then(|n| n.parent);
+        while let Some(p) = up {
+            let n = dom.get(p)?;
+            if let Some(e) = n.as_element() {
+                if e.name.local.eq_ignore_ascii_case("table") {
+                    return Some(e);
+                }
+            }
+            up = n.parent;
+        }
+        None
+    };
+    let mut css = String::new();
+    let mut push = |prop: &str, value: &str| {
+        css.push_str(prop);
+        css.push(':');
+        css.push_str(value);
+        css.push(';');
+    };
+    let align =
+        |v: &str| matches!(v, "left" | "right" | "center" | "justify").then(|| v.to_string());
+    match tag.as_str() {
+        "table" => {
+            for (a, p) in [("width", "width"), ("height", "height")] {
+                if let Some(v) = attr(elem, a).as_deref().and_then(attr_length) {
+                    push(p, &v);
+                }
+            }
+            if let Some(v) = attr(elem, "cellspacing").as_deref().and_then(attr_length) {
+                push("border-spacing", &v);
+            }
+            if let Some(b) = attr(elem, "border") {
+                let n = if b.is_empty() {
+                    Some("1px".to_string())
+                } else {
+                    attr_length(&b)
+                };
+                if let Some(n) = n.filter(|n| n != "0px") {
+                    push("border-width", &n);
+                    push("border-style", "outset");
+                    push("border-color", "gray");
+                }
+            }
+            match attr(elem, "align").as_deref() {
+                Some("center") => {
+                    push("margin-left", "auto");
+                    push("margin-right", "auto");
+                }
+                Some("right") => push("float", "right"),
+                Some("left") => push("float", "left"),
+                _ => {}
+            }
+            if let Some(c) = attr(elem, "bgcolor") {
+                push("background-color", &c);
+            }
+        }
+        "td" | "th" => {
+            for (a, p) in [("width", "width"), ("height", "height")] {
+                if let Some(v) = attr(elem, a).as_deref().and_then(attr_length) {
+                    push(p, &v);
+                }
+            }
+            if let Some(table) = table_of() {
+                if let Some(v) = attr(table, "cellpadding").as_deref().and_then(attr_length) {
+                    push("padding", &v);
+                }
+                if attr(table, "border")
+                    .is_some_and(|b| b.is_empty() || attr_length(&b).is_some_and(|n| n != "0px"))
+                {
+                    push("border-width", "1px");
+                    push("border-style", "inset");
+                    push("border-color", "gray");
+                }
+            }
+            if let Some(a) = attr(elem, "align").as_deref().and_then(align) {
+                push("text-align", &a);
+            }
+            if let Some(v) = attr(elem, "valign") {
+                push("vertical-align", &v);
+            }
+            if attr(elem, "nowrap").is_some() {
+                push("white-space", "nowrap");
+            }
+            if let Some(c) = attr(elem, "bgcolor") {
+                push("background-color", &c);
+            }
+        }
+        "tr" | "thead" | "tbody" | "tfoot" => {
+            if let Some(a) = attr(elem, "align").as_deref().and_then(align) {
+                push("text-align", &a);
+            }
+            if let Some(v) = attr(elem, "valign") {
+                push("vertical-align", &v);
+            }
+            if let Some(c) = attr(elem, "bgcolor") {
+                push("background-color", &c);
+            }
+        }
+        _ => {}
+    }
+    css
+}

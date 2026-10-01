@@ -24,6 +24,40 @@ struct Cell {
     min: f32,
     max: f32,
     h: f32,
+    /// What the row needs of this cell: its content, or the `height` it asked for.
+    need: f32,
+    want: Want,
+}
+
+/// The width a cell asks for with `width`.
+#[derive(Clone, Copy, PartialEq, Default)]
+enum Want {
+    #[default]
+    Auto,
+    /// A length, as the cell's outer width.
+    Fixed(f32),
+    /// A fraction of the table.
+    Percent(f32),
+}
+
+fn want_of(tree: &Tree, node: usize) -> Want {
+    let style = &tree.nodes[node].style;
+    let w = style.size.width;
+    match w.tag() {
+        taffy::CompactLength::LENGTH_TAG => {
+            let edges = if style.box_sizing == taffy::BoxSizing::BorderBox {
+                0.0
+            } else {
+                px(style.padding.left)
+                    + px(style.padding.right)
+                    + px(style.border.left)
+                    + px(style.border.right)
+            };
+            Want::Fixed(w.value() + edges)
+        }
+        taffy::CompactLength::PERCENT_TAG => Want::Percent(w.value()),
+        _ => Want::Auto,
+    }
 }
 
 fn input(
@@ -103,6 +137,8 @@ fn place_cells(tree: &Tree, rows: &[(usize, Option<usize>)]) -> (Vec<Cell>, usiz
                 min: 0.0,
                 max: 0.0,
                 h: 0.0,
+                need: 0.0,
+                want: want_of(tree, cell),
             });
             col += cs;
             ncols = ncols.max(col);
@@ -199,7 +235,9 @@ pub fn compute(tree: &mut Tree, node_id: NodeId, inputs: LayoutInput) -> LayoutO
     for c in &mut cells {
         let id = NodeId::from(c.node);
         let mut measure = |w: AvailableSpace| {
-            tree_width(tree, id, input(RunMode::ComputeSize, Size::NONE, space(w)))
+            let mut inputs = input(RunMode::ComputeSize, Size::NONE, space(w));
+            inputs.sizing_mode = SizingMode::ContentSize;
+            tree_width(tree, id, inputs)
         };
         c.min = measure(AvailableSpace::MinContent);
         c.max = measure(AvailableSpace::MaxContent).max(c.min);
@@ -231,6 +269,20 @@ pub fn compute(tree: &mut Tree, node_id: NodeId, inputs: LayoutInput) -> LayoutO
             }
         }
     }
+    // `width` on a cell: a length sets what the column wants, a percentage what
+    // share of the table it takes.
+    let mut fixed = vec![false; ncols];
+    let mut percent = vec![0.0f32; ncols];
+    for c in cells.iter().filter(|c| c.cs == 1) {
+        match c.want {
+            Want::Fixed(w) => {
+                fixed[c.col] = true;
+                cmax[c.col] = cmax[c.col].min(w).max(cmin[c.col]);
+            }
+            Want::Percent(p) => percent[c.col] = percent[c.col].max(p),
+            Want::Auto => {}
+        }
+    }
     for i in 0..ncols {
         cmax[i] = cmax[i].max(cmin[i]);
     }
@@ -256,17 +308,35 @@ pub fn compute(tree: &mut Tree, node_id: NodeId, inputs: LayoutInput) -> LayoutO
     };
     let content = (width - fixed_w).max(sum_min);
     let cols: Vec<f32> = if content >= sum_max {
-        let extra = content - sum_max;
-        (0..ncols)
-            .map(|i| {
-                let share = if sum_max > 0.0 {
-                    cmax[i] / sum_max
-                } else {
-                    1.0 / ncols as f32
-                };
-                cmax[i] + extra * share
-            })
-            .collect()
+        // Room beyond what the columns want goes first to the percentages, then
+        // to the columns without a width of their own, and only without any such
+        // column to the rest.
+        let mut cols = cmax.clone();
+        let mut extra = content - sum_max;
+        for i in (0..ncols).filter(|&i| percent[i] > 0.0) {
+            let give = (percent[i] * content - cols[i]).clamp(0.0, extra);
+            cols[i] += give;
+            extra -= give;
+        }
+        let mut takers: Vec<usize> = (0..ncols)
+            .filter(|&i| !fixed[i] && percent[i] == 0.0)
+            .collect();
+        if takers.is_empty() {
+            takers = (0..ncols).filter(|&i| percent[i] == 0.0).collect();
+        }
+        if takers.is_empty() {
+            takers = (0..ncols).collect();
+        }
+        let total: f32 = takers.iter().map(|&i| cmax[i]).sum();
+        for &i in &takers {
+            let share = if total > 0.0 {
+                cmax[i] / total
+            } else {
+                1.0 / takers.len() as f32
+            };
+            cols[i] += extra * share;
+        }
+        cols
     } else {
         let t = if sum_max > sum_min {
             (content - sum_min) / (sum_max - sum_min)
@@ -288,23 +358,41 @@ pub fn compute(tree: &mut Tree, node_id: NodeId, inputs: LayoutInput) -> LayoutO
 
     // Heights, given those widths.
     let cell_w = |c: &Cell| cols[c.col..c.col + c.cs].iter().sum::<f32>() + sx * (c.cs - 1) as f32;
+    if inputs.run_mode == RunMode::ComputeSize && inputs.axis == RequestedAxis::Horizontal {
+        return LayoutOutput::from_outer_size(Size { width, height: 0.0 });
+    }
+    // A cell is laid out in full to find its height: taffy loses the collapsed
+    // margins of nested blocks when it only measures. The same layout is the one
+    // that stays; only the cell's box grows to the height of its row.
+    let cell_inputs = |w: f32| {
+        let mut inputs = input(
+            RunMode::PerformLayout,
+            Size {
+                width: Some(w),
+                height: None,
+            },
+            Size {
+                width: AvailableSpace::Definite(w),
+                height: AvailableSpace::MaxContent,
+            },
+        );
+        inputs.sizing_mode = SizingMode::ContentSize;
+        inputs
+    };
     for c in &mut cells {
         let w = cell_w(c);
-        c.h = tree_height(
-            tree,
-            NodeId::from(c.node),
-            input(
-                RunMode::ComputeSize,
-                Size {
-                    width: Some(w),
-                    height: None,
-                },
-                Size {
-                    width: AvailableSpace::Definite(w),
-                    height: AvailableSpace::MaxContent,
-                },
+        c.h = tree_height(tree, NodeId::from(c.node), cell_inputs(w));
+        let style = &tree.nodes[c.node].style;
+        c.need = match style.size.height.into_option() {
+            Some(h) if style.box_sizing == taffy::BoxSizing::BorderBox => c.h.max(h),
+            Some(h) => c.h.max(
+                h + px(style.padding.top)
+                    + px(style.padding.bottom)
+                    + px(style.border.top)
+                    + px(style.border.bottom),
             ),
-        );
+            None => c.h,
+        };
     }
     let mut row_h = vec![0.0f32; nrows];
     for (r, &(row, _)) in rows.iter().enumerate() {
@@ -313,12 +401,12 @@ pub fn compute(tree: &mut Tree, node_id: NodeId, inputs: LayoutInput) -> LayoutO
         }
     }
     for c in cells.iter().filter(|c| c.rs == 1) {
-        row_h[c.row] = row_h[c.row].max(c.h);
+        row_h[c.row] = row_h[c.row].max(c.need);
     }
     for c in cells.iter().filter(|c| c.rs > 1) {
         let have: f32 = row_h[c.row..c.row + c.rs].iter().sum::<f32>() + sy * (c.rs - 1) as f32;
-        if c.h > have {
-            row_h[c.row + c.rs - 1] += c.h - have;
+        if c.need > have {
+            row_h[c.row + c.rs - 1] += c.need - have;
         }
     }
     let row_y: Vec<f32> = row_h
@@ -369,20 +457,7 @@ pub fn compute(tree: &mut Tree, node_id: NodeId, inputs: LayoutInput) -> LayoutO
         let w = cell_w(c);
         let h = row_h[c.row..c.row + c.rs].iter().sum::<f32>() + sy * (c.rs - 1) as f32;
         let id = NodeId::from(c.node);
-        let done = tree.compute_child_layout(
-            id,
-            input(
-                RunMode::PerformLayout,
-                Size {
-                    width: Some(w),
-                    height: Some(h),
-                },
-                Size {
-                    width: AvailableSpace::Definite(w),
-                    height: AvailableSpace::Definite(h),
-                },
-            ),
-        );
+        let done = tree.compute_child_layout(id, cell_inputs(w));
         let free = (h - c.h).max(0.0);
         let shift = match tree.nodes[c.node].valign {
             VAlign::Top => 0.0,
@@ -404,7 +479,10 @@ pub fn compute(tree: &mut Tree, node_id: NodeId, inputs: LayoutInput) -> LayoutO
                     x: col_x[c.col] - edge_l,
                     y: 0.0,
                 },
-                size: done.size,
+                size: Size {
+                    width: done.size.width,
+                    height: h,
+                },
                 content_size: done.content_size,
                 scrollbar_size: Size::ZERO,
                 border: Rect {

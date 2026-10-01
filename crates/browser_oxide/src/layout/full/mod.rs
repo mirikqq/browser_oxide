@@ -34,6 +34,7 @@ pub struct FullLayout {
     pub tree: Tree,
     pub dom_to_node: HashMap<u32, usize>,
     pub root: Option<usize>,
+    block_in_inline: HashMap<u32, Vec<usize>>,
     /// Fragments of inline elements and text nodes, by DOM id: the owning node
     /// and the fragment's index in it.
     inline: HashMap<u32, Vec<(usize, usize)>>,
@@ -60,10 +61,12 @@ impl FullLayout {
         b.build(&mut on_style);
         let root = b.dom_to_node.get(&DomId::DOCUMENT.to_raw()).copied();
         let vertical_percent = std::mem::take(&mut b.vertical_percent);
+        let block_in_inline = std::mem::take(&mut b.block_in_inline);
         let mut layout = Self {
             tree: b.tree,
             dom_to_node: b.dom_to_node,
             root,
+            block_in_inline,
             inline: HashMap::new(),
         };
         if let Some(root) = layout.root {
@@ -101,24 +104,53 @@ impl FullLayout {
     /// The boxes an inline element (or a text node) occupies, one per line, in
     /// document coordinates. Empty for anything that has a box of its own.
     pub fn inline_rects(&self, dom_id: u32) -> Vec<[f32; 4]> {
-        let Some(frags) = self.inline.get(&dom_id) else {
+        let mut out = Vec::new();
+        self.push_inline_rects(dom_id, &mut out);
+        out.extend(self.block_rects(dom_id));
+        out
+    }
+
+    /// What Chrome reports of the blocks inside an inline element: for each, the
+    /// width of the container and the height of the block.
+    fn block_rects(&self, dom_id: u32) -> Vec<[f32; 4]> {
+        let Some(blocks) = self.block_in_inline.get(&dom_id) else {
             return Vec::new();
         };
-        frags
+        blocks
             .iter()
-            .filter_map(|&(n, f)| {
-                let frag = &self.tree.nodes[n].frags[f];
-                let (x, y) = self.absolute_position(n);
-                (frag.kind == ifc::FragKind::Box || self.is_text(dom_id)).then(|| {
-                    [
-                        x + frag.rect[0],
-                        y + frag.rect[1],
-                        frag.rect[2],
-                        frag.rect[3],
-                    ]
-                })
+            .filter_map(|&n| {
+                let parent = &self.tree.nodes[self.tree.nodes[n].parent?];
+                let (px, _) = self.absolute_position(self.tree.nodes[n].parent?);
+                let (_, y) = self.absolute_position(n);
+                let l = &parent.layout;
+                let left = l.padding.left + l.border.left;
+                let width = l.size.width - left - l.padding.right - l.border.right;
+                Some([
+                    px + left,
+                    y,
+                    width.max(0.0),
+                    self.tree.nodes[n].layout.size.height,
+                ])
             })
             .collect()
+    }
+
+    fn push_inline_rects(&self, dom_id: u32, out: &mut Vec<[f32; 4]>) {
+        let Some(frags) = self.inline.get(&dom_id) else {
+            return;
+        };
+        out.extend(frags.iter().filter_map(|&(n, f)| {
+            let frag = &self.tree.nodes[n].frags[f];
+            let (x, y) = self.absolute_position(n);
+            (frag.kind == ifc::FragKind::Box || self.is_text(dom_id)).then(|| {
+                [
+                    x + frag.rect[0],
+                    y + frag.rect[1],
+                    frag.rect[2],
+                    frag.rect[3],
+                ]
+            })
+        }));
     }
 
     /// What `getClientRects` reports for an inline element: one rectangle per line
@@ -154,11 +186,13 @@ impl FullLayout {
         }
         if own.iter().any(|f| f.decorated) {
             out.extend(frags.into_iter().flatten().map(abs));
+            out.extend(self.block_rects(id.to_raw()));
             return;
         }
         for child in dom.children(id) {
             self.collect_client_rects(dom, child, out);
         }
+        out.extend(self.block_rects(id.to_raw()));
     }
 
     fn is_text(&self, dom_id: u32) -> bool {

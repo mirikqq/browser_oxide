@@ -13,5 +13,10 @@ tr { display: table-row; vertical-align: inherit }
 td, th { display: table-cell; vertical-align: inherit; padding: 1px }
 th { font-weight: bold; text-align: center }
 
+/* `center` centres its text and, below, its block children. */
+center { text-align: center }
+center > * { margin-left: auto; margin-right: auto }
+center > table { text-align: start }
+
 /* A closed disclosure shows only its summary. */
 details:not([open]) > :not(summary) { display: none }
