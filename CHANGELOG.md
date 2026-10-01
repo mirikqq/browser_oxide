@@ -86,6 +86,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   context keeping its children's margins, quirks-mode lines of images only, table
   columns following cell `width` (lengths and percentages) and cell `height` as
   a minimum.
+  Also in `Full`: `::before`/`::after` boxes (`content` with strings, `attr()`,
+  quotes and `url(data:…)`), the static position of out-of-flow boxes that move to
+  their containing block, sizes and baselines of form controls after Blink, text
+  wrapping around floats, and generated images with the natural size of an SVG,
+  PNG or GIF given as a `data:` URL.
   New dependencies: `unicode-linebreak`
   (Apache-2.0), `unicode-width` (MIT OR Apache-2.0). New properties parsed:
   `grid-template-columns`/`-rows`, `border-collapse`, `border-spacing`,

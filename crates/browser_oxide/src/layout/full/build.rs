@@ -937,7 +937,13 @@ impl<'a> Builder<'a> {
             return;
         };
         if let Some(ifc) = builder.finish() {
-            out.push(self.tree.add_ifc(Style::default(), ifc, atomics));
+            // A block of its own kind: taffy would lay a flex node out as a box that
+            // keeps clear of floats, instead of leaving them to the lines.
+            let style = Style {
+                display: taffy::Display::Block,
+                ..Default::default()
+            };
+            out.push(self.tree.add_ifc(style, ifc, atomics));
         }
     }
 
@@ -1101,7 +1107,14 @@ impl<'a> Builder<'a> {
                 }
                 *run = Some(next);
             }
-            // A float or an atomic inline sits in the line as an atom.
+            // A float inside inline content goes before the lines that hold it, as
+            // if it came first: the text then wraps around it.
+            Level::Block if self.float_of(id) != CssFloat::None => {
+                if let Some(&n) = self.dom_to_node.get(&id.to_raw()) {
+                    out.push(n);
+                }
+            }
+            // An atomic inline sits in the line as an atom.
             Level::Atomic | Level::Block => {
                 if let (Some(&n), Some((b, atomics))) =
                     (self.dom_to_node.get(&id.to_raw()), run.as_mut())

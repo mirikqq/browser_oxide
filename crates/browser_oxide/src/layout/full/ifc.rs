@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 
 use taffy::util::{MaybeResolve, ResolveOrZero};
-use taffy::{AvailableSpace, BoxSizing};
+use taffy::{AvailableSpace, BlockContext, BoxSizing};
 use taffy::{
     Layout, LayoutInput, LayoutOutput, LayoutPartialTree, Line, NodeId, Point, Rect, RequestedAxis,
     RunMode, Size, SizingMode,
@@ -503,6 +503,9 @@ impl AtomicBox {
 struct LineBox {
     atoms: std::ops::Range<usize>,
     width: f32,
+    /// Where the line may go when floats narrow it: the offset of its left edge
+    /// and the room it has.
+    slot: Option<(f32, f32)>,
 }
 
 fn input(
@@ -653,11 +656,10 @@ impl Ifc {
         }
     }
 
-    /// Greedy line breaking against `avail`.
-    fn break_lines(&self, atomics: &[AtomicBox], avail: f32) -> Vec<LineBox> {
+    /// The line that starts at atom `start`, broken greedily against `avail`.
+    fn break_line(&self, start: usize, atomics: &[AtomicBox], avail: f32) -> LineBox {
         let n = self.atoms.len();
-        let mut lines = Vec::new();
-        let (mut start, mut i) = (0, 0);
+        let mut i = start;
         let (mut used, mut trailing) = (0.0f32, 0.0f32);
         let mut has_content = false;
         while i < n {
@@ -674,37 +676,21 @@ impl Ifc {
             let forced = self.atoms[j].brk == Brk::Forced;
             let fits = !has_content || used + trailing + chunk <= avail + 0.001;
             if !fits {
-                lines.push(LineBox {
-                    atoms: start..i,
-                    width: used,
-                });
-                start = i;
-                used = 0.0;
-                trailing = 0.0;
-                has_content = false;
+                break;
             }
             used += if has_content { trailing } else { 0.0 } + chunk;
             trailing = space;
             has_content = true;
             i = j + 1;
             if forced {
-                lines.push(LineBox {
-                    atoms: start..i,
-                    width: used,
-                });
-                start = i;
-                used = 0.0;
-                trailing = 0.0;
-                has_content = false;
+                break;
             }
         }
-        if start < n {
-            lines.push(LineBox {
-                atoms: start..n,
-                width: used,
-            });
+        LineBox {
+            atoms: start..i,
+            width: used,
+            slot: None,
         }
-        lines
     }
 }
 
@@ -716,12 +702,43 @@ struct Placed {
     height: f32,
 }
 
-fn place(ifc: &Ifc, atomics: &[AtomicBox], avail: f32) -> Placed {
-    let lines = ifc.break_lines(atomics, avail);
-    let mut metrics = Vec::with_capacity(lines.len());
+fn place(
+    ifc: &Ifc,
+    atomics: &[AtomicBox],
+    avail: f32,
+    floats: Option<&BlockContext<'_>>,
+) -> Placed {
+    let floats = floats.filter(|c| c.has_floats());
+    let mut lines: Vec<LineBox> = Vec::new();
+    let mut metrics = Vec::new();
     let mut open: Vec<usize> = Vec::new();
     let mut top = 0.0f32;
-    for line in &lines {
+    let mut start = 0;
+    while start < ifc.atoms.len() {
+        // With floats about, the line goes where there is room: beside them if its
+        // first word fits there, below them if not.
+        let mut broken = ifc.break_line(start, atomics, avail);
+        if let Some(ctx) = floats {
+            let mut after = None;
+            loop {
+                let mut slot = ctx.find_content_slot(top, taffy::Clear::None, after);
+                if slot.segment_id.is_none() && after.is_some() {
+                    // Not even a word fits beside the floats: below the lowest.
+                    let below = ctx.cleared_threshold(taffy::Clear::Both).unwrap_or(slot.y);
+                    slot = ctx.find_content_slot(below.max(slot.y), taffy::Clear::None, None);
+                }
+                broken = ifc.break_line(start, atomics, slot.width.min(avail));
+                top = slot.y;
+                broken.slot = Some((slot.x, slot.width));
+                let fits = broken.width <= slot.width + 0.001;
+                if fits || slot.segment_id.is_none() || slot.width >= avail - 0.001 {
+                    break;
+                }
+                after = slot.segment_id;
+            }
+        }
+        start = broken.atoms.end;
+        let line = &broken;
         // Leading can be negative, so nothing starts from zero.
         let (mut asc, mut desc) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
         let mut touched: Vec<usize> = open.clone();
@@ -779,6 +796,7 @@ fn place(ifc: &Ifc, atomics: &[AtomicBox], avail: f32) -> Placed {
         }
         metrics.push((top, asc + desc, asc));
         top += asc + desc;
+        lines.push(broken);
     }
     Placed {
         lines,
@@ -798,12 +816,14 @@ fn fragments(
     let mut atomic_at = Vec::new();
     let mut carried: Vec<usize> = Vec::new();
     for (line, &(top, _, asc)) in placed.lines.iter().zip(&placed.metrics) {
-        let free = (width - line.width).max(0.0);
-        let x0 = match ifc.root.align {
-            TextAlign::Right | TextAlign::End => free,
-            TextAlign::Center => free / 2.0,
-            _ => 0.0,
-        };
+        let (left, room) = line.slot.unwrap_or((0.0, width));
+        let free = (room - line.width).max(0.0);
+        let x0 = left
+            + match ifc.root.align {
+                TextAlign::Right | TextAlign::End => free,
+                TextAlign::Center => free / 2.0,
+                _ => 0.0,
+            };
         let baseline = top + asc;
         let mut x = x0;
         let mut starts: Vec<(usize, f32, bool)> = carried.iter().map(|&b| (b, x0, false)).collect();
@@ -940,17 +960,28 @@ fn box_frag(
 }
 
 /// Lay out the `Ifc` of `node_id`.
-pub fn compute(tree: &mut Tree, node_id: NodeId, inputs: LayoutInput) -> LayoutOutput {
+pub fn compute(
+    tree: &mut Tree,
+    node_id: NodeId,
+    inputs: LayoutInput,
+    floats: Option<&BlockContext<'_>>,
+) -> LayoutOutput {
     let idx = usize::from(node_id);
     let Some(ifc) = tree.nodes[idx].ifc.take() else {
         return LayoutOutput::HIDDEN;
     };
-    let out = run(tree, idx, &ifc, inputs);
+    let out = run(tree, idx, &ifc, inputs, floats);
     tree.nodes[idx].ifc = Some(ifc);
     out
 }
 
-fn run(tree: &mut Tree, idx: usize, ifc: &Ifc, inputs: LayoutInput) -> LayoutOutput {
+fn run(
+    tree: &mut Tree,
+    idx: usize,
+    ifc: &Ifc,
+    inputs: LayoutInput,
+    floats: Option<&BlockContext<'_>>,
+) -> LayoutOutput {
     let avail = match inputs.known_dimensions.width {
         Some(w) => w,
         None => match inputs.available_space.width {
@@ -965,7 +996,7 @@ fn run(tree: &mut Tree, idx: usize, ifc: &Ifc, inputs: LayoutInput) -> LayoutOut
             atomics[i] = size_atomic(tree, node, avail, avail);
         }
     }
-    let placed = place(ifc, &atomics, avail);
+    let placed = place(ifc, &atomics, avail, floats);
     let content_w = placed.lines.iter().map(|l| l.width).fold(0.0f32, f32::max);
     let width = inputs.known_dimensions.width.unwrap_or(content_w);
     let height = inputs.known_dimensions.height.unwrap_or(placed.height);

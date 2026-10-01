@@ -197,7 +197,7 @@ impl Tree {
         compute_cached_layout(self, node_id, inputs, |tree, node_id, inputs| {
             let idx = usize::from(node_id);
             if tree.nodes[idx].ifc.is_some() {
-                return ifc::compute(tree, node_id, inputs);
+                return ifc::compute(tree, node_id, inputs, block_ctx.as_deref());
             }
             if tree.nodes[idx].role == Role::Table {
                 return table::compute(tree, node_id, inputs);
