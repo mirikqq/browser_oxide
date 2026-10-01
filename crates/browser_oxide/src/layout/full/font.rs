@@ -145,7 +145,7 @@ pub fn line_height_px(
     metrics: &Metrics,
     ctx: &ResolveContext,
 ) -> f32 {
-    match c.get(&PropertyId::LineHeight) {
+    let raw = match c.get(&PropertyId::LineHeight) {
         Some(CssValue::LineHeight(LineHeight::Number(n))) => *n as f32 * size,
         Some(CssValue::LineHeight(LineHeight::Length(l))) => resolve_length(
             l,
@@ -155,6 +155,9 @@ pub fn line_height_px(
             },
         ),
         Some(CssValue::LineHeight(LineHeight::Percentage(p))) => *p as f32 / 100.0 * size,
-        _ => metrics.normal_line_height(),
-    }
+        _ => return metrics.normal_line_height(),
+    };
+    // Blink keeps it in 1/64 px (`LayoutUnit`), rounded to the nearest; over a long page the
+    // difference from a plain float adds up to more than a pixel.
+    (raw * 64.0).round() / 64.0
 }

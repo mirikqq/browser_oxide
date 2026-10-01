@@ -104,6 +104,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `<details>`: the contents are in a block formatting context after the summary;
   closed, they are laid out (they have rectangles, as in Chrome) in a box of no
   height and not drawn.
+  Lengths follow Blink's `LayoutUnit`: margins, paddings, sizes and offsets in
+  1/64 px (rounded down), line heights rounded to 1/64, border widths in whole
+  device pixels; a `line-height` in em or % is computed to a length before it is
+  inherited.
   New dependencies: `unicode-linebreak`
   (Apache-2.0), `unicode-width` (MIT OR Apache-2.0). New properties parsed:
   `grid-template-columns`/`-rows`, `border-collapse`, `border-spacing`,

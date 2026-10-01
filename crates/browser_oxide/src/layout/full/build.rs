@@ -135,6 +135,8 @@ fn format_counter(n: i32, style: &str) -> String {
 }
 
 pub(super) struct Builder<'a> {
+    /// Device pixels per CSS pixel: border widths are whole device pixels.
+    dpr: f32,
     pub dom: &'a Dom,
     pub styles: &'a StyleTree,
     pub ctx: &'a ResolveContext,
@@ -185,8 +187,15 @@ fn is_replaced(tag: &str) -> bool {
 }
 
 impl<'a> Builder<'a> {
-    pub fn new(dom: &'a Dom, styles: &'a StyleTree, ctx: &'a ResolveContext, os: &'a str) -> Self {
+    pub fn new(
+        dom: &'a Dom,
+        styles: &'a StyleTree,
+        ctx: &'a ResolveContext,
+        os: &'a str,
+        dpr: f32,
+    ) -> Self {
         Self {
+            dpr,
             dom,
             styles,
             ctx,
@@ -700,6 +709,7 @@ impl<'a> Builder<'a> {
         }
 
         let mut style = computed_to_taffy(computed, &ctx);
+        self.snap_borders(&mut style);
         if position == CssPosition::Sticky {
             // At the top of the page a sticky box has not moved: it is where it
             // would be if static, whatever its offsets.
@@ -1398,6 +1408,86 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Border widths come out in whole device pixels, at least one if there is a
+    /// border: Blink floors them (`1.7px` is `1.5px` at 2x).
+    fn snap_borders(&self, ts: &mut Style) {
+        self.quantize(ts);
+        let dpr = if self.dpr > 0.0 { self.dpr } else { 1.0 };
+        let snap = |w: taffy::LengthPercentage| {
+            let v = w.resolve_or_zero(None, |_, _| 0.0);
+            if v <= 0.0 {
+                w
+            } else {
+                taffy::LengthPercentage::length((v * dpr).floor().max(1.0) / dpr)
+            }
+        };
+        ts.border.top = snap(ts.border.top);
+        ts.border.right = snap(ts.border.right);
+        ts.border.bottom = snap(ts.border.bottom);
+        ts.border.left = snap(ts.border.left);
+    }
+
+    /// Blink keeps lengths in 1/64 px (`LayoutUnit`), rounded down; kept as plain
+    /// floats the differences add up to pixels over a long page.
+    fn quantize(&self, ts: &mut Style) {
+        let q = |v: f32| (v * 64.0).floor() / 64.0;
+        let length = taffy::CompactLength::LENGTH_TAG;
+        let lp = |v: taffy::LengthPercentage| {
+            let r = v.into_raw();
+            if r.tag() == length {
+                taffy::LengthPercentage::length(q(r.value()))
+            } else {
+                v
+            }
+        };
+        let lpa = |v: taffy::LengthPercentageAuto| {
+            let r = v.into_raw();
+            if r.tag() == length {
+                taffy::LengthPercentageAuto::length(q(r.value()))
+            } else {
+                v
+            }
+        };
+        let dim = |v: Dimension| {
+            let r = v.into_raw();
+            if r.tag() == length {
+                Dimension::length(q(r.value()))
+            } else {
+                v
+            }
+        };
+        ts.margin = taffy::Rect {
+            left: lpa(ts.margin.left),
+            right: lpa(ts.margin.right),
+            top: lpa(ts.margin.top),
+            bottom: lpa(ts.margin.bottom),
+        };
+        ts.padding = taffy::Rect {
+            left: lp(ts.padding.left),
+            right: lp(ts.padding.right),
+            top: lp(ts.padding.top),
+            bottom: lp(ts.padding.bottom),
+        };
+        ts.inset = taffy::Rect {
+            left: lpa(ts.inset.left),
+            right: lpa(ts.inset.right),
+            top: lpa(ts.inset.top),
+            bottom: lpa(ts.inset.bottom),
+        };
+        ts.size = Size {
+            width: dim(ts.size.width),
+            height: dim(ts.size.height),
+        };
+        ts.min_size = Size {
+            width: dim(ts.min_size.width),
+            height: dim(ts.min_size.height),
+        };
+        ts.max_size = Size {
+            width: dim(ts.max_size.width),
+            height: dim(ts.max_size.height),
+        };
+    }
+
     /// `vertical-align` of an inline box or an atomic inline.
     fn lift_of(&self, id: DomId, c: &ComputedStyle) -> Lift {
         let Some(CssValue::CustomValue(raw)) = c.get(&PropertyId::VerticalAlign) else {
@@ -1462,7 +1552,8 @@ impl<'a> Builder<'a> {
         let (_, m) = self.font(c, size);
         let lh = line_height_px(c, size, &m, &ctx);
         let (asc_l, desc_l) = m.with_leading(lh);
-        let ts = computed_to_taffy(c, &ctx);
+        let mut ts = computed_to_taffy(c, &ctx);
+        self.snap_borders(&mut ts);
         let lp = |v: taffy::LengthPercentage| v.resolve_or_zero(None, |_, _| 0.0);
         let margin =
             |v: taffy::LengthPercentageAuto| v.maybe_resolve(Some(0.0), |_, _| 0.0).unwrap_or(0.0);

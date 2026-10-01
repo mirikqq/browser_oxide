@@ -61,7 +61,7 @@ impl FullLayout {
             viewport_w: viewport.width,
             viewport_h: viewport.height,
         };
-        let mut b = Builder::new(dom, styles, &ctx, os);
+        let mut b = Builder::new(dom, styles, &ctx, os, viewport.device_pixel_ratio);
         b.build(&mut on_style);
         let root = b.dom_to_node.get(&DomId::DOCUMENT.to_raw()).copied();
         let vertical_percent = std::mem::take(&mut b.vertical_percent);
