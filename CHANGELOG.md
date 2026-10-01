@@ -77,7 +77,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   viewport for `fixed` and unanchored `absolute` boxes. Local saved pages can
   be compared with Chrome too (`tests/layout_corpus/prepare.mjs`,
   `snapshot.mjs --real`, `probe.mjs`, test `layout_corpus_real`); the pages
-  are kept out of git.
+  are kept out of git. Five saved web pages (`fetch.mjs`) join the rustdoc
+  ones. What they showed, in `Full` only: a strict `@media` evaluator
+  (`evaluate_media_query_strict`), the presentational attributes of old table
+  markup (`width`, `cellpadding`, `cellspacing`, `border`, `align`, `valign`,
+  `bgcolor`, `<center>`), blocks inside inline elements (the inline context is
+  split around them), the root and every box that starts a block formatting
+  context keeping its children's margins, quirks-mode lines of images only, table
+  columns following cell `width` (lengths and percentages) and cell `height` as
+  a minimum.
   New dependencies: `unicode-linebreak`
   (Apache-2.0), `unicode-width` (MIT OR Apache-2.0). New properties parsed:
   `grid-template-columns`/`-rows`, `border-collapse`, `border-spacing`,
