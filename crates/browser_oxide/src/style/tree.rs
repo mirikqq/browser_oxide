@@ -13,7 +13,7 @@
 
 use crate::css_cascade::{CascadeEntry, ComputedStyle, Origin};
 use crate::css_selectors::Specificity;
-use crate::css_values::property::{CssValue, PropertyDeclaration, PropertyId};
+use crate::css_values::property::{CssValue, LineHeight, PropertyDeclaration, PropertyId};
 use crate::css_values::types::display::Display;
 use crate::css_values::types::length::{Length, LengthPercentage};
 use crate::dom::node::{NodeData, NodeId};
@@ -234,7 +234,14 @@ fn compute_element(
 
     let inherited = parent.map(|p| p.custom.clone()).unwrap_or_default();
     let (cascaded, custom) = stylist.cascade_with_custom(dom, node, extra, &inherited);
-    resolve_styled(cascaded, custom, parent, root_font_size, viewport)
+    resolve_styled(
+        cascaded,
+        custom,
+        parent,
+        root_font_size,
+        viewport,
+        stylist.is_full(),
+    )
 }
 
 /// The style of the `::before` or `::after` of `owner`, if it has `content` and
@@ -263,6 +270,7 @@ fn pseudo_style(
         Some(owner_style),
         root_font_size,
         viewport,
+        true,
     );
     let hidden = matches!(
         styled.style.get(&PropertyId::Display),
@@ -278,6 +286,7 @@ fn resolve_styled(
     parent: Option<&Styled>,
     root_font_size: f32,
     viewport: (f32, f32),
+    full: bool,
 ) -> Styled {
     let parent_style = parent.map(|p| &p.style);
     let mut style = ComputedStyle::resolve(&cascaded, parent_style);
@@ -307,6 +316,29 @@ fn resolve_styled(
         PropertyId::FontSize,
         CssValue::Length(Length::Px(px as f64)),
     );
+    // A `line-height` in `em` or `%` is computed to a length against this element's
+    // own font size, and that length is what its descendants inherit.
+    if full {
+        if let Some(CssValue::LineHeight(lh)) = style.get(&PropertyId::LineHeight) {
+            let own = ResolveContext {
+                font_size: px,
+                ..ctx
+            };
+            let computed = match lh {
+                LineHeight::Percentage(p) => Some(*p as f32 / 100.0 * px),
+                LineHeight::Length(l) if !matches!(l, Length::Px(_)) => {
+                    Some(resolve_length(l, &own))
+                }
+                _ => None,
+            };
+            if let Some(v) = computed {
+                style.set(
+                    PropertyId::LineHeight,
+                    CssValue::LineHeight(LineHeight::Length(Length::Px(f64::from(v)))),
+                );
+            }
+        }
+    }
     Styled { style, custom }
 }
 
