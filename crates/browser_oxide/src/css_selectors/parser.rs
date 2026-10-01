@@ -396,6 +396,17 @@ impl<'a> SelectorParser<'a> {
             TokenKind::Ident(name) => {
                 let name_lower = name.to_ascii_lowercase();
                 self.advance();
+                // The four pseudo-elements CSS 2 wrote with one colon.
+                let legacy = match name_lower.as_str() {
+                    "before" => Some(PseudoElement::Before),
+                    "after" => Some(PseudoElement::After),
+                    "first-line" => Some(PseudoElement::FirstLine),
+                    "first-letter" => Some(PseudoElement::FirstLetter),
+                    _ => None,
+                };
+                if let Some(pe) = legacy {
+                    return Ok(SimpleSelector::PseudoElement(pe));
+                }
                 let pc = match name_lower.as_str() {
                     "hover" => PseudoClass::Hover,
                     "active" => PseudoClass::Active,

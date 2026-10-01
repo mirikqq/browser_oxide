@@ -74,6 +74,8 @@ pub struct Node {
     pub lift: ifc::Lift,
     /// `order`, which sorts the items of a flex or grid container.
     pub order: i32,
+    /// `position: sticky`: the `top`, `right`, `bottom` and `left` offsets, in px.
+    pub sticky: Option<[Option<f32>; 4]>,
     /// Laid out, so that it has rectangles, but not drawn: the contents of a closed
     /// disclosure.
     pub paint_hidden: bool,
@@ -133,6 +135,7 @@ impl Tree {
             lift: ifc::Lift::default(),
             order: 0,
             transform: None,
+            sticky: None,
             paint_hidden: false,
             cache: Cache::new(),
             layout: Layout::with_order(0),

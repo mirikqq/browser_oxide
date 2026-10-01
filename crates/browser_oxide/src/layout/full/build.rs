@@ -642,28 +642,48 @@ impl<'a> Builder<'a> {
                 .and_then(|c| self.dom_to_node.get(&c.to_raw()).copied());
             let (kept, contents): (Vec<usize>, Vec<usize>) =
                 children.iter().partition(|&&c| Some(c) == summary);
-            // Closed, the slot has no height; either way it is a block formatting
-            // context, so the margins of its contents stay inside the element.
-            let slot = Style {
-                display: taffy::Display::Block,
-                size: Size {
-                    width: Dimension::auto(),
-                    height: if open {
-                        Dimension::auto()
-                    } else {
-                        Dimension::length(0.0)
-                    },
-                },
-                overflow: taffy::Point {
-                    x: taffy::Overflow::Hidden,
-                    y: taffy::Overflow::Hidden,
-                },
-                ..Default::default()
+            // The slot is a block formatting context, so the margins of its contents
+            // stay inside the element. Closed, it is empty and the contents sit
+            // beside it, out of flow (they add nothing to the size) as wide as the
+            // element, and are not drawn.
+            let bfc = taffy::Point {
+                x: taffy::Overflow::Hidden,
+                y: taffy::Overflow::Hidden,
             };
-            let slot = self.tree.add(slot, contents);
-            self.tree.nodes[slot].paint_hidden = !open;
             children = kept;
-            children.push(slot);
+            if open {
+                let slot = Style {
+                    display: taffy::Display::Block,
+                    overflow: bfc,
+                    ..Default::default()
+                };
+                children.push(self.tree.add(slot, contents));
+            } else {
+                let slot = Style {
+                    display: taffy::Display::Block,
+                    size: Size {
+                        width: Dimension::auto(),
+                        height: Dimension::length(0.0),
+                    },
+                    overflow: bfc,
+                    ..Default::default()
+                };
+                children.push(self.tree.add(slot, Vec::new()));
+                let hidden = Style {
+                    display: taffy::Display::Block,
+                    position: taffy::Position::Absolute,
+                    inset: taffy::Rect {
+                        left: taffy::LengthPercentageAuto::length(0.0),
+                        right: taffy::LengthPercentageAuto::length(0.0),
+                        top: taffy::LengthPercentageAuto::auto(),
+                        bottom: taffy::LengthPercentageAuto::auto(),
+                    },
+                    ..Default::default()
+                };
+                let hidden = self.tree.add(hidden, contents);
+                self.tree.nodes[hidden].paint_hidden = true;
+                children.push(hidden);
+            }
         }
         // The marker of a list item is a line of its own when the item holds nothing.
         let marker_shown = !matches!(
@@ -710,9 +730,20 @@ impl<'a> Builder<'a> {
 
         let mut style = computed_to_taffy(computed, &ctx);
         self.snap_borders(&mut style);
+        let mut sticky = None;
         if position == CssPosition::Sticky {
-            // At the top of the page a sticky box has not moved: it is where it
-            // would be if static, whatever its offsets.
+            // A sticky box is where it would be if static, and the offsets only move
+            // it back into view (see `FullLayout::apply_sticky`).
+            let px = |v: taffy::LengthPercentageAuto| {
+                let r = v.into_raw();
+                (r.tag() == taffy::CompactLength::LENGTH_TAG).then(|| r.value())
+            };
+            sticky = Some([
+                px(style.inset.top),
+                px(style.inset.right),
+                px(style.inset.bottom),
+                px(style.inset.left),
+            ]);
             style.inset = taffy::Rect {
                 left: taffy::LengthPercentageAuto::auto(),
                 right: taffy::LengthPercentageAuto::auto(),
@@ -922,6 +953,7 @@ impl<'a> Builder<'a> {
         if self.level(id) == Level::Atomic {
             self.tree.nodes[id_node].lift = self.lift_of(id, computed);
         }
+        self.tree.nodes[id_node].sticky = sticky;
         if let Some(CssValue::Transform(t)) = computed.get(&PropertyId::Transform) {
             if !t.is_empty() {
                 self.tree.nodes[id_node].transform = Some(t.clone());

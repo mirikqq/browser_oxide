@@ -765,6 +765,18 @@ impl Ifc {
                 i = j + 1;
                 continue;
             }
+            // A space of its own is the end of the line before it, or nothing at the
+            // start of a line: it never makes a line of its own.
+            if chunk == 0.0
+                && self.atoms[j].brk != Brk::Forced
+                && (i..=j).all(|k| matches!(self.atoms[k].kind, AtomKind::Text { .. }))
+            {
+                if has_content {
+                    trailing = trailing.max(space);
+                }
+                i = j + 1;
+                continue;
+            }
             // The edges of closing inline boxes come after the space at the end of a
             // line, which is dropped all the same.
             if (i..=j).all(|k| matches!(self.atoms[k].kind, AtomKind::Close(_))) && has_content {
@@ -1062,15 +1074,19 @@ fn fragments(
                     x += bx.right();
                     if let Some(p) = starts.iter().rposition(|&(id, _, _)| id == b) {
                         let (_, sx, left) = starts.remove(p);
-                        frags.push(box_frag(
-                            ifc,
-                            b,
-                            sx,
-                            x - bx.margin_right,
-                            baseline - shift.of_box(b),
-                            left,
-                            true,
-                        ));
+                        // What is left of a box that carried over a line break and
+                        // holds nothing on this line is no fragment.
+                        if left || x - bx.margin_right - sx > 0.0 || bx.right() != 0.0 {
+                            frags.push(box_frag(
+                                ifc,
+                                b,
+                                sx,
+                                x - bx.margin_right,
+                                baseline - shift.of_box(b),
+                                left,
+                                true,
+                            ));
+                        }
                     }
                     carried.retain(|&c| c != b);
                 }
@@ -1118,6 +1134,9 @@ fn fragments(
         flush(&mut text, end_x, &mut frags);
         // Boxes still open at the end of the line end with it.
         for (b, sx, left) in starts {
+            if !left && end_x - sx <= 0.0 {
+                continue;
+            }
             frags.push(box_frag(
                 ifc,
                 b,

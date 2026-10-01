@@ -58,6 +58,29 @@ pub fn parse_property(
         "border" | "border-top" | "border-right" | "border-bottom" | "border-left" => {
             return parse_border_shorthand(value_trimmed, important, &name_lower)
         }
+        // The logical forms, for a horizontal left-to-right writing mode.
+        "border-block-start" => {
+            return parse_border_shorthand(value_trimmed, important, "border-top")
+        }
+        "border-block-end" => {
+            return parse_border_shorthand(value_trimmed, important, "border-bottom")
+        }
+        "border-inline-start" => {
+            return parse_border_shorthand(value_trimmed, important, "border-left")
+        }
+        "border-inline-end" => {
+            return parse_border_shorthand(value_trimmed, important, "border-right")
+        }
+        "border-block" | "border-inline" => {
+            let (a, b) = if name_lower == "border-block" {
+                ("border-top", "border-bottom")
+            } else {
+                ("border-left", "border-right")
+            };
+            let mut out = parse_border_shorthand(value_trimmed, important, a)?;
+            out.extend(parse_border_shorthand(value_trimmed, important, b)?);
+            return Ok(out);
+        }
         _ => {}
     }
 

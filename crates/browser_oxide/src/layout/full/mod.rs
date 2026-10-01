@@ -98,6 +98,7 @@ impl FullLayout {
                 );
             }
         }
+        layout.apply_sticky(viewport);
         layout.compute_matrices(viewport);
         for (n, node) in layout.tree.nodes.iter().enumerate() {
             for (f, frag) in node.frags.iter().enumerate() {
@@ -133,6 +134,35 @@ impl FullLayout {
             self.tree.clear_caches();
         }
         changed
+    }
+
+    /// A sticky box stays inside the view when the page is at its top: one whose
+    /// `top` is below where it sits is pushed down to it (and one whose `bottom` is
+    /// above where its bottom edge sits is pulled up), within its parent.
+    fn apply_sticky(&mut self, viewport: Viewport) {
+        for n in 0..self.tree.nodes.len() {
+            let Some([top, _, bottom, _]) = self.tree.nodes[n].sticky else {
+                continue;
+            };
+            let Some(parent) = self.tree.nodes[n].parent else {
+                continue;
+            };
+            let (_, y) = self.absolute_position(n);
+            let (_, parent_y) = self.absolute_position(parent);
+            let parent_h = self.tree.nodes[parent].layout.size.height;
+            let h = self.tree.nodes[n].layout.size.height;
+            let mut at = y;
+            if let Some(b) = bottom {
+                at = at.min(viewport.height - b - h);
+            }
+            if let Some(t) = top {
+                at = at.max(t);
+            }
+            let at = at.min(parent_y + parent_h - h).max(parent_y.min(y));
+            if (at - y).abs() > f32::EPSILON {
+                self.tree.nodes[n].layout.location.y += at - y;
+            }
+        }
     }
 
     /// The matrix of every node, if any has a `transform`: the node's own
