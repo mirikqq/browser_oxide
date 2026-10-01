@@ -2,6 +2,10 @@
 // `layout_corpus` test compares the engine against.
 //
 //   node tests/layout_corpus/snapshot.mjs [case-name ...]
+//   node tests/layout_corpus/snapshot.mjs --real [page-name ...]
+//
+// `--real` records every element of the pages in `real/` (made by prepare.mjs), in
+// document order, instead of the elements with an `id`.
 //
 // Needs Google Chrome and Node >= 22. No network: the cases are local files.
 import { spawn } from "node:child_process";
@@ -11,8 +15,9 @@ import { join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const casesDir = join(here, "cases");
-const outDir = join(here, "chrome");
+const real = process.argv.includes("--real");
+const casesDir = join(here, real ? "real" : "cases");
+const outDir = real ? join(here, "real") : join(here, "chrome");
 const CHROME =
   process.env.CHROME || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const VIEWPORT = { width: 1512, height: 871 };
@@ -71,7 +76,16 @@ const COLLECT = `(() => {
   return JSON.stringify({ viewport: [innerWidth, innerHeight], rects, client });
 })()`;
 
-const wanted = process.argv.slice(2);
+const COLLECT_ALL = `(() => {
+  const round = (n) => Math.round(n * 1000) / 1000;
+  const all = [...document.querySelectorAll("*")].map((e) => {
+    const b = e.getBoundingClientRect();
+    return [e.localName, round(b.x), round(b.y), round(b.width), round(b.height)];
+  });
+  return JSON.stringify({ viewport: [innerWidth, innerHeight], all });
+})()`;
+
+const wanted = process.argv.slice(2).filter((a) => a !== "--real");
 const cases = readdirSync(casesDir)
   .filter((f) => f.endsWith(".html"))
   .filter((f) => !wanted.length || wanted.includes(basename(f, ".html")));
@@ -90,12 +104,12 @@ try {
     });
     await send("Page.navigate", { url: "file://" + join(casesDir, file) }, sessionId);
     await loaded;
-    const { result } = await send("Runtime.evaluate", { expression: COLLECT, returnByValue: true }, sessionId);
+    const { result } = await send("Runtime.evaluate", { expression: real ? COLLECT_ALL : COLLECT, returnByValue: true }, sessionId);
     const data = JSON.parse(result.value);
     if (data.viewport[0] !== VIEWPORT.width || data.viewport[1] !== VIEWPORT.height)
       throw new Error(`${file}: viewport ${data.viewport} is not ${VIEWPORT.width}x${VIEWPORT.height}`);
     writeFileSync(join(outDir, basename(file, ".html") + ".json"), JSON.stringify(data, null, 1) + "\n");
-    console.log("recorded", file, Object.keys(data.rects).length, "elements");
+    console.log("recorded", file, (real ? data.all : Object.keys(data.rects)).length, "elements");
     await send("Target.closeTarget", { targetId });
   }
 } finally {

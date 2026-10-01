@@ -61,3 +61,5 @@ release-title.txt
 release-notes.md
 
 crates/browser_oxide_py/target
+# Saved pages that belong to other people: compared locally, never committed
+crates/browser_oxide/tests/layout_corpus/real/
