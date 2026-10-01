@@ -197,8 +197,11 @@ impl LayoutEngine {
                 dom_of,
                 |id| Some(full.tree.nodes[usize::from(id)].layout),
                 |id| {
-                    full.tree.nodes[usize::from(id)]
-                        .children
+                    let node = &full.tree.nodes[usize::from(id)];
+                    if node.paint_hidden {
+                        return Vec::new();
+                    }
+                    node.children
                         .iter()
                         .map(|c| taffy::NodeId::from(*c))
                         .collect()

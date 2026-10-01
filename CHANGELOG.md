@@ -101,6 +101,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sticky` at its static position, percentage heights in auto-height flex
   containers counting as `auto`, and line breaks between ASCII symbols following
   a table measured in Chrome (`text/breaks.rs`).
+  `<details>`: the contents are in a block formatting context after the summary;
+  closed, they are laid out (they have rectangles, as in Chrome) in a box of no
+  height and not drawn.
   New dependencies: `unicode-linebreak`
   (Apache-2.0), `unicode-width` (MIT OR Apache-2.0). New properties parsed:
   `grid-template-columns`/`-rows`, `border-collapse`, `border-spacing`,

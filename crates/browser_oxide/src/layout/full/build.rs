@@ -618,6 +618,44 @@ impl<'a> Builder<'a> {
         } else {
             self.assemble(id)
         };
+        // The contents of a closed disclosure are laid out, so that they have
+        // rectangles, in a box of no height after the summary (which also keeps
+        // the summary's bottom margin from collapsing out of the element).
+        if tag == "details" && elem.is_some() {
+            let open = attrs
+                .iter()
+                .any(|a| a.name.local.eq_ignore_ascii_case("open"));
+            let summary = self
+                .dom
+                .children(id)
+                .into_iter()
+                .find(|&c| self.tag(c) == "summary")
+                .and_then(|c| self.dom_to_node.get(&c.to_raw()).copied());
+            let (kept, contents): (Vec<usize>, Vec<usize>) =
+                children.iter().partition(|&&c| Some(c) == summary);
+            // Closed, the slot has no height; either way it is a block formatting
+            // context, so the margins of its contents stay inside the element.
+            let slot = Style {
+                display: taffy::Display::Block,
+                size: Size {
+                    width: Dimension::auto(),
+                    height: if open {
+                        Dimension::auto()
+                    } else {
+                        Dimension::length(0.0)
+                    },
+                },
+                overflow: taffy::Point {
+                    x: taffy::Overflow::Hidden,
+                    y: taffy::Overflow::Hidden,
+                },
+                ..Default::default()
+            };
+            let slot = self.tree.add(slot, contents);
+            self.tree.nodes[slot].paint_hidden = !open;
+            children = kept;
+            children.push(slot);
+        }
         // The marker of a list item is a line of its own when the item holds nothing.
         let marker_shown = !matches!(
             computed.get(&PropertyId::ListStyleType),

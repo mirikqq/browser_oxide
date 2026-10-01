@@ -74,6 +74,9 @@ pub struct Node {
     pub lift: ifc::Lift,
     /// `order`, which sorts the items of a flex or grid container.
     pub order: i32,
+    /// Laid out, so that it has rectangles, but not drawn: the contents of a closed
+    /// disclosure.
+    pub paint_hidden: bool,
     /// `transform`, applied to the rectangles the box reports.
     pub transform: Option<Vec<crate::css_values::types::transform::TransformFunction>>,
     cache: Cache,
@@ -130,6 +133,7 @@ impl Tree {
             lift: ifc::Lift::default(),
             order: 0,
             transform: None,
+            paint_hidden: false,
             cache: Cache::new(),
             layout: Layout::with_order(0),
             children,
