@@ -266,6 +266,15 @@ impl Builder {
         });
     }
 
+    /// The marker of an out-of-flow box: it is no content, so the spaces around it
+    /// collapse as if it were not there.
+    pub fn marker(&mut self, node: usize) {
+        self.atoms.push(Atom {
+            kind: AtomKind::Atomic { node },
+            brk: Brk::None,
+        });
+    }
+
     /// `<wbr>`: a place where the line may end, and nothing else.
     pub fn break_opportunity(&mut self) {
         if let Some(last) = self.atoms.last_mut() {
@@ -669,6 +678,18 @@ fn baseline_of(tree: &Tree, node: usize) -> Option<f32> {
     if n.ifc.is_some() {
         return n.baseline;
     }
+    // A flex or grid container takes the baseline of its first item, or the bottom
+    // edge of that item when it has none.
+    if matches!(n.style.display, taffy::Display::Flex | taffy::Display::Grid) {
+        return n
+            .children
+            .iter()
+            .find(|&&c| tree.nodes[c].style.position != taffy::Position::Absolute)
+            .map(|&c| {
+                let item = &tree.nodes[c];
+                item.layout.location.y + baseline_of(tree, c).unwrap_or(item.layout.size.height)
+            });
+    }
     n.children
         .iter()
         .rev()
@@ -710,6 +731,14 @@ impl Ifc {
                     break;
                 }
                 j += 1;
+            }
+            // The marker of an out-of-flow box takes no room and does not keep the
+            // space before it from being trimmed at the end of the line.
+            if (i..=j)
+                .all(|k| matches!(self.atoms[k].kind, AtomKind::Atomic { .. }) && atomics[k].marker)
+            {
+                i = j + 1;
+                continue;
             }
             let forced = self.atoms[j].brk == Brk::Forced;
             let fits = !has_content || used + trailing + chunk <= avail + 0.001;

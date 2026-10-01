@@ -900,7 +900,7 @@ impl<'a> Builder<'a> {
         match run {
             Some((b, atomics)) if !flex_or_grid && b.is_visible() => {
                 atomics.push(mark);
-                b.atomic(mark);
+                b.marker(mark);
             }
             _ => out.push(mark),
         }

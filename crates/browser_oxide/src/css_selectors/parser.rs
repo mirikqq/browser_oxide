@@ -508,7 +508,7 @@ impl<'a> SelectorParser<'a> {
                         match self.current_kind() {
                             TokenKind::CloseParen if depth == 0 => break,
                             TokenKind::Eof => break,
-                            TokenKind::OpenParen => {
+                            TokenKind::OpenParen | TokenKind::Function(_) => {
                                 depth += 1;
                                 if let Some(t) = self.current_token() {
                                     inner_tokens.push(t.clone());
@@ -630,7 +630,7 @@ impl<'a> SelectorParser<'a> {
             match self.current_kind() {
                 TokenKind::CloseParen if depth == 0 => break,
                 TokenKind::Eof => break,
-                TokenKind::OpenParen => {
+                TokenKind::OpenParen | TokenKind::Function(_) => {
                     depth += 1;
                     if let Some(t) = self.current_token() {
                         tokens.push(t.clone());

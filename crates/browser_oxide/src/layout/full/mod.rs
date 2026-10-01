@@ -261,11 +261,34 @@ fn calc_of(v: &CssValue) -> Option<&CalcExpr> {
 /// The legacy mapping turns `calc()` into `auto` or zero; put the expressions
 /// back, for taffy to resolve against the box they belong to.
 fn apply_calc(tree: &mut Tree, computed: &ComputedStyle, ts: &mut taffy::Style, cc: CalcContext) {
-    let mut handle = |p: PropertyId| computed.get(&p).and_then(calc_of).map(|e| tree.calc(e, cc));
+    /// A `calc()` that does not depend on its percentage basis is a plain length:
+    /// taffy cannot resolve one where no basis is known, as in intrinsic sizing.
+    enum Calc {
+        Length(f32),
+        Pointer(*const ()),
+    }
+    let mut handle = |p: PropertyId| {
+        computed.get(&p).and_then(calc_of).map(|e| {
+            let at = |base: f64| {
+                e.evaluate(&CalcContext {
+                    percentage_base_px: base,
+                    ..cc
+                })
+            };
+            let (a, b) = (at(0.0), at(1000.0));
+            if (a - b).abs() < 1e-6 {
+                Calc::Length(a as f32)
+            } else {
+                Calc::Pointer(tree.calc(e, cc))
+            }
+        })
+    };
     macro_rules! set {
         ($field:expr, $prop:expr, $ty:ty) => {
-            if let Some(ptr) = handle($prop) {
-                $field = <$ty>::calc(ptr);
+            match handle($prop) {
+                Some(Calc::Length(v)) => $field = <$ty>::length(v),
+                Some(Calc::Pointer(ptr)) => $field = <$ty>::calc(ptr),
+                None => {}
             }
         };
     }
