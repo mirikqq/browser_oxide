@@ -20,7 +20,9 @@ const casesDir = join(here, real ? "real" : "cases");
 const outDir = real ? join(here, "real") : join(here, "chrome");
 const CHROME =
   process.env.CHROME || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+// The macOS profile the engine runs as: a 1512x871 CSS-pixel window at 2x.
 const VIEWPORT = { width: 1512, height: 871 };
+const DPR = 2;
 const PORT = 9300 + Math.floor(Math.random() * 500);
 
 const profile = mkdtempSync(join(tmpdir(), "layout-corpus-"));
@@ -73,7 +75,7 @@ const COLLECT = `(() => {
     rects[e.id] = box(e.getBoundingClientRect());
     client[e.id] = [...e.getClientRects()].map(box);
   }
-  return JSON.stringify({ viewport: [innerWidth, innerHeight], rects, client });
+  return JSON.stringify({ viewport: [innerWidth, innerHeight], dpr: devicePixelRatio, rects, client });
 })()`;
 
 const COLLECT_ALL = `(() => {
@@ -82,7 +84,7 @@ const COLLECT_ALL = `(() => {
     const b = e.getBoundingClientRect();
     return [e.localName, round(b.x), round(b.y), round(b.width), round(b.height)];
   });
-  return JSON.stringify({ viewport: [innerWidth, innerHeight], all });
+  return JSON.stringify({ viewport: [innerWidth, innerHeight], dpr: devicePixelRatio, all });
 })()`;
 
 const wanted = process.argv.slice(2).filter((a) => a !== "--real");
@@ -96,7 +98,7 @@ try {
     const { sessionId } = await send("Target.attachToTarget", { targetId, flatten: true });
     await send("Page.enable", {}, sessionId);
     await send("Emulation.setDeviceMetricsOverride",
-      { ...VIEWPORT, deviceScaleFactor: 1, mobile: false }, sessionId);
+      { ...VIEWPORT, deviceScaleFactor: DPR, mobile: false }, sessionId);
     await send("Emulation.setScrollbarsHidden", { hidden: true }, sessionId);
     const loaded = new Promise((r) => {
       const l = (m) => { if (m.sessionId === sessionId && m.method === "Page.loadEventFired") r(); };

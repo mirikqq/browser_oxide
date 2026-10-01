@@ -58,7 +58,7 @@ try {
   const { sessionId } = await send("Target.attachToTarget", { targetId, flatten: true });
   await send("Page.enable", {}, sessionId);
   await send("Emulation.setDeviceMetricsOverride",
-    { width: 1512, height: 871, deviceScaleFactor: 1, mobile: false }, sessionId);
+    { width: 1512, height: 871, deviceScaleFactor: 2, mobile: false }, sessionId);
   await send("Emulation.setScrollbarsHidden", { hidden: true }, sessionId);
   const loaded = new Promise((r) =>
     listeners.push((m) => m.sessionId === sessionId && m.method === "Page.loadEventFired" && r()));

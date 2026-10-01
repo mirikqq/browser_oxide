@@ -26,7 +26,7 @@ const COLLECT: &str = "(() => {\
         const b = e.getBoundingClientRect();\
         return [e.localName, b.x, b.y, b.width, b.height];\
     });\
-    return JSON.stringify({viewport: [innerWidth, innerHeight], all});\
+    return JSON.stringify({viewport: [innerWidth, innerHeight], dpr: devicePixelRatio, all});\
 })()";
 
 fn dir() -> PathBuf {
@@ -131,6 +131,10 @@ async fn real_pages_against_chrome() {
             page.set_layout_mode(mode);
             let got: Value =
                 serde_json::from_str(&page.evaluate(COLLECT).expect("evaluate")).unwrap();
+            assert_eq!(
+                got["dpr"], reference["dpr"],
+                "{name}: device pixel ratio differs"
+            );
             let engine = got["all"].as_array().cloned().unwrap_or_default();
             if engine.len() != chrome.len() {
                 println!(

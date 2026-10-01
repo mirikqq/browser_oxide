@@ -31,7 +31,7 @@ const COLLECT: &str = "(() => {\
         r[e.id] = box(e.getBoundingClientRect());\
         c[e.id] = [...e.getClientRects()].map(box);\
     }\
-    return JSON.stringify({viewport: [innerWidth, innerHeight], rects: r, client: c});\
+    return JSON.stringify({viewport: [innerWidth, innerHeight], dpr: devicePixelRatio, rects: r, client: c});\
 })()";
 
 struct Case {
@@ -79,6 +79,11 @@ fn compare(page: &mut Page, case: &Case) -> (usize, usize, Vec<String>) {
         numbers(&got["viewport"]),
         numbers(&case.reference["viewport"]),
         "{}: engine and Chrome disagree about the viewport",
+        case.name
+    );
+    assert_eq!(
+        got["dpr"], case.reference["dpr"],
+        "{}: engine and Chrome disagree about the device pixel ratio",
         case.name
     );
     let (mut matched, mut total, mut misses) = (0, 0, Vec::new());

@@ -2,7 +2,8 @@
 // stylesheets inlined, scripts and images dropped) and set in the same fonts
 // everywhere (web fonts removed, every font-family reduced to Arial, Times New
 // Roman or Courier New, which the bundled faces match metrically). What is left to
-// differ is layout.
+// differ is layout. An image has lost its file, so it also loses its `alt`: a broken
+// image with alt text lays out as that text, which is not what is being compared.
 //
 //   node tests/layout_corpus/prepare.mjs <page.html> [name]
 //
@@ -48,6 +49,7 @@ html = html
   .replace(/\s(?:src|srcset)=["'][^"']*["']/gi, (m, off, whole) =>
     /<img\b[^>]*$/i.test(whole.slice(Math.max(0, off - 400), off)) ? "" : m,
   )
+  .replace(/<img\b[^>]*>/gi, (tag) => tag.replace(/\salt=("[^"]*"|'[^']*')/gi, ""))
   .replace(/<base\b[^>]*>/gi, "");
 
 mkdirSync(join(here, "real"), { recursive: true });
