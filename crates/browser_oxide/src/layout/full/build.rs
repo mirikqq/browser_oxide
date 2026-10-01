@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use taffy::util::{MaybeResolve, ResolveOrZero};
 use taffy::{Dimension, Size, Style};
 
-use super::font::{line_height_px, FontSpec, Metrics};
+use super::font::{family_list, line_height_px, FontSpec, Metrics};
 use super::ifc::{self, InlineBox, Root};
 use super::tree::{GroupKind, Role, TableStyle, Tree, VAlign};
 use super::{apply_calc, grid};
@@ -49,6 +49,8 @@ enum Part {
     Node(DomId),
     /// Text a pseudo-element generates, in the style of the given pseudo-element.
     Text(DomId, String),
+    /// An image a pseudo-element generates, with its natural size.
+    Image(f32, f32),
 }
 
 enum Work {
@@ -75,6 +77,9 @@ pub(super) struct Builder<'a> {
     /// Boxes with a percentage vertical padding or margin, which taffy resolves
     /// against the parent's height instead of its width.
     pub vertical_percent: Vec<usize>,
+    /// Each out-of-flow box with the empty box that stands where it would have
+    /// been in the flow of its parent, for finding its static position.
+    pub static_pending: Vec<(usize, usize)>,
     /// Parsed fonts and their metrics, by what makes them different.
     fonts: RefCell<HashMap<FontKey, (ParsedFont, Metrics)>>,
 }
@@ -115,6 +120,7 @@ impl<'a> Builder<'a> {
             css_position: HashMap::new(),
             css_display: HashMap::new(),
             vertical_percent: Vec::new(),
+            static_pending: Vec::new(),
             fonts: RefCell::new(HashMap::new()),
         }
     }
@@ -270,6 +276,19 @@ impl<'a> Builder<'a> {
         out
     }
 
+    /// A replaced box of a given size, for an image in generated content.
+    fn image_box(&mut self, w: f32, h: f32) -> usize {
+        let style = Style {
+            display: taffy::Display::Block,
+            size: Size {
+                width: Dimension::length(w),
+                height: Dimension::length(h),
+            },
+            ..Default::default()
+        };
+        self.tree.add(style, Vec::new())
+    }
+
     /// The boxes below `id` that the walk visits.
     fn child_ids(&self, id: DomId) -> Vec<DomId> {
         if self.styles.is_pseudo(id) {
@@ -279,7 +298,7 @@ impl<'a> Builder<'a> {
             .into_iter()
             .filter_map(|p| match p {
                 Part::Node(c) => Some(c),
-                Part::Text(..) => None,
+                Part::Text(..) | Part::Image(..) => None,
             })
             .collect()
     }
@@ -318,8 +337,10 @@ impl<'a> Builder<'a> {
                         .unwrap_or_default(),
                     ContentItem::OpenQuote => "\u{201C}".to_string(),
                     ContentItem::CloseQuote => "\u{201D}".to_string(),
-                    ContentItem::Url(_)
-                    | ContentItem::NoOpenQuote
+                    ContentItem::Url(url) => {
+                        return super::image::natural_size(url).map(|(w, h)| Part::Image(w, h))
+                    }
+                    ContentItem::NoOpenQuote
                     | ContentItem::NoCloseQuote
                     | ContentItem::Counter(_) => return None,
                 };
@@ -425,6 +446,16 @@ impl<'a> Builder<'a> {
         } else {
             self.assemble(id)
         };
+        // A button centres its content vertically: the content is one block in a
+        // column the button centres.
+        let is_button = elem.is_some() && tag == "button";
+        if is_button && !children.is_empty() {
+            let inner = Style {
+                display: taffy::Display::Block,
+                ..Default::default()
+            };
+            children = vec![self.tree.add(inner, std::mem::take(&mut children))];
+        }
         // A positioned box is a containing block for the absolutes beneath
         // it; `fixed` keeps rising to the viewport.
         if !matches!(position, CssPosition::Static) {
@@ -439,6 +470,16 @@ impl<'a> Builder<'a> {
         }
 
         let mut style = computed_to_taffy(computed, &ctx);
+        let control_baseline = if elem.is_some() {
+            self.size_control(id, &tag, attrs, computed, font_size, &mut style)
+        } else {
+            None
+        };
+        if is_button && style.display == taffy::Display::Block {
+            style.display = taffy::Display::Flex;
+            style.flex_direction = taffy::FlexDirection::Column;
+            style.justify_content = Some(taffy::AlignContent::CENTER);
+        }
         // A box that starts a block formatting context keeps the margins of
         // its children inside; taffy does that for scroll containers.
         let clips = [PropertyId::OverflowX, PropertyId::OverflowY]
@@ -572,6 +613,7 @@ impl<'a> Builder<'a> {
         }
         let id_node = self.tree.add(style, children);
         self.tree.nodes[id_node].role = role;
+        self.tree.nodes[id_node].control_baseline = control_baseline;
         if role == Role::Table {
             self.tree.nodes[id_node].table = Some(self.table_style(computed));
         }
@@ -632,6 +674,204 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// The size of a form control that sets none of its own, as Blink works it out:
+    /// a text field is as wide as `size` average characters, a textarea as `cols`
+    /// plus its scrollbar and as high as `rows` lines, a button as its label.
+    fn size_control(
+        &self,
+        id: DomId,
+        tag: &str,
+        attrs: &[crate::dom::node::Attribute],
+        computed: &ComputedStyle,
+        font_size: f32,
+        style: &mut Style,
+    ) -> Option<f32> {
+        let attr = |name: &str| {
+            attrs
+                .iter()
+                .find(|a| a.name.local.eq_ignore_ascii_case(name))
+                .map(|a| a.value.trim().to_string())
+        };
+        let kind = match tag {
+            "input" => attr("type").unwrap_or_default().to_ascii_lowercase(),
+            "textarea" => "textarea".to_string(),
+            "select" => "select".to_string(),
+            _ => return None,
+        };
+        let ctx = ResolveContext {
+            font_size,
+            ..*self.ctx
+        };
+        let (font, metrics) = self.font(computed, font_size);
+        let lh = line_height_px(computed, font_size, &metrics, &ctx);
+        let lp = |v: taffy::LengthPercentage| v.resolve_or_zero(None, |_, _| 0.0);
+        let edges_w = lp(style.padding.left)
+            + lp(style.padding.right)
+            + lp(style.border.left)
+            + lp(style.border.right);
+        let edges_h = lp(style.padding.top)
+            + lp(style.padding.bottom)
+            + lp(style.border.top)
+            + lp(style.border.bottom);
+        let border_box = style.box_sizing == taffy::BoxSizing::BorderBox;
+        // Blink sets a field's width from the average width of a character, which
+        // it takes as half an em for the usual faces and 0.6 em for monospace.
+        let mono = {
+            let f = family_list(computed).to_ascii_lowercase();
+            ["mono", "courier", "consolas", "menlo"]
+                .iter()
+                .any(|m| f.contains(m))
+        };
+        let (avg, extra) = if mono {
+            ((0.6 * font_size).round(), (0.25 * font_size).round())
+        } else {
+            ((0.5 * font_size).round(), (0.4 * font_size).round())
+        };
+        let count = |name: &str, default: f32| {
+            attr(name)
+                .and_then(|v| v.parse::<f32>().ok())
+                .filter(|n| *n > 0.0)
+                .map_or(default, f32::floor)
+        };
+        let label = |default: &str| {
+            let text = attr("value").filter(|v| !v.is_empty());
+            ifc::text_width(text.as_deref().unwrap_or(default), &font, self.os)
+        };
+        // Border-box width and height the control asks for.
+        let (w, h) = match kind.as_str() {
+            "checkbox" | "radio" | "hidden" | "image" | "range" | "color" | "file" | "date"
+            | "datetime-local" | "month" | "week" | "time" => return None,
+            "button" | "submit" | "reset" => {
+                let default = match kind.as_str() {
+                    "submit" => "Submit",
+                    "reset" => "Reset",
+                    _ => "",
+                };
+                (label(default) + edges_w, lh + edges_h)
+            }
+            // A drop-down is as wide as its widest option and the arrow.
+            "select" if attr("multiple").is_none() && count("size", 1.0) <= 1.0 => {
+                let widest = self
+                    .option_texts(id)
+                    .iter()
+                    .map(|t| ifc::text_width(t, &font, self.os))
+                    .fold(0.0f32, f32::max);
+                (widest.ceil() + 18.0, metrics.ascent + metrics.descent + 4.0)
+            }
+            "select" => return None,
+            "textarea" => (
+                count("cols", 20.0) * avg + 16.0 + edges_w,
+                count("rows", 2.0) * lh + edges_h,
+            ),
+            _ => (count("size", 20.0) * avg + extra + edges_w, lh + edges_h),
+        };
+        let (w, h) = if border_box {
+            (w, h)
+        } else {
+            (w - edges_w, h - edges_h)
+        };
+        if style.size.width.is_auto() {
+            style.size.width = Dimension::length(w);
+        }
+        if style.size.height.is_auto() {
+            style.size.height = Dimension::length(h);
+        }
+        // The baseline of the text inside: at the top edge of a field and its
+        // first line, centred in a button or a drop-down.
+        let (asc_l, _) = metrics.with_leading(lh);
+        let total_h = if border_box { h } else { h + edges_h };
+        Some(match kind.as_str() {
+            "button" | "submit" | "reset" | "select" => {
+                (total_h - (metrics.ascent + metrics.descent)) / 2.0 + metrics.ascent
+            }
+            _ => lp(style.border.top) + lp(style.padding.top) + asc_l,
+        })
+    }
+
+    /// The text of every `<option>` under the `<select>` `id`.
+    fn option_texts(&self, id: DomId) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = self.dom.children(id);
+        stack.reverse();
+        while let Some(n) = stack.pop() {
+            let Some(e) = self.dom.get(n).and_then(|n| n.as_element()) else {
+                continue;
+            };
+            match &*e.name.local.to_ascii_lowercase() {
+                "option" => out.push(
+                    self.dom
+                        .text_content(n)
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ),
+                "optgroup" => stack.extend(self.dom.children(n).into_iter().rev()),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Leave an empty box where the out-of-flow `c` would have been in the flow of
+    /// `cont`; once laid out, it says where `c` goes when its offsets are `auto`.
+    /// In a flex or grid container the box is itself out of flow, so that those
+    /// algorithms pick the position; table containers get none.
+    fn mark_static_position(
+        &mut self,
+        cont: DomId,
+        c: DomId,
+        run: &mut Option<(ifc::Builder, Vec<usize>)>,
+        out: &mut Vec<usize>,
+    ) {
+        let Some(&abs) = self.dom_to_node.get(&c.to_raw()) else {
+            return;
+        };
+        let document = self
+            .dom
+            .get(cont)
+            .is_some_and(|n| matches!(n.data, NodeData::Document | NodeData::DocumentFragment));
+        let display = self.display_of(cont);
+        let flex_or_grid = matches!(
+            display,
+            CssDisplay::Flex | CssDisplay::InlineFlex | CssDisplay::Grid | CssDisplay::InlineGrid
+        );
+        let in_flow = document
+            || matches!(
+                display,
+                CssDisplay::Block
+                    | CssDisplay::Inline
+                    | CssDisplay::InlineBlock
+                    | CssDisplay::FlowRoot
+                    | CssDisplay::ListItem
+            );
+        if !in_flow && !flex_or_grid {
+            return;
+        }
+        let empty = Style {
+            display: taffy::Display::Block,
+            position: if flex_or_grid {
+                taffy::Position::Absolute
+            } else {
+                taffy::Position::Relative
+            },
+            size: Size {
+                width: Dimension::length(0.0),
+                height: Dimension::length(0.0),
+            },
+            ..Default::default()
+        };
+        let mark = self.tree.add(empty, Vec::new());
+        self.tree.nodes[mark].role = Role::Marker;
+        self.static_pending.push((abs, mark));
+        match run {
+            Some((b, atomics)) if !flex_or_grid && b.is_visible() => {
+                atomics.push(mark);
+                b.atomic(mark);
+            }
+            _ => out.push(mark),
+        }
+    }
+
     /// The boxes inside the container `cont`: its block-level children, and an
     /// anonymous block for each run of inline content between them.
     fn assemble(&mut self, cont: DomId) -> Vec<usize> {
@@ -642,6 +882,14 @@ impl<'a> Builder<'a> {
                 Part::Text(owner, text) => {
                     let (b, _) = run.get_or_insert_with(|| (self.run_builder(cont), Vec::new()));
                     self.add_text(b, owner, &text, cont);
+                    continue;
+                }
+                Part::Image(w, h) => {
+                    let n = self.image_box(w, h);
+                    let (b, atomics) =
+                        run.get_or_insert_with(|| (self.run_builder(cont), Vec::new()));
+                    atomics.push(n);
+                    b.atomic(n);
                     continue;
                 }
                 Part::Node(c) => c,
@@ -664,6 +912,7 @@ impl<'a> Builder<'a> {
                 self.position_of(c),
                 CssPosition::Absolute | CssPosition::Fixed
             ) {
+                self.mark_static_position(cont, c, &mut run, &mut out);
                 continue;
             }
             match self.level(c) {
@@ -796,6 +1045,13 @@ impl<'a> Builder<'a> {
                         Part::Text(owner, t) => {
                             if let Some((b, _)) = run.as_mut() {
                                 self.add_text(b, owner, &t, id);
+                            }
+                        }
+                        Part::Image(w, h) => {
+                            let n = self.image_box(w, h);
+                            if let Some((b, atomics)) = run.as_mut() {
+                                atomics.push(n);
+                                b.atomic(n);
                             }
                         }
                         Part::Node(c) => match self.dom.get(c).map(|n| &n.data) {

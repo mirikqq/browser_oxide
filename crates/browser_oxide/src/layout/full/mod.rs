@@ -24,6 +24,7 @@ mod build;
 pub(crate) mod font;
 mod grid;
 pub mod ifc;
+mod image;
 mod table;
 pub mod tree;
 
@@ -61,6 +62,7 @@ impl FullLayout {
         b.build(&mut on_style);
         let root = b.dom_to_node.get(&DomId::DOCUMENT.to_raw()).copied();
         let vertical_percent = std::mem::take(&mut b.vertical_percent);
+        let static_pending = std::mem::take(&mut b.static_pending);
         let block_in_inline = std::mem::take(&mut b.block_in_inline);
         let mut layout = Self {
             tree: b.tree,
@@ -81,12 +83,51 @@ impl FullLayout {
                 layout.tree.compute(root, available);
             }
         }
+        if layout.root.is_some() && layout.place_out_of_flow(&static_pending) {
+            if let Some(root) = layout.root {
+                layout.tree.compute(
+                    root,
+                    Size {
+                        width: AvailableSpace::Definite(viewport.width),
+                        height: AvailableSpace::Definite(viewport.height),
+                    },
+                );
+            }
+        }
         for (n, node) in layout.tree.nodes.iter().enumerate() {
             for (f, frag) in node.frags.iter().enumerate() {
                 layout.inline.entry(frag.dom).or_default().push((n, f));
             }
         }
         layout
+    }
+
+    /// Give each out-of-flow box whose offsets are `auto` the position of the empty
+    /// box that marks where it would have been in the flow. Whether any changed.
+    fn place_out_of_flow(&mut self, pending: &[(usize, usize)]) -> bool {
+        let mut changed = false;
+        for &(abs, mark) in pending {
+            let Some(cb) = self.tree.nodes[abs].parent else {
+                continue;
+            };
+            let (mx, my) = self.absolute_position(mark);
+            let (cx, cy) = self.absolute_position(cb);
+            let border = self.tree.nodes[cb].layout.border;
+            let (ox, oy) = (cx + border.left, cy + border.top);
+            let inset = &mut self.tree.nodes[abs].style.inset;
+            if inset.left.is_auto() && inset.right.is_auto() {
+                inset.left = LengthPercentageAuto::length(mx - ox);
+                changed = true;
+            }
+            if inset.top.is_auto() && inset.bottom.is_auto() {
+                inset.top = LengthPercentageAuto::length(my - oy);
+                changed = true;
+            }
+        }
+        if changed {
+            self.tree.clear_caches();
+        }
+        changed
     }
 
     /// `(x, y)` of a node's border box in document coordinates.

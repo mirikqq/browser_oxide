@@ -26,6 +26,8 @@ pub enum Role {
     Group(GroupKind),
     Row,
     Cell,
+    /// An empty box left in the flow where an out-of-flow box would have been.
+    Marker,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -66,6 +68,8 @@ pub struct Node {
     pub frags: Vec<Frag>,
     /// Baseline of the last line of inline content, from the top of the node.
     pub baseline: Option<f32>,
+    /// The baseline of a form control, which draws its own text.
+    pub control_baseline: Option<f32>,
     cache: Cache,
     pub layout: Layout,
     pub children: Vec<usize>,
@@ -116,6 +120,7 @@ impl Tree {
             ifc,
             frags: Vec::new(),
             baseline: None,
+            control_baseline: None,
             cache: Cache::new(),
             layout: Layout::with_order(0),
             children,

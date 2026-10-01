@@ -19,7 +19,7 @@ use taffy::{
 };
 
 use crate::css_values::types::display::{TextAlign, WhiteSpace};
-use crate::layout::full::tree::{resolve_calc, Tree};
+use crate::layout::full::tree::{resolve_calc, Role, Tree};
 use crate::text::fallback::hermetic_segments;
 use crate::text::{shaper, ParsedFont};
 
@@ -180,6 +180,11 @@ impl Builder {
             prev_space: true,
             visible: false,
         }
+    }
+
+    /// Whether anything that takes room has been added.
+    pub fn is_visible(&self) -> bool {
+        self.visible
     }
 
     pub fn open(&mut self, b: InlineBox) {
@@ -404,6 +409,11 @@ fn units_of(text: &str, preserve: bool) -> Vec<Unit> {
 /// `prefix[b]`: the advance of the first `b` bytes of `text`. Measured with the
 /// bundled faces only, and with fixed advances for what no bundled face draws, so
 /// geometry never depends on which fonts the host has.
+/// The width of `text` set in `font` on one line, as lines are measured.
+pub(super) fn text_width(text: &str, font: &ParsedFont, os: &str) -> f32 {
+    prefix_widths(text, font, os).last().copied().unwrap_or(0.0)
+}
+
 fn prefix_widths(text: &str, font: &ParsedFont, os: &str) -> Vec<f32> {
     let size = font.size_px;
     let mut prefix = vec![0.0f32; text.len() + 1];
@@ -465,6 +475,9 @@ struct AtomicBox {
     mb: f32,
     /// Distance from the top of the border box to its baseline, if it has one.
     baseline: Option<f32>,
+    /// Stands for an out-of-flow box: it sits at the top of its line, which is
+    /// where the box's static position is.
+    marker: bool,
 }
 
 impl AtomicBox {
@@ -601,6 +614,7 @@ fn size_atomic(tree: &mut Tree, node: usize, fit: f32, basis: f32) -> AtomicBox 
         mt,
         mb,
         baseline: baseline_of(tree, node),
+        marker: tree.nodes[node].role == Role::Marker,
     }
 }
 
@@ -608,6 +622,9 @@ fn size_atomic(tree: &mut Tree, node: usize, fit: f32, basis: f32) -> AtomicBox 
 /// box: the baseline an `inline-block` takes. `None` if it holds no text.
 fn baseline_of(tree: &Tree, node: usize) -> Option<f32> {
     let n = &tree.nodes[node];
+    if n.control_baseline.is_some() {
+        return n.control_baseline;
+    }
     if n.ifc.is_some() {
         return n.baseline;
     }
@@ -705,17 +722,14 @@ fn place(ifc: &Ifc, atomics: &[AtomicBox], avail: f32) -> Placed {
     let mut open: Vec<usize> = Vec::new();
     let mut top = 0.0f32;
     for line in &lines {
-        let text = line
-            .atoms
-            .clone()
-            .any(|i| matches!(ifc.atoms[i].kind, AtomKind::Text { .. } | AtomKind::Break));
-        let strut = text || !ifc.root.quirks;
-        let (mut asc, mut desc) = if strut {
-            (ifc.root.asc_l, ifc.root.desc_l)
-        } else {
-            (0.0, 0.0)
-        };
+        // Leading can be negative, so nothing starts from zero.
+        let (mut asc, mut desc) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
         let mut touched: Vec<usize> = open.clone();
+        // Text of the block itself, and of each inline box.
+        let mut root_text = false;
+        let mut root_break = false;
+        let mut content = false;
+        let mut boxes_with_text: Vec<usize> = Vec::new();
         for i in line.atoms.clone() {
             match ifc.atoms[i].kind {
                 AtomKind::Open(b) => {
@@ -726,21 +740,42 @@ fn place(ifc: &Ifc, atomics: &[AtomicBox], avail: f32) -> Placed {
                     touched.push(b);
                     open.retain(|&x| x != b);
                 }
-                AtomKind::Text { .. } => touched.extend(open.iter().copied()),
+                AtomKind::Text { .. } | AtomKind::Break => {
+                    let is_break = matches!(ifc.atoms[i].kind, AtomKind::Break);
+                    root_text |= open.is_empty() && !is_break;
+                    root_break |= open.is_empty() && is_break;
+                    content |= !is_break;
+                    boxes_with_text.extend(open.iter().copied());
+                    touched.extend(open.iter().copied());
+                }
                 AtomKind::Atomic { .. } => {
+                    content = true;
                     touched.extend(open.iter().copied());
                     asc = asc.max(atomics[i].ascent());
                     desc = desc.max(atomics[i].descent());
                 }
-                AtomKind::Break => {}
             }
+        }
+        // Quirks mode: the strut counts only on a line with text of the block
+        // itself, and an inline box counts only if it holds text or has edges.
+        // A line of nothing but a break keeps the strut: it is an empty line.
+        if root_text || (root_break && !content) || !ifc.root.quirks {
+            asc = asc.max(ifc.root.asc_l);
+            desc = desc.max(ifc.root.desc_l);
         }
         for b in touched {
             let bx = &ifc.boxes[b];
-            if strut || bx.left() > 0.0 || bx.right() > 0.0 {
+            if !ifc.root.quirks
+                || boxes_with_text.contains(&b)
+                || bx.left() > 0.0
+                || bx.right() > 0.0
+            {
                 asc = asc.max(bx.asc_l);
                 desc = desc.max(bx.desc_l);
             }
+        }
+        if asc == f32::NEG_INFINITY {
+            (asc, desc) = (0.0, 0.0);
         }
         metrics.push((top, asc + desc, asc));
         top += asc + desc;
@@ -844,7 +879,12 @@ fn fragments(
                     let AtomKind::Atomic { node } = ifc.atoms[i].kind else {
                         continue;
                     };
-                    atomic_at.push((node, x + a.ml, baseline - a.ascent() + a.mt));
+                    let y = if a.marker {
+                        top
+                    } else {
+                        baseline - a.ascent() + a.mt
+                    };
+                    atomic_at.push((node, x + a.ml, y));
                     x += a.margin_width();
                 }
                 AtomKind::Break => flush(&mut text, x, &mut frags),

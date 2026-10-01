@@ -20,3 +20,23 @@ center > table { text-align: start }
 
 /* A closed disclosure shows only its summary. */
 details:not([open]) > :not(summary) { display: none }
+
+/* Form controls, after Chrome's html.css: inline blocks in the small control font.
+   Their own sizes (an input is as wide as its `size`, a button as its label) come
+   from the layout builder. */
+input, textarea, select, button {
+  display: inline-block; margin: 0; font-family: system-ui, sans-serif; font-size: 13.3333px;
+  font-weight: 400; font-style: normal; line-height: normal; text-align: start;
+  text-indent: 0; letter-spacing: normal; word-spacing: normal; text-transform: none;
+}
+input { padding: 1px 2px; border: 2px inset #767676; box-sizing: content-box }
+input[type=search] { box-sizing: border-box }
+input[type=checkbox], input[type=radio] {
+  box-sizing: border-box; margin: 3px 3px 3px 4px; padding: 0; border: 0; width: 13px; height: 13px
+}
+input[type=radio] { margin: 3px 3px 0 5px }
+input[type=button i], input[type=submit i], input[type=reset i], button {
+  box-sizing: border-box; padding: 1px 6px; border: 2px outset #767676; text-align: center
+}
+textarea { padding: 2px; border: 1px solid #767676; box-sizing: content-box }
+select { padding: 0; border: 1px solid #767676; box-sizing: border-box }

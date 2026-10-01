@@ -1,6 +1,28 @@
 use crate::css_parser::ast::ComponentValue;
 use crate::css_parser::token::TokenKind;
 
+/// A string token's text back as a quoted string. The token has lost which quote it
+/// was written with, so take the one its text does not contain; a text with both
+/// keeps its unescaped `"` escaped.
+pub(crate) fn push_quoted(out: &mut String, text: &str) {
+    if text.contains('"') && !text.contains('\'') {
+        out.push('\'');
+        out.push_str(text);
+        out.push('\'');
+        return;
+    }
+    out.push('"');
+    let mut escaped = false;
+    for c in text.chars() {
+        if c == '"' && !escaped {
+            out.push('\\');
+        }
+        escaped = c == '\\' && !escaped;
+        out.push(c);
+    }
+    out.push('"');
+}
+
 /// Convert CSS component values back to a string.
 pub fn tokens_to_string(values: &[ComponentValue]) -> String {
     let mut s = String::new();
@@ -8,11 +30,7 @@ pub fn tokens_to_string(values: &[ComponentValue]) -> String {
         match v {
             ComponentValue::Token(t) => match &t.kind {
                 TokenKind::Ident(name) => s.push_str(name),
-                TokenKind::String(val) => {
-                    s.push('"');
-                    s.push_str(val);
-                    s.push('"');
-                }
+                TokenKind::String(val) => push_quoted(&mut s, val),
                 TokenKind::Hash { value, .. } => {
                     s.push('#');
                     s.push_str(value);

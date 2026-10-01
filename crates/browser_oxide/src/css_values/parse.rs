@@ -1249,11 +1249,7 @@ fn component_values_to_string(value: &[ComponentValue<'_>]) -> String {
         match cv {
             ComponentValue::Token(Token { kind, .. }) => match kind {
                 TokenKind::Ident(v) => s.push_str(v),
-                TokenKind::String(v) => {
-                    s.push('"');
-                    s.push_str(v);
-                    s.push('"');
-                }
+                TokenKind::String(v) => crate::js_runtime::utils::push_quoted(&mut s, v),
                 TokenKind::Number { value, .. } => s.push_str(&value.to_string()),
                 TokenKind::Dimension { value, unit, .. } => {
                     s.push_str(&value.to_string());
