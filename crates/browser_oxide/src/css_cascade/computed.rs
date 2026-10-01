@@ -174,6 +174,8 @@ fn all_property_ids() -> Vec<PropertyId> {
         PropertyId::ZIndex,
         PropertyId::ContentVisibility,
         PropertyId::Content,
+        PropertyId::ListStyleType,
+        PropertyId::Order,
         PropertyId::Transform,
     ]
 }

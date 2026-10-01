@@ -95,6 +95,7 @@ pub(crate) fn longhands_of(name: &str) -> Option<Vec<String>> {
         "padding-block" => names(&["padding-top", "padding-bottom"]),
         "inset-inline" => names(&["left", "right"]),
         "inset-block" => names(&["top", "bottom"]),
+        "list-style" => names(&["list-style-type"]),
         "font" => names(&[
             "font-style",
             "font-weight",
@@ -221,8 +222,30 @@ pub(crate) fn expand(name: &str, value: &[ComponentValue<'_>], important: bool) 
         "flex-flow" => flex_flow(&p, important),
         "background" => background(value, important),
         "font" => font(&p, important),
+        "list-style" => Ok(vec![PropertyDeclaration {
+            property: PropertyId::ListStyleType,
+            value: CssValue::CustomValue(list_style_type(value)),
+            important,
+        }]),
         _ => return None,
     })
+}
+
+/// The `list-style-type` a `list-style` shorthand sets: `none`, a named type, or the
+/// initial `disc` when it names none (`inside` and `outside` are the position).
+fn list_style_type(value: &[ComponentValue<'_>]) -> String {
+    let idents: Vec<String> = value
+        .iter()
+        .filter_map(try_ident)
+        .map(|i| i.to_ascii_lowercase())
+        .collect();
+    if idents.iter().any(|i| i == "none") {
+        return "none".to_string();
+    }
+    idents
+        .into_iter()
+        .find(|i| i != "inside" && i != "outside")
+        .unwrap_or_else(|| "disc".to_string())
 }
 
 /// A one- or two-value shorthand: the second value defaults to the first.

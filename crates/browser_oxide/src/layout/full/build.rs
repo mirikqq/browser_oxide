@@ -12,7 +12,7 @@ use taffy::util::{MaybeResolve, ResolveOrZero};
 use taffy::{Dimension, Size, Style};
 
 use super::font::{family_list, line_height_px, FontSpec, Metrics};
-use super::ifc::{self, InlineBox, Root};
+use super::ifc::{self, InlineBox, Lift, Root};
 use super::tree::{GroupKind, Role, TableStyle, Tree, VAlign};
 use super::{apply_calc, grid};
 use crate::css_cascade::ComputedStyle;
@@ -146,6 +146,7 @@ impl<'a> Builder<'a> {
                         ascent: 0.0,
                         descent: 0.0,
                         line_gap: 0.0,
+                        x_height: 0.0,
                     };
                     return (parsed, none);
                 }
@@ -446,6 +447,26 @@ impl<'a> Builder<'a> {
         } else {
             self.assemble(id)
         };
+        // The marker of a list item is a line of its own when the item holds nothing.
+        let marker_shown = !matches!(
+            computed.get(&PropertyId::ListStyleType),
+            Some(CssValue::CustomValue(t)) if t.trim() == "none"
+        );
+        if elem.is_some()
+            && marker_shown
+            && children.is_empty()
+            && self.display_of(id) == CssDisplay::ListItem
+        {
+            let mut b = self.run_builder(id);
+            b.line_break();
+            if let Some(ifc) = b.finish() {
+                let block = Style {
+                    display: taffy::Display::Block,
+                    ..Default::default()
+                };
+                children.push(self.tree.add_ifc(block, ifc, Vec::new()));
+            }
+        }
         // A button centres its content vertically: the content is one block in a
         // column the button centres.
         let is_button = elem.is_some() && tag == "button";
@@ -611,9 +632,22 @@ impl<'a> Builder<'a> {
                 .sum::<f32>();
             style.min_size.height = Dimension::length((ctx.viewport_h - margins).max(0.0));
         }
+        let style_display = style.display;
         let id_node = self.tree.add(style, children);
         self.tree.nodes[id_node].role = role;
         self.tree.nodes[id_node].control_baseline = control_baseline;
+        if self.level(id) == Level::Atomic {
+            self.tree.nodes[id_node].lift = self.lift_of(id, computed);
+        }
+        if let Some(CssValue::CustomValue(o)) = computed.get(&PropertyId::Order) {
+            self.tree.nodes[id_node].order = o.trim().parse().unwrap_or(0);
+        }
+        if matches!(style_display, taffy::Display::Flex | taffy::Display::Grid) {
+            // `order` sorts the items; equal ones keep their place.
+            let mut kids = std::mem::take(&mut self.tree.nodes[id_node].children);
+            kids.sort_by_key(|&c| self.tree.nodes[c].order);
+            self.tree.nodes[id_node].children = kids;
+        }
         if role == Role::Table {
             self.tree.nodes[id_node].table = Some(self.table_style(computed));
         }
@@ -1126,6 +1160,61 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// `vertical-align` of an inline box or an atomic inline.
+    fn lift_of(&self, id: DomId, c: &ComputedStyle) -> Lift {
+        let Some(CssValue::CustomValue(raw)) = c.get(&PropertyId::VerticalAlign) else {
+            return Lift::Baseline;
+        };
+        let raw = raw.trim().to_ascii_lowercase();
+        let parent = self
+            .parent_of(id)
+            .and_then(|p| self.styles.get(p).map(|s| (p, s)));
+        let (parent_size, parent_metrics) = match parent {
+            Some((p, s)) => {
+                let size = self.styles.font_size(p);
+                (size, self.font(s, size).1)
+            }
+            None => {
+                let size = crate::style::tree::DEFAULT_FONT_SIZE;
+                (size, self.font(c, size).1)
+            }
+        };
+        match raw.as_str() {
+            "baseline" => Lift::Baseline,
+            "sub" => Lift::Shift(-(parent_size / 5.0 + 1.0)),
+            "super" => Lift::Shift(parent_size / 3.0 + 1.0),
+            "middle" => Lift::Middle(parent_metrics.x_height),
+            "text-top" => Lift::TextTop(parent_metrics.ascent),
+            "text-bottom" => Lift::TextBottom(parent_metrics.descent),
+            "top" => Lift::Top,
+            "bottom" => Lift::Bottom,
+            other => {
+                let own = self.styles.font_size(id);
+                let split = other
+                    .find(|ch: char| ch.is_ascii_alphabetic() || ch == '%')
+                    .unwrap_or(other.len());
+                let Ok(n) = other[..split].trim().parse::<f32>() else {
+                    return Lift::Baseline;
+                };
+                match &other[split..] {
+                    "px" | "" => Lift::Shift(n),
+                    "pt" => Lift::Shift(n * 4.0 / 3.0),
+                    "em" => Lift::Shift(n * own),
+                    "rem" => Lift::Shift(n * self.ctx.root_font_size),
+                    "%" => {
+                        let ctx = ResolveContext {
+                            font_size: own,
+                            ..*self.ctx
+                        };
+                        let (_, m) = self.font(c, own);
+                        Lift::Shift(n / 100.0 * line_height_px(c, own, &m, &ctx))
+                    }
+                    _ => Lift::Baseline,
+                }
+            }
+        }
+    }
+
     fn inline_box(&self, id: DomId, c: &ComputedStyle) -> InlineBox {
         let size = self.styles.font_size(id);
         let ctx = ResolveContext {
@@ -1141,6 +1230,7 @@ impl<'a> Builder<'a> {
             |v: taffy::LengthPercentageAuto| v.maybe_resolve(Some(0.0), |_, _| 0.0).unwrap_or(0.0);
         InlineBox {
             dom: id.to_raw(),
+            lift: self.lift_of(id, c),
             ascent: m.ascent,
             descent: m.descent,
             asc_l,

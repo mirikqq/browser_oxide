@@ -67,10 +67,46 @@ pub struct TextItem {
     pub units: Vec<Unit>,
 }
 
+/// `vertical-align` of an inline box or an atomic inline, with what it needs of
+/// the parent's font resolved.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum Lift {
+    #[default]
+    Baseline,
+    /// Raised this many px (lowered if negative) from the parent's baseline.
+    Shift(f32),
+    /// Its midpoint at the parent's baseline plus half this x-height.
+    Middle(f32),
+    /// Its top at the top of the parent's content area, this far above its baseline.
+    TextTop(f32),
+    /// Its bottom at the bottom of the parent's content area, this far below its baseline.
+    TextBottom(f32),
+    /// Its top at the top of the line.
+    Top,
+    /// Its bottom at the bottom of the line.
+    Bottom,
+}
+
+impl Lift {
+    /// How far above the parent's baseline the baseline of a box whose extent above
+    /// and below its own is `asc` and `desc` goes; `None` for what the line decides.
+    fn shift(self, asc: f32, desc: f32) -> Option<f32> {
+        match self {
+            Self::Baseline => Some(0.0),
+            Self::Shift(s) => Some(s),
+            Self::Middle(x_height) => Some((x_height - asc + desc) / 2.0),
+            Self::TextTop(parent_ascent) => Some(parent_ascent - asc),
+            Self::TextBottom(parent_descent) => Some(desc - parent_descent),
+            Self::Top | Self::Bottom => None,
+        }
+    }
+}
+
 /// An inline element that takes part in the line without being a box of its own.
 #[derive(Debug, Clone, Default)]
 pub struct InlineBox {
     pub dom: u32,
+    pub lift: Lift,
     /// The font's content area above and below the baseline.
     pub ascent: f32,
     pub descent: f32,
@@ -478,6 +514,7 @@ struct AtomicBox {
     /// Stands for an out-of-flow box: it sits at the top of its line, which is
     /// where the box's static position is.
     marker: bool,
+    lift: Lift,
 }
 
 impl AtomicBox {
@@ -618,6 +655,7 @@ fn size_atomic(tree: &mut Tree, node: usize, fit: f32, basis: f32) -> AtomicBox 
         mb,
         baseline: baseline_of(tree, node),
         marker: tree.nodes[node].role == Role::Marker,
+        lift: tree.nodes[node].lift,
     }
 }
 
@@ -699,7 +737,35 @@ struct Placed {
     lines: Vec<LineBox>,
     /// Top and height of each line, and the baseline's distance from the top.
     metrics: Vec<(f32, f32, f32)>,
+    /// What sits off the baseline of each line.
+    shifts: Vec<Shifts>,
     height: f32,
+}
+
+/// How far above its line's baseline the baseline of a box, or of an atomic inline
+/// (by its atom), sits. What is not listed is on the baseline.
+#[derive(Default)]
+struct Shifts {
+    boxes: Vec<(usize, f32)>,
+    atoms: Vec<(usize, f32)>,
+}
+
+impl Shifts {
+    fn of_box(&self, b: usize) -> f32 {
+        self.boxes.iter().find(|e| e.0 == b).map_or(0.0, |e| e.1)
+    }
+
+    fn of_atom(&self, i: usize) -> f32 {
+        self.atoms.iter().find(|e| e.0 == i).map_or(0.0, |e| e.1)
+    }
+}
+
+/// Something `vertical-align: top` or `bottom` puts against an edge of the line.
+struct Aligned {
+    lift: Lift,
+    asc: f32,
+    desc: f32,
+    target: Result<usize, usize>,
 }
 
 fn place(
@@ -711,7 +777,11 @@ fn place(
     let floats = floats.filter(|c| c.has_floats());
     let mut lines: Vec<LineBox> = Vec::new();
     let mut metrics = Vec::new();
+    let mut shifts = Vec::new();
     let mut open: Vec<usize> = Vec::new();
+    // How far above the baseline of the line each box's own sits, kept while the
+    // box is open.
+    let mut cum = vec![0.0f32; ifc.boxes.len()];
     let mut top = 0.0f32;
     let mut start = 0;
     while start < ifc.atoms.len() {
@@ -742,6 +812,8 @@ fn place(
         // Leading can be negative, so nothing starts from zero.
         let (mut asc, mut desc) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
         let mut touched: Vec<usize> = open.clone();
+        let mut aligned: Vec<Aligned> = Vec::new();
+        let mut shift = Shifts::default();
         // Text of the block itself, and of each inline box.
         let mut root_text = false;
         let mut root_break = false;
@@ -750,6 +822,9 @@ fn place(
         for i in line.atoms.clone() {
             match ifc.atoms[i].kind {
                 AtomKind::Open(b) => {
+                    let bx = &ifc.boxes[b];
+                    let parent = open.last().map_or(0.0, |&p| cum[p]);
+                    cum[b] = parent + bx.lift.shift(bx.asc_l, bx.desc_l).unwrap_or(0.0);
                     open.push(b);
                     touched.push(b);
                 }
@@ -768,8 +843,24 @@ fn place(
                 AtomKind::Atomic { .. } => {
                     content = true;
                     touched.extend(open.iter().copied());
-                    asc = asc.max(atomics[i].ascent());
-                    desc = desc.max(atomics[i].descent());
+                    let a = &atomics[i];
+                    let parent = open.last().map_or(0.0, |&p| cum[p]);
+                    match a.lift.shift(a.ascent(), a.descent()) {
+                        Some(own) => {
+                            let s = parent + own;
+                            asc = asc.max(a.ascent() + s);
+                            desc = desc.max(a.descent() - s);
+                            if s != 0.0 {
+                                shift.atoms.push((i, s));
+                            }
+                        }
+                        None => aligned.push(Aligned {
+                            lift: a.lift,
+                            asc: a.ascent(),
+                            desc: a.descent(),
+                            target: Err(i),
+                        }),
+                    }
                 }
             }
         }
@@ -780,6 +871,8 @@ fn place(
             asc = asc.max(ifc.root.asc_l);
             desc = desc.max(ifc.root.desc_l);
         }
+        touched.sort_unstable();
+        touched.dedup();
         for b in touched {
             let bx = &ifc.boxes[b];
             if !ifc.root.quirks
@@ -787,20 +880,56 @@ fn place(
                 || bx.left() > 0.0
                 || bx.right() > 0.0
             {
-                asc = asc.max(bx.asc_l);
-                desc = desc.max(bx.desc_l);
+                if matches!(bx.lift, Lift::Top | Lift::Bottom) {
+                    aligned.push(Aligned {
+                        lift: bx.lift,
+                        asc: bx.asc_l,
+                        desc: bx.desc_l,
+                        target: Ok(b),
+                    });
+                } else {
+                    asc = asc.max(bx.asc_l + cum[b]);
+                    desc = desc.max(bx.desc_l - cum[b]);
+                    if cum[b] != 0.0 {
+                        shift.boxes.push((b, cum[b]));
+                    }
+                }
             }
         }
         if asc == f32::NEG_INFINITY {
             (asc, desc) = (0.0, 0.0);
         }
+        // What is aligned to the line itself makes the line as tall as it needs.
+        for it in &aligned {
+            let extra = it.asc + it.desc - (asc + desc);
+            if extra > 0.0 {
+                if it.lift == Lift::Top {
+                    desc += extra;
+                } else {
+                    asc += extra;
+                }
+            }
+        }
+        for it in &aligned {
+            let s = if it.lift == Lift::Top {
+                asc - it.asc
+            } else {
+                it.desc - desc
+            };
+            match it.target {
+                Ok(b) => shift.boxes.push((b, s)),
+                Err(i) => shift.atoms.push((i, s)),
+            }
+        }
         metrics.push((top, asc + desc, asc));
+        shifts.push(shift);
         top += asc + desc;
         lines.push(broken);
     }
     Placed {
         lines,
         metrics,
+        shifts,
         height: top,
     }
 }
@@ -815,7 +944,9 @@ fn fragments(
     let mut frags = Vec::new();
     let mut atomic_at = Vec::new();
     let mut carried: Vec<usize> = Vec::new();
-    for (line, &(top, _, asc)) in placed.lines.iter().zip(&placed.metrics) {
+    for ((line, &(top, _, asc)), shift) in
+        placed.lines.iter().zip(&placed.metrics).zip(&placed.shifts)
+    {
         let (left, room) = line.slot.unwrap_or((0.0, width));
         let free = (room - line.width).max(0.0);
         let x0 = left
@@ -832,10 +963,16 @@ fn fragments(
             |text: &mut Option<(usize, usize, usize, f32)>, end_x: f32, frags: &mut Vec<Frag>| {
                 if let Some((item, from, to, sx)) = text.take() {
                     let t = &ifc.texts[item];
-                    let (ascent, descent, owner_dom) = match t.owner {
-                        Some(b) => (ifc.boxes[b].ascent, ifc.boxes[b].descent, ifc.boxes[b].dom),
-                        None => (ifc.root.ascent, ifc.root.descent, ifc.root.dom),
+                    let (ascent, descent, owner_dom, lifted) = match t.owner {
+                        Some(b) => (
+                            ifc.boxes[b].ascent,
+                            ifc.boxes[b].descent,
+                            ifc.boxes[b].dom,
+                            shift.of_box(b),
+                        ),
+                        None => (ifc.root.ascent, ifc.root.descent, ifc.root.dom, 0.0),
                     };
+                    let baseline = baseline - lifted;
                     frags.push(Frag {
                         dom: t.dom,
                         owner: owner_dom,
@@ -869,7 +1006,7 @@ fn fragments(
                             b,
                             sx,
                             x - bx.margin_right,
-                            baseline,
+                            baseline - shift.of_box(b),
                             left,
                             true,
                         ));
@@ -902,7 +1039,7 @@ fn fragments(
                     let y = if a.marker {
                         top
                     } else {
-                        baseline - a.ascent() + a.mt
+                        baseline - shift.of_atom(i) - a.ascent() + a.mt
                     };
                     atomic_at.push((node, x + a.ml, y));
                     x += a.margin_width();
@@ -914,7 +1051,15 @@ fn fragments(
         flush(&mut text, end_x, &mut frags);
         // Boxes still open at the end of the line end with it.
         for (b, sx, left) in starts {
-            frags.push(box_frag(ifc, b, sx, end_x, baseline, left, false));
+            frags.push(box_frag(
+                ifc,
+                b,
+                sx,
+                end_x,
+                baseline - shift.of_box(b),
+                left,
+                false,
+            ));
         }
     }
     (frags, atomic_at)

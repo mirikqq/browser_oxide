@@ -94,6 +94,8 @@ pub fn parse_property(
         | "grid-template-rows"
         | "border-collapse"
         | "border-spacing"
+        | "list-style-type"
+        | "order"
         | "vertical-align"
         | "grid-template-areas"
         | "grid-auto-flow"

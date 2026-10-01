@@ -97,6 +97,8 @@ pub enum PropertyId {
     ZIndex,
     ContentVisibility,
     Content,
+    ListStyleType,
+    Order,
     Transform,
     Custom(String),
 }
@@ -185,6 +187,8 @@ impl PropertyId {
             "z-index" => Self::ZIndex,
             "content-visibility" => Self::ContentVisibility,
             "content" => Self::Content,
+            "list-style-type" => Self::ListStyleType,
+            "order" => Self::Order,
             "transform" => Self::Transform,
             name if name.starts_with("--") => Self::Custom(name.to_string()),
             _ => Self::Custom(name.to_string()),

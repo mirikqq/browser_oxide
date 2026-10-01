@@ -93,6 +93,8 @@ pub struct Metrics {
     pub ascent: f32,
     pub descent: f32,
     pub line_gap: f32,
+    /// Height of a lowercase `x`, what `vertical-align: middle` is measured by.
+    pub x_height: f32,
 }
 
 impl Metrics {
@@ -109,6 +111,7 @@ impl Metrics {
                         ascent: (f32::from(face.ascender()) * scale).round(),
                         descent: (-f32::from(face.descender()) * scale).round(),
                         line_gap: (f32::from(face.line_gap()) * scale).round(),
+                        x_height: face.x_height().map_or(size * 0.5, |h| f32::from(h) * scale),
                     }
                 })
             });
@@ -116,6 +119,7 @@ impl Metrics {
             ascent: (size * 0.8).round(),
             descent: (size * 0.2).round(),
             line_gap: 0.0,
+            x_height: size * 0.5,
         })
     }
 

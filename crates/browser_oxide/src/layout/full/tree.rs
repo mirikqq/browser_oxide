@@ -70,6 +70,10 @@ pub struct Node {
     pub baseline: Option<f32>,
     /// The baseline of a form control, which draws its own text.
     pub control_baseline: Option<f32>,
+    /// `vertical-align`, for an atomic inline.
+    pub lift: ifc::Lift,
+    /// `order`, which sorts the items of a flex or grid container.
+    pub order: i32,
     cache: Cache,
     pub layout: Layout,
     pub children: Vec<usize>,
@@ -121,6 +125,8 @@ impl Tree {
             frags: Vec::new(),
             baseline: None,
             control_baseline: None,
+            lift: ifc::Lift::default(),
+            order: 0,
             cache: Cache::new(),
             layout: Layout::with_order(0),
             children,

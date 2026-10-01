@@ -106,6 +106,8 @@ pub fn initial_value(property: &PropertyId) -> CssValue {
         PropertyId::ZIndex => CssValue::Integer(0),
         PropertyId::ContentVisibility => CssValue::ContentVisibility(ContentVisibility::Visible),
         PropertyId::Content => CssValue::Content(Vec::new()),
+        PropertyId::ListStyleType => CssValue::CustomValue("disc".to_string()),
+        PropertyId::Order => CssValue::CustomValue("0".to_string()),
         PropertyId::Transform => CssValue::Transform(vec![]),
         PropertyId::Custom(_) => CssValue::Inherit, // custom properties inherit by default
     }
