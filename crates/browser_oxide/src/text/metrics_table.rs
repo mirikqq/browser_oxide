@@ -262,6 +262,150 @@ pub fn is_claimed(family: &str, os_name: &str) -> bool {
     )
 }
 
+/// A face's average character `avg` em wide and widest character `max` em wide, as Blink takes
+/// them to size a text field: the average rounded up when its fraction reaches a half, the widest
+/// rounded to a device pixel.
+const FIELD_EM: [(&str, f32, f32); 11] = [
+    ("arial", 0.5, 0.90533),
+    ("times new roman", 0.5, 0.8912),
+    ("georgia", 0.50487, 0.91685),
+    ("courier new", 0.6001, 0.83248),
+    ("menlo", 0.60205, 0.92817),
+    ("helvetica neue", 0.518, 0.95238),
+    ("trebuchet ms", 0.50097, 0.9389),
+    ("verdana", 0.5918, 1.00535),
+    ("comic sans ms", 0.59033, 1.10216),
+    ("impact", 0.4336, 1.00881),
+    ("arial black", 0.66699, 1.10054),
+];
+
+/// Faces Blink does not trust the average width of: it sizes a field by the width of a `0`, in em.
+const FIELD_ZERO_EM: [(&str, f32); 5] = [
+    ("helvetica", 0.55615),
+    ("times", 0.5),
+    ("monaco", 0.6001),
+    ("courier", 0.6001),
+    ("lucida grande", 0.63232),
+];
+
+/// The system font has optical sizes, so it does not scale: per CSS size from 2 to 72 px in steps
+/// of 1/24 px, as measured in Chrome at 2x, three little-endian `u16`s each — the widest character
+/// in device px, the average one and the height of an `x` in 1/64 device px.
+static SYSTEM_UI: &[u8] = include_bytes!("fmetrics_system_ui.bin");
+
+/// The system font's row for a font of `size_css` CSS px at `dpr`: widest character, average
+/// character and x-height, in device px (a table measured at 2x, scaled to other ratios).
+fn system_ui_row(size_css: f32, dpr: f32) -> (f32, f32, f32) {
+    let step = (((size_css - 2.0) * 24.0).round().max(0.0) as usize).min(VERTICAL_STEPS - 1);
+    let scale = if size_css > 72.0 {
+        size_css / 72.0
+    } else {
+        1.0
+    } * dpr
+        / 2.0;
+    let at = |i: usize| {
+        f32::from(u16::from_le_bytes([
+            SYSTEM_UI[step * 6 + i * 2],
+            SYSTEM_UI[step * 6 + i * 2 + 1],
+        ]))
+    };
+    (
+        (at(0) * scale).round(),
+        at(1) / 64.0 * scale,
+        at(2) / 64.0 * scale,
+    )
+}
+
+/// What sizes a text field in a face, in device px at a font of `size_px` device pixels.
+#[derive(Debug, Clone, Copy)]
+pub struct FieldChars {
+    pub avg: f32,
+    /// The widest character, which a field adds beyond its average ones; `None` where the field
+    /// is just `size` average characters.
+    pub max: Option<f32>,
+}
+
+/// The measures Blink sizes a text field or textarea by, for the first family of `families` with
+/// a row here, at a font of `size_css` CSS px. `None` where none has.
+pub fn field_chars(
+    families: &[String],
+    os_name: &str,
+    size_css: f32,
+    dpr: f32,
+) -> Option<FieldChars> {
+    let size_px = size_css * dpr;
+    if os_name != "macOS" {
+        return None;
+    }
+    families.iter().find_map(|f| {
+        let key = match key_of(f).as_str() {
+            "monospace" | "ui-monospace" => "menlo".to_string(),
+            "-apple-system" | "blinkmacsystemfont" | "ui-rounded" => "system-ui".to_string(),
+            other => other.to_string(),
+        };
+        if key == "system-ui" {
+            let (max, avg, _) = system_ui_row(size_css, dpr);
+            return Some(FieldChars {
+                avg,
+                max: Some(max),
+            });
+        }
+        if let Some((_, avg, max)) = FIELD_EM.iter().find(|(n, ..)| *n == key) {
+            let avg = avg * size_px;
+            return Some(FieldChars {
+                avg: avg.max(avg.round()),
+                max: Some((max * size_px).round()),
+            });
+        }
+        FIELD_ZERO_EM
+            .iter()
+            .find(|(n, _)| *n == key)
+            .map(|(_, zero)| FieldChars {
+                avg: zero * size_px,
+                max: None,
+            })
+    })
+}
+
+/// The height of an `x` in each family, in em, as `ex` measures it in Chrome.
+const X_HEIGHT_EM: [(&str, f32); 16] = [
+    ("times", 0.44873),
+    ("times new roman", 0.44727),
+    ("helvetica", 0.52295),
+    ("arial", 0.51855),
+    ("courier", 0.45117),
+    ("courier new", 0.42285),
+    ("menlo", 0.54688),
+    ("monaco", 0.54541),
+    ("georgia", 0.48145),
+    ("verdana", 0.54541),
+    ("helvetica neue", 0.517),
+    ("lucida grande", 0.53027),
+    ("trebuchet ms", 0.52295),
+    ("comic sans ms", 0.53955),
+    ("impact", 0.64795),
+    ("arial black", 0.51855),
+];
+
+/// The height of an `x`, in device px, of the first family of `families` this profile knows, else
+/// the OS default (`Times`), at a font of `size_css` CSS px. `None` for an OS without a table.
+pub fn x_height(families: &[String], os_name: &str, size_css: f32, dpr: f32) -> Option<f32> {
+    if os_name != "macOS" {
+        return None;
+    }
+    let em = families.iter().find_map(|f| {
+        let key = vertical_alias(&key_of(f));
+        if key == "system-ui" {
+            return Some(system_ui_row(size_css, dpr).2 / (size_css * dpr));
+        }
+        X_HEIGHT_EM
+            .iter()
+            .find(|(n, _)| *n == key)
+            .map(|(_, em)| *em)
+    });
+    Some(em.unwrap_or(X_HEIGHT_EM[0].1) * size_css * dpr)
+}
+
 /// The claimed set, for keeping the JS-side font list in sync.
 pub const CLAIMED_MACOS: &[&str] = &[
     "arial",
@@ -280,61 +424,81 @@ pub const CLAIMED_MACOS: &[&str] = &[
     "verdana",
 ];
 
-/// The families `VERTICAL` has rows for, in the order of its rows.
-const VERTICAL_FAMILIES: [&str; 17] = [
-    "times",
-    "times new roman",
-    "helvetica",
-    "arial",
-    "courier",
-    "courier new",
-    "menlo",
-    "monaco",
-    "system-ui",
-    "georgia",
-    "verdana",
-    "helvetica neue",
-    "lucida grande",
-    "trebuchet ms",
-    "comic sans ms",
-    "impact",
-    "arial black",
-];
+/// The families `VERTICAL` has rows for, in the order of its rows: the faces whose metrics come
+/// from tables inside the font and so follow no ratio of the size.
+const VERTICAL_FAMILIES: [&str; 3] = ["times", "helvetica", "courier"];
 
 /// What Chrome on macOS reports of each family's vertical metrics — ascent,
-/// descent and line gap, in whole px — for sizes 4 to 72 px in steps of 1/24 px
-/// (1633 rows of three bytes per family; 1/24 puts 10pt, 8pt, 11pt … on a step). Measured in Chrome (a zero-height
+/// descent and line gap, in whole device px — for device font sizes 4 to 144 px in steps of 1/12
+/// px (1681 rows of three bytes per family; 1/12 puts 10pt, 8pt, 11pt … on a step). Blink lays
+/// out in device pixels (a page at 2x is a page at zoom 2), so these are what a font of that
+/// many device pixels measures, whatever the scale. Measured in Chrome (a zero-height
 /// inline-block on the baseline against the span around it, and the line box of
 /// `line-height: normal`); the numbers follow from how Core Text reports the
 /// fonts and Blink rounds them, which a bundled face cannot reproduce.
 static VERTICAL: &[u8] = include_bytes!("vmetrics_macos.bin");
 
-const VERTICAL_STEPS: usize = 1633;
+const VERTICAL_STEPS: usize = 1681;
 
-/// Ascent, descent and line gap (px, whole numbers) of the first family of
-/// `families` this profile has vertical metrics for, else the OS default (`Times`).
-/// `None` for an OS without a table.
-pub fn vertical(families: &[String], os_name: &str, size_px: f32) -> Option<(f32, f32, f32)> {
-    if os_name != "macOS" {
-        return None;
-    }
-    let alias = |key: &str| match key {
+/// Ascent, descent and line gap in em of the other families, which Chrome rounds to device px.
+const VERTICAL_EM: [(&str, f32, f32, f32); 14] = [
+    ("times new roman", 0.89107, 0.216284, 0.042479),
+    ("arial", 0.9052, 0.211902, 0.032713),
+    ("courier new", 0.832488, 0.300289, 0.0),
+    ("menlo", 0.928197, 0.235829, 0.0),
+    ("monaco", 1.000291, 0.250073, 0.083493),
+    ("system-ui", 0.966734, 0.210929, 0.0),
+    ("georgia", 0.916944, 0.219223, 0.0),
+    ("verdana", 1.005319, 0.209949, 0.0),
+    ("helvetica neue", 0.951969, 0.212993, 0.027997),
+    ("lucida grande", 0.966734, 0.210929, 0.0),
+    ("trebuchet ms", 0.938925, 0.222157, 0.0),
+    ("comic sans ms", 1.102041, 0.291498, 0.0),
+    ("impact", 1.008757, 0.210929, 0.0),
+    ("arial black", 1.100563, 0.309566, 0.0),
+];
+
+/// The family a generic keyword stands for in Chrome on macOS.
+fn vertical_alias(key: &str) -> String {
+    match key {
         "serif" => "times".to_string(),
         "sans-serif" | "ui-sans-serif" => "helvetica".to_string(),
         "monospace" | "ui-monospace" => "menlo".to_string(),
         "-apple-system" | "blinkmacsystemfont" | "ui-rounded" => "system-ui".to_string(),
         other => other.to_string(),
+    }
+}
+
+/// Ascent, descent and line gap (device px, whole numbers) of the first family of
+/// `families` this profile has vertical metrics for, else the OS default (`Times`), at a font of
+/// `size_px` device pixels. `None` for an OS without a table.
+pub fn vertical(families: &[String], os_name: &str, size_px: f32) -> Option<(f32, f32, f32)> {
+    if os_name != "macOS" {
+        return None;
+    }
+    let known = |key: &str| {
+        VERTICAL_FAMILIES.contains(&key) || VERTICAL_EM.iter().any(|(name, ..)| *name == key)
     };
-    let row = families
+    let key = families
         .iter()
-        .find_map(|f| {
-            let key = alias(&key_of(f));
-            VERTICAL_FAMILIES.iter().position(|n| *n == key)
-        })
+        .map(|f| vertical_alias(&key_of(f)))
+        .find(|key| known(key))
+        .unwrap_or_else(|| VERTICAL_FAMILIES[0].to_string());
+    if let Some((_, ascent, descent, gap)) = VERTICAL_EM.iter().find(|(name, ..)| *name == key) {
+        let round = |em: f32| (em * size_px).round();
+        return Some((round(*ascent), round(*descent), round(*gap)));
+    }
+    let row = VERTICAL_FAMILIES
+        .iter()
+        .position(|name| *name == key)
         .unwrap_or(0);
-    let step = (((size_px - 4.0) * 24.0).round().max(0.0) as usize).min(VERTICAL_STEPS - 1);
+    let step = (((size_px - 4.0) * 12.0).round().max(0.0) as usize).min(VERTICAL_STEPS - 1);
     let at = (row * VERTICAL_STEPS + step) * 3;
-    let scale = if size_px > 72.0 { size_px / 72.0 } else { 1.0 };
+    let scale = if size_px > 144.0 {
+        size_px / 144.0
+    } else {
+        1.0
+    };
     let v = |i: usize| (f32::from(VERTICAL[at + i]) * scale).round();
     Some((v(0), v(1), v(2)))
 }

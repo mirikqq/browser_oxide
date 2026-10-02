@@ -22,6 +22,7 @@ const profile = mkdtempSync(join(tmpdir(), "layout-probe-"));
 const chrome = spawn(
   CHROME,
   ["--headless=new", "--disable-gpu", "--no-first-run", "--hide-scrollbars",
+    "--force-device-scale-factor=2", "--window-size=1512,958",
     `--user-data-dir=${profile}`, `--remote-debugging-port=${PORT}`, "about:blank"],
   { stdio: "ignore" },
 );
@@ -57,8 +58,6 @@ try {
   const { targetId } = await send("Target.createTarget", { url: "about:blank" });
   const { sessionId } = await send("Target.attachToTarget", { targetId, flatten: true });
   await send("Page.enable", {}, sessionId);
-  await send("Emulation.setDeviceMetricsOverride",
-    { width: 1512, height: 871, deviceScaleFactor: 2, mobile: false }, sessionId);
   await send("Emulation.setScrollbarsHidden", { hidden: true }, sessionId);
   const loaded = new Promise((r) =>
     listeners.push((m) => m.sessionId === sessionId && m.method === "Page.loadEventFired" && r()));

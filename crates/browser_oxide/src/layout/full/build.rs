@@ -195,7 +195,7 @@ impl<'a> Builder<'a> {
         dpr: f32,
     ) -> Self {
         Self {
-            dpr,
+            dpr: if dpr > 0.0 { dpr } else { 1.0 },
             dom,
             styles,
             ctx,
@@ -236,10 +236,11 @@ impl<'a> Builder<'a> {
                         descent: 0.0,
                         line_gap: 0.0,
                         x_height: 0.0,
+                        dpr: self.dpr,
                     };
                     return (parsed, none);
                 }
-                let metrics = Metrics::of(&parsed, self.os);
+                let metrics = Metrics::of(&parsed, self.os, self.dpr);
                 (parsed, metrics)
             })
             .clone()
@@ -1068,26 +1069,36 @@ impl<'a> Builder<'a> {
             + lp(style.border.top)
             + lp(style.border.bottom);
         let border_box = style.box_sizing == taffy::BoxSizing::BorderBox;
-        // Blink sets a field's width from the average width of a character, which
-        // it takes as half an em for the usual faces and 0.6 em for monospace.
+        // Blink sets a field's width from the average width of a character; where the face
+        // has no measures here, that is half an em, or 0.6 em for monospace.
         let mono = {
             let f = family_list(computed).to_ascii_lowercase();
             ["mono", "courier", "consolas", "menlo"]
                 .iter()
                 .any(|m| f.contains(m))
         };
-        // Menlo, the `monospace` of macOS, is wider than Courier New by a little more
-        // than a pixel on a field.
         let menlo = {
             let f = family_list(computed).to_ascii_lowercase();
             (f.contains("menlo") || f.contains("monospace")) && !f.contains("courier")
         };
+        let device = |v: f32| (v * self.dpr).round() / self.dpr;
         let (avg, extra) = if menlo {
-            ((0.6 * font_size).round(), (0.375 * font_size).round())
+            (device(0.6 * font_size), device(0.375 * font_size))
         } else if mono {
-            ((0.6 * font_size).round(), (0.25 * font_size).round())
+            (device(0.6 * font_size), device(0.25 * font_size))
         } else {
-            ((0.5 * font_size).round(), (0.4 * font_size).round())
+            (device(0.5 * font_size), device(0.4 * font_size))
+        };
+        let chars =
+            crate::text::metrics_table::field_chars(&font.families, self.os, font_size, self.dpr);
+        let ceil_device = |v: f32| (v - 1e-4).ceil() / self.dpr;
+        let field = |n: f32| match chars {
+            Some(c) => ceil_device(n * c.avg + c.max.map_or(0.0, |m| m - c.avg)),
+            None => n * avg + extra,
+        };
+        let area = |n: f32| match chars {
+            Some(c) => ceil_device(n * c.avg + 16.0 * self.dpr),
+            None => n * avg + if menlo { 17.0 } else { 16.0 },
         };
         let count = |name: &str, default: f32| {
             attr(name)
@@ -1121,14 +1132,17 @@ impl<'a> Builder<'a> {
                     .iter()
                     .map(|t| ifc::text_width(t, &font, self.os))
                     .fold(0.0f32, f32::max);
-                (widest.ceil() + 18.0, metrics.ascent + metrics.descent + 4.0)
+                (
+                    (widest * self.dpr).ceil() / self.dpr + 18.0,
+                    metrics.ascent + metrics.descent + 4.0,
+                )
             }
             "select" => return None,
             "textarea" => (
-                count("cols", 20.0) * avg + if menlo { 17.0 } else { 16.0 } + edges_w,
+                area(count("cols", 20.0)) + edges_w,
                 count("rows", 2.0) * lh + edges_h,
             ),
-            _ => (count("size", 20.0) * avg + extra + edges_w, lh + edges_h),
+            _ => (field(count("size", 20.0)) + edges_w, lh + edges_h),
         };
         let (w, h) = if border_box {
             (w, h)
@@ -1339,7 +1353,7 @@ impl<'a> Builder<'a> {
                     italic: false,
                 }
                 .parsed();
-                let m = Metrics::of(&font, self.os);
+                let m = Metrics::of(&font, self.os, self.dpr);
                 let lh = m.normal_line_height();
                 (m, lh, TextAlign::Start)
             }
@@ -1497,7 +1511,7 @@ impl<'a> Builder<'a> {
     /// border: Blink floors them (`1.7px` is `1.5px` at 2x).
     fn snap_borders(&self, ts: &mut Style) {
         self.quantize(ts);
-        let dpr = if self.dpr > 0.0 { self.dpr } else { 1.0 };
+        let dpr = self.dpr;
         let snap = |w: taffy::LengthPercentage| {
             let v = w.resolve_or_zero(None, |_, _| 0.0);
             if v <= 0.0 {
@@ -1512,10 +1526,11 @@ impl<'a> Builder<'a> {
         ts.border.left = snap(ts.border.left);
     }
 
-    /// Blink keeps lengths in 1/64 px (`LayoutUnit`), rounded down; kept as plain
+    /// Blink keeps lengths in 1/64 device px (`LayoutUnit`), rounded down; kept as plain
     /// floats the differences add up to pixels over a long page.
     fn quantize(&self, ts: &mut Style) {
-        let q = |v: f32| (v * 64.0).floor() / 64.0;
+        let unit = 64.0 * self.dpr;
+        let q = |v: f32| (v * unit).floor() / unit;
         let length = taffy::CompactLength::LENGTH_TAG;
         let lp = |v: taffy::LengthPercentage| {
             let r = v.into_raw();

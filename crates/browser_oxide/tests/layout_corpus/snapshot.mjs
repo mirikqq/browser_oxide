@@ -20,7 +20,9 @@ const casesDir = join(here, real ? "real" : "cases");
 const outDir = real ? join(here, "real") : join(here, "chrome");
 const CHROME =
   process.env.CHROME || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-// The macOS profile the engine runs as: a 1512x871 CSS-pixel window at 2x.
+// The macOS profile the engine runs as: a 1512x871 CSS-pixel viewport at a real 2x. Chrome lays out
+// in device pixels at 2x (text heights in half pixels, borders floored to device pixels), which
+// device-metrics emulation does not do. A headless window is 87 CSS px taller than its viewport.
 const VIEWPORT = { width: 1512, height: 871 };
 const DPR = 2;
 const PORT = 9300 + Math.floor(Math.random() * 500);
@@ -30,7 +32,8 @@ const chrome = spawn(
   CHROME,
   [
     "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
-    "--disable-extensions", "--hide-scrollbars", `--user-data-dir=${profile}`,
+    "--disable-extensions", "--hide-scrollbars", `--force-device-scale-factor=${DPR}`,
+    `--window-size=${VIEWPORT.width},${VIEWPORT.height + 87}`, `--user-data-dir=${profile}`,
     `--remote-debugging-port=${PORT}`, "about:blank",
   ],
   { stdio: "ignore" },
@@ -97,8 +100,6 @@ try {
     const { targetId } = await send("Target.createTarget", { url: "about:blank" });
     const { sessionId } = await send("Target.attachToTarget", { targetId, flatten: true });
     await send("Page.enable", {}, sessionId);
-    await send("Emulation.setDeviceMetricsOverride",
-      { ...VIEWPORT, deviceScaleFactor: DPR, mobile: false }, sessionId);
     await send("Emulation.setScrollbarsHidden", { hidden: true }, sessionId);
     const loaded = new Promise((r) => {
       const l = (m) => { if (m.sessionId === sessionId && m.method === "Page.loadEventFired") r(); };
@@ -108,8 +109,8 @@ try {
     await loaded;
     const { result } = await send("Runtime.evaluate", { expression: real ? COLLECT_ALL : COLLECT, returnByValue: true }, sessionId);
     const data = JSON.parse(result.value);
-    if (data.viewport[0] !== VIEWPORT.width || data.viewport[1] !== VIEWPORT.height)
-      throw new Error(`${file}: viewport ${data.viewport} is not ${VIEWPORT.width}x${VIEWPORT.height}`);
+    if (data.viewport[0] !== VIEWPORT.width || data.viewport[1] !== VIEWPORT.height || data.dpr !== DPR)
+      throw new Error(`${file}: viewport ${data.viewport} at ${data.dpr}x is not ${VIEWPORT.width}x${VIEWPORT.height} at ${DPR}x`);
     writeFileSync(join(outDir, basename(file, ".html") + ".json"), JSON.stringify(data, null, 1) + "\n");
     console.log("recorded", file, (real ? data.all : Object.keys(data.rects)).length, "elements");
     await send("Target.closeTarget", { targetId });

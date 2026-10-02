@@ -108,6 +108,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   1/64 px (rounded down), line heights rounded to 1/64, border widths in whole
   device pixels; a `line-height` in em or % is computed to a length before it is
   inherited.
+  `Full` lays out in device pixels, as Blink does at a device scale factor
+  (a page at 2x is a page at zoom 2): font ascent, descent and line gap are
+  rounded to whole device pixels (an Arial line at 16px is 18.5 CSS px), half-leading
+  is floored to one, lengths are kept in 1/64 device px, and the sizes of text
+  fields, buttons and the height of an `x` (`vertical-align: middle`) follow the
+  profile's fonts (`text/metrics_table.rs`). The Chrome numbers in
+  `tests/layout_corpus` are now recorded at a real `--force-device-scale-factor=2`
+  rather than with device-metrics emulation, which rounds in CSS pixels.
+  Also in `Full`: `fieldset`/`legend`, single-colon `:before`/`:after`, logical
+  `border-block`/`-inline` shorthands, `position: sticky` offsets, the rule that a
+  line holding only collapsible spaces takes no room, and the baseline of
+  checkboxes, radio buttons and text areas.
   New dependencies: `unicode-linebreak`
   (Apache-2.0), `unicode-width` (MIT OR Apache-2.0). New properties parsed:
   `grid-template-columns`/`-rows`, `border-collapse`, `border-spacing`,
