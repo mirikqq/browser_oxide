@@ -42,6 +42,8 @@ pub struct FullLayout {
     /// Fragments of inline elements and text nodes, by DOM id: the owning node
     /// and the fragment's index in it.
     inline: HashMap<u32, Vec<(usize, usize)>>,
+    /// See [`Builder::empty_inline`].
+    empty_inline: HashMap<u32, (Option<usize>, u32)>,
 }
 
 impl FullLayout {
@@ -67,6 +69,7 @@ impl FullLayout {
         let vertical_percent = std::mem::take(&mut b.vertical_percent);
         let static_pending = std::mem::take(&mut b.static_pending);
         let block_in_inline = std::mem::take(&mut b.block_in_inline);
+        let empty_inline = std::mem::take(&mut b.empty_inline);
         let mut layout = Self {
             tree: b.tree,
             dom_to_node: b.dom_to_node,
@@ -74,7 +77,9 @@ impl FullLayout {
             block_in_inline,
             matrices: Vec::new(),
             inline: HashMap::new(),
+            empty_inline,
         };
+        layout.tree.justify_blocks();
         if let Some(root) = layout.root {
             let available = Size {
                 width: AvailableSpace::Definite(viewport.width),
@@ -246,7 +251,26 @@ impl FullLayout {
         let mut out = Vec::new();
         self.push_inline_rects(dom_id, &mut out);
         out.extend(self.block_rects(dom_id));
+        if out.is_empty() {
+            out.extend(self.empty_inline_rect(dom_id));
+        }
         out
+    }
+
+    /// An inline element with nothing to show and no line to be on is a zero-size box
+    /// where the next box of its container would start: at the content edge, below the
+    /// box before it and that box's margin.
+    fn empty_inline_rect(&self, dom_id: u32) -> Option<[f32; 4]> {
+        let &(prev, cont) = self.empty_inline.get(&dom_id)?;
+        let c = *self.dom_to_node.get(&cont)?;
+        let layout = &self.tree.nodes[c].layout;
+        let y = match prev.map(|p| &self.tree.nodes[p]) {
+            Some(p) if p.parent == Some(c) => {
+                p.layout.location.y + p.layout.size.height + p.layout.margin.bottom
+            }
+            _ => layout.border.top + layout.padding.top,
+        };
+        Some(self.to_document(c, [layout.border.left + layout.padding.left, y, 0.0, 0.0]))
     }
 
     /// What Chrome reports of the blocks inside an inline element: for each, the
@@ -303,13 +327,19 @@ impl FullLayout {
             .flatten()
             .map(|&(n, f)| &self.tree.nodes[n].frags[f])
             .collect();
+        if frags.is_none() && !self.block_in_inline.contains_key(&id.to_raw()) {
+            if let Some(rect) = self.empty_inline_rect(id.to_raw()) {
+                out.push(rect);
+                return;
+            }
+        }
         let abs = |&(n, f): &(usize, usize)| self.to_document(n, self.tree.nodes[n].frags[f].rect);
         if own.iter().any(|f| f.kind == ifc::FragKind::Text) {
             // A text node: its line fragments.
             out.extend(frags.into_iter().flatten().map(abs));
             return;
         }
-        if own.iter().any(|f| f.decorated) {
+        if own.iter().any(|f| f.decorated) || (!own.is_empty() && dom.children(id).is_empty()) {
             out.extend(frags.into_iter().flatten().map(abs));
             out.extend(self.block_rects(id.to_raw()));
             return;

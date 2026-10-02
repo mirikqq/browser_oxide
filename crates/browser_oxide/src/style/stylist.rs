@@ -44,6 +44,13 @@ const UA_CSS: &str = include_str!("ua.css");
 /// What `LayoutMode::Full` adds, see `ua_full.css`.
 const UA_FULL_CSS: &str = include_str!("ua_full.css");
 
+/// What `LayoutMode::Full` adds for a document in quirks mode, after Chrome's `quirks.css`.
+const UA_QUIRKS_CSS: &str = "
+form { margin-bottom: 1em }
+table { font-weight: normal; font-style: normal; font-size: medium; line-height: normal;
+  white-space: normal; text-align: start }
+";
+
 /// Order given to presentational hints: above every rule of the user-agent sheet,
 /// below every author rule (the origin sees to the latter).
 pub const HINT_ORDER: u32 = 1_000_000;
@@ -150,12 +157,15 @@ impl Stylist {
     }
 
     /// [`Stylist::new`] for a layout mode: `Full` adds the table rules to the
-    /// user-agent sheet.
-    pub fn for_mode(media: MediaFeatures, mode: crate::layout::LayoutMode) -> Self {
+    /// user-agent sheet, and the quirks ones for a document in quirks mode.
+    pub fn for_mode(media: MediaFeatures, mode: crate::layout::LayoutMode, quirks: bool) -> Self {
         let mut s = match mode {
             crate::layout::LayoutMode::Full => UA_FULL_STYLIST.clone(),
             crate::layout::LayoutMode::Legacy => UA_STYLIST.clone(),
         };
+        if quirks && mode == crate::layout::LayoutMode::Full {
+            s.add_stylesheet(UA_QUIRKS_CSS, Origin::UserAgent);
+        }
         s.media = media;
         s.full = mode == crate::layout::LayoutMode::Full;
         s
@@ -344,7 +354,15 @@ impl Stylist {
             let mut decls = Vec::new();
             let mut raw = Vec::new();
             for d in declarations {
-                raw.push(raw_decl(d));
+                let r = raw_decl(d);
+                if self.full {
+                    if let Some(decl) = content_width(&r) {
+                        decls.push(decl);
+                        raw.push(r);
+                        continue;
+                    }
+                }
+                raw.push(r);
                 if let Ok(props) = crate::css_values::parse_property(d.name, &d.value, d.important)
                 {
                     decls.extend(props);
@@ -558,7 +576,15 @@ impl Stylist {
             };
             let important = if d.important { " !important" } else { "" };
             let text = format!("{}:{}{}", d.name, value, important);
-            for declaration in parse_inline_style(&text) {
+            let keyword = RawDecl {
+                value: value.clone(),
+                ..d.clone()
+            };
+            let parsed = match self.full.then(|| content_width(&keyword)).flatten() {
+                Some(declaration) => vec![declaration],
+                None => parse_inline_style(&text),
+            };
+            for declaration in parsed {
                 entries.push(CascadeEntry {
                     declaration,
                     origin: key.origin,
@@ -630,6 +656,25 @@ impl Stylist {
         found.sort_by(|a, b| compare_keys(&a.0, &b.0));
         found.pop().map(|(_, v)| v)
     }
+}
+
+/// `width: fit-content`, `max-content` or `min-content`, which the value parser does not
+/// know (the declaration would be dropped): kept as the keyword, for `LayoutMode::Full`.
+fn content_width(d: &RawDecl) -> Option<PropertyDeclaration> {
+    if d.name != "width" {
+        return None;
+    }
+    let keyword = match d.value.to_ascii_lowercase().as_str() {
+        "fit-content" | "-webkit-fit-content" | "-moz-fit-content" => "fit-content",
+        "max-content" | "-webkit-max-content" | "-moz-max-content" => "max-content",
+        "min-content" | "-webkit-min-content" | "-moz-min-content" => "min-content",
+        _ => return None,
+    };
+    Some(PropertyDeclaration {
+        property: PropertyId::Width,
+        value: CssValue::CustomValue(keyword.to_string()),
+        important: d.important,
+    })
 }
 
 fn raw_decl(d: &Declaration<'_>) -> RawDecl {

@@ -153,6 +153,8 @@ pub struct Ifc {
     pub texts: Vec<TextItem>,
     pub boxes: Vec<InlineBox>,
     pub root: Root,
+    /// Each `<br>`: its atom, its element, and the inline box it is in.
+    pub breaks: Vec<(usize, u32, Option<usize>)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -196,9 +198,13 @@ pub struct Builder {
     atoms: Vec<Atom>,
     texts: Vec<TextItem>,
     boxes: Vec<InlineBox>,
+    breaks: Vec<(usize, u32, Option<usize>)>,
     stack: Vec<usize>,
     root: Root,
     os: String,
+    /// The last text item and its font, while nothing has come between it and the next
+    /// text that would keep the two from being shaped together.
+    shaped_with_next: Option<(usize, ParsedFont)>,
     /// The last thing emitted ended with a collapsible space.
     prev_space: bool,
     visible: bool,
@@ -210,12 +216,19 @@ impl Builder {
             atoms: Vec::new(),
             texts: Vec::new(),
             boxes: Vec::new(),
+            breaks: Vec::new(),
             stack: Vec::new(),
             root,
             os: os.to_string(),
+            shaped_with_next: None,
             prev_space: true,
             visible: false,
         }
+    }
+
+    /// The elements of the empty inline boxes, when that is all there is.
+    pub fn empty_boxes(&self) -> Vec<u32> {
+        self.boxes.iter().map(|b| b.dom).collect()
     }
 
     /// Whether anything that takes room has been added.
@@ -226,6 +239,9 @@ impl Builder {
     pub fn open(&mut self, b: InlineBox) {
         if b.left() > 0.0 || b.right() > 0.0 {
             self.visible = true;
+        }
+        if b.left() > 0.0 {
+            self.shaped_with_next = None;
         }
         let id = self.boxes.len();
         self.boxes.push(b);
@@ -238,6 +254,9 @@ impl Builder {
 
     pub fn close(&mut self) {
         if let Some(id) = self.stack.pop() {
+            if self.boxes[id].right() > 0.0 {
+                self.shaped_with_next = None;
+            }
             self.atoms.push(Atom {
                 kind: AtomKind::Close(id),
                 brk: Brk::None,
@@ -258,6 +277,7 @@ impl Builder {
     }
 
     pub fn atomic(&mut self, node: usize) {
+        self.shaped_with_next = None;
         self.visible = true;
         self.prev_space = false;
         self.atoms.push(Atom {
@@ -284,9 +304,14 @@ impl Builder {
         }
     }
 
-    pub fn line_break(&mut self) {
+    pub fn line_break(&mut self, dom: Option<u32>) {
+        self.shaped_with_next = None;
         self.visible = true;
         self.prev_space = true;
+        if let Some(dom) = dom {
+            self.breaks
+                .push((self.atoms.len(), dom, self.stack.last().copied()));
+        }
         self.atoms.push(Atom {
             kind: AtomKind::Break,
             brk: Brk::Forced,
@@ -300,6 +325,23 @@ impl Builder {
         }
         if text.chars().any(|c| !c.is_whitespace()) {
             self.visible = true;
+        }
+        // Text of the same font is shaped as one run across the elements between: the
+        // kerning of the last character before and the first after goes to the former.
+        if let Some((prev, _)) = self
+            .shaped_with_next
+            .take()
+            .filter(|(_, font)| font == parsed)
+        {
+            if let (Some(a), Some(b)) = (self.texts[prev].text.chars().last(), text.chars().next())
+            {
+                let width = |s: &str| text_width(s, parsed, &self.os);
+                let kern =
+                    width(&format!("{a}{b}")) - width(&a.to_string()) - width(&b.to_string());
+                if let Some(end) = self.texts[prev].prefix.last_mut() {
+                    *end += kern;
+                }
+            }
         }
         let prefix = prefix_widths(&text, parsed, &self.os);
         let preserve = matches!(
@@ -338,6 +380,7 @@ impl Builder {
             prefix,
             units,
         });
+        self.shaped_with_next = Some((item, parsed.clone()));
     }
 
     /// `None` when there is nothing to lay out: only collapsible whitespace and
@@ -359,6 +402,7 @@ impl Builder {
             texts: self.texts,
             boxes: self.boxes,
             root: self.root,
+            breaks: self.breaks,
         })
     }
 }
@@ -681,7 +725,7 @@ fn size_atomic(tree: &mut Tree, node: usize, fit: f32, basis: f32) -> AtomicBox 
     );
     let h = known_h.unwrap_or(out.size.height);
     AtomicBox {
-        w,
+        w: out.size.width,
         h,
         ml,
         mr,
@@ -785,6 +829,16 @@ impl Ifc {
                 continue;
             }
             let forced = self.atoms[j].brk == Brk::Forced;
+            // The space before a `<br>` is at the end of its line, and dropped.
+            if forced
+                && has_content
+                && (i..=j)
+                    .all(|k| matches!(self.atoms[k].kind, AtomKind::Break | AtomKind::Close(_)))
+            {
+                used += chunk;
+                i = j + 1;
+                break;
+            }
             let fits = !has_content || used + trailing + chunk <= avail + 0.001;
             if !fits {
                 break;
@@ -1095,13 +1149,15 @@ fn fragments(
                     let u = &t.units[unit];
                     let (w, _) = ifc.weights(i, atomics);
                     let space = t.prefix[u.end] - t.prefix[u.content_end];
-                    // Closing boxes after it do not count: the space is still at the
+                    // Closing boxes, empty opening ones and a `<br>` after it do not count: the space is still at the
                     // end of the line.
-                    let last_on_line = line
-                        .atoms
-                        .clone()
-                        .skip(i + 1 - line.atoms.start)
-                        .all(|k| matches!(ifc.atoms[k].kind, AtomKind::Close(_)));
+                    let last_on_line = line.atoms.clone().skip(i + 1 - line.atoms.start).all(|k| {
+                        match ifc.atoms[k].kind {
+                            AtomKind::Close(_) | AtomKind::Break => true,
+                            AtomKind::Open(b) => ifc.boxes[b].left() == 0.0,
+                            _ => false,
+                        }
+                    });
                     let shown_end = if last_on_line { u.content_end } else { u.end };
                     let advance = if last_on_line { w } else { w + space };
                     match &mut text {
@@ -1127,7 +1183,26 @@ fn fragments(
                     atomic_at.push((node, x + a.ml, y));
                     x += a.margin_width();
                 }
-                AtomKind::Break => flush(&mut text, x, &mut frags),
+                AtomKind::Break => {
+                    flush(&mut text, x, &mut frags);
+                    if let Some(&(_, dom, owner)) = ifc.breaks.iter().find(|(a, ..)| *a == i) {
+                        let (ascent, descent, lifted) = match owner {
+                            Some(b) => (ifc.boxes[b].ascent, ifc.boxes[b].descent, shift.of_box(b)),
+                            None => (ifc.root.ascent, ifc.root.descent, 0.0),
+                        };
+                        let base = baseline - lifted;
+                        frags.push(Frag {
+                            dom,
+                            owner: dom,
+                            kind: FragKind::Box,
+                            rect: [x, base - ascent, 0.0, ascent + descent],
+                            text: String::new(),
+                            baseline: base,
+                            border: [0.0; 4],
+                            decorated: false,
+                        });
+                    }
+                }
             }
             end_x = x;
         }

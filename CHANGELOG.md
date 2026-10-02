@@ -116,6 +116,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   profile's fonts (`text/metrics_table.rs`). The Chrome numbers in
   `tests/layout_corpus` are now recorded at a real `--force-device-scale-factor=2`
   rather than with device-metrics emulation, which rounds in CSS pixels.
+  Also in `Full`: `justify-self` on block-level boxes and `width: fit-content` (and
+  `max-`/`min-content`), zero-size rectangles for empty inline elements and `<br>`,
+  kerning across element boundaries, the viewport taking the `overflow` of `body`,
+  the quirks-mode rules of the user-agent sheet, and trailing spaces before a `<br>`
+  not counting toward the line.
   Also in `Full`: `fieldset`/`legend`, single-colon `:before`/`:after`, logical
   `border-block`/`-inline` shorthands, `position: sticky` offsets, the rule that a
   line holding only collapsible spaces takes no room, and the baseline of

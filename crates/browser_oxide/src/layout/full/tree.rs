@@ -52,6 +52,15 @@ pub struct TableStyle {
     pub spacing: (f32, f32),
 }
 
+/// How a block-level box takes the width of its content.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fit {
+    /// As wide as the content, up to the room there is (but not below its narrowest).
+    Content,
+    Max,
+    Min,
+}
+
 pub struct Node {
     pub role: Role,
     /// `(colspan, rowspan)` of a cell.
@@ -79,6 +88,9 @@ pub struct Node {
     /// Laid out, so that it has rectangles, but not drawn: the contents of a closed
     /// disclosure.
     pub paint_hidden: bool,
+    /// A block-level box that is as wide as its content rather than its container:
+    /// `width: fit-content` (or `max-`, `min-content`), or a `justify-self`.
+    pub fit: Option<Fit>,
     /// `transform`, applied to the rectangles the box reports.
     pub transform: Option<Vec<crate::css_values::types::transform::TransformFunction>>,
     cache: Cache,
@@ -137,6 +149,7 @@ impl Tree {
             transform: None,
             sticky: None,
             paint_hidden: false,
+            fit: None,
             cache: Cache::new(),
             layout: Layout::with_order(0),
             children,
@@ -197,6 +210,46 @@ impl Tree {
         }
     }
 
+    /// A block-level box with a `justify-self` other than the default is as wide as
+    /// its content, up to the room there is, and sits at that side of its container:
+    /// the auto margins do the placing once the width is known.
+    pub fn justify_blocks(&mut self) {
+        let zero = |m: LengthPercentageAuto| m.maybe_resolve(Some(0.0), resolve_calc) == Some(0.0);
+        for n in 0..self.nodes.len() {
+            let Some(parent) = self.nodes[n].parent else {
+                continue;
+            };
+            let container = &self.nodes[parent];
+            if container.style.display != Display::Block || container.ifc.is_some() {
+                continue;
+            }
+            let node = &mut self.nodes[n];
+            let s = &mut node.style;
+            let Some(align) = s.justify_self else {
+                continue;
+            };
+            if node.role != Role::None
+                || s.display == Display::None
+                || s.position != Position::Relative
+                || s.float != taffy::Float::None
+                || !s.size.width.is_auto()
+            {
+                continue;
+            }
+            if align == AlignItems::CENTER && zero(s.margin.left) && zero(s.margin.right) {
+                s.margin.left = LengthPercentageAuto::AUTO;
+                s.margin.right = LengthPercentageAuto::AUTO;
+            } else if (align == AlignItems::END || align == AlignItems::FLEX_END)
+                && zero(s.margin.left)
+            {
+                s.margin.left = LengthPercentageAuto::AUTO;
+            } else if align != AlignItems::START && align != AlignItems::FLEX_START {
+                continue;
+            }
+            node.fit.get_or_insert(Fit::Content);
+        }
+    }
+
     pub fn compute(&mut self, root: usize, available: Size<AvailableSpace>) {
         compute_root_layout(self, NodeId::from(root), available);
     }
@@ -204,11 +257,38 @@ impl Tree {
     fn compute_node(
         &mut self,
         node_id: NodeId,
-        inputs: LayoutInput,
+        mut inputs: LayoutInput,
         block_ctx: Option<&mut BlockContext<'_>>,
     ) -> LayoutOutput {
         if inputs.run_mode == RunMode::PerformHiddenLayout {
             return compute_hidden_layout(self, node_id);
+        }
+        if let (Some(fit), Some(room)) = (
+            self.nodes[usize::from(node_id)].fit,
+            inputs.known_dimensions.width,
+        ) {
+            let mut measure = |width| {
+                let probe = LayoutInput {
+                    known_dimensions: Size::NONE,
+                    available_space: Size {
+                        width,
+                        height: AvailableSpace::MaxContent,
+                    },
+                    run_mode: RunMode::ComputeSize,
+                    ..inputs
+                };
+                self.compute_child_layout(node_id, probe).size.width
+            };
+            let width = match fit {
+                Fit::Max => measure(AvailableSpace::MaxContent),
+                Fit::Min => measure(AvailableSpace::MinContent),
+                Fit::Content => {
+                    let max = measure(AvailableSpace::MaxContent);
+                    max.min(measure(AvailableSpace::MinContent).max(room))
+                }
+            };
+            inputs.known_dimensions.width = Some(width);
+            inputs.available_space.width = AvailableSpace::Definite(width);
         }
         compute_cached_layout(self, node_id, inputs, |tree, node_id, inputs| {
             let idx = usize::from(node_id);

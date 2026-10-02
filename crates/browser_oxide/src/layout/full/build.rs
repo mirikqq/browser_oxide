@@ -13,6 +13,7 @@ use taffy::{Dimension, Size, Style};
 
 use super::font::{family_list, line_height_px, FontSpec, Metrics};
 use super::ifc::{self, InlineBox, Lift, Root};
+use super::tree::Fit;
 use super::tree::{GroupKind, Role, TableStyle, Tree, VAlign};
 use super::{apply_calc, grid};
 use crate::css_cascade::ComputedStyle;
@@ -145,6 +146,9 @@ pub(super) struct Builder<'a> {
     pub dom_to_node: HashMap<u32, usize>,
     /// The blocks that cut each inline element in two.
     pub block_in_inline: HashMap<u32, Vec<usize>>,
+    /// Inline elements with nothing to show, which got no line: the container they
+    /// are in and the box before them in its flow.
+    pub empty_inline: HashMap<u32, (Option<usize>, u32)>,
     /// Out-of-flow boxes waiting for their containing block; the flag marks
     /// `position: fixed`.
     abs_pending: Vec<(usize, bool)>,
@@ -203,6 +207,7 @@ impl<'a> Builder<'a> {
             tree: Tree::default(),
             dom_to_node: HashMap::new(),
             block_in_inline: HashMap::new(),
+            empty_inline: HashMap::new(),
             abs_pending: Vec::new(),
             css_position: HashMap::new(),
             css_display: HashMap::new(),
@@ -697,7 +702,7 @@ impl<'a> Builder<'a> {
             && self.display_of(id) == CssDisplay::ListItem
         {
             let mut b = self.run_builder(id);
-            b.line_break();
+            b.line_break(None);
             if let Some(ifc) = b.finish() {
                 let block = Style {
                     display: taffy::Display::Block,
@@ -764,14 +769,24 @@ impl<'a> Builder<'a> {
         }
         // A box that starts a block formatting context keeps the margins of
         // its children inside; taffy does that for scroll containers.
-        let clips = [PropertyId::OverflowX, PropertyId::OverflowY]
-            .iter()
-            .any(|p| {
-                matches!(
-                    computed.get(p),
-                    Some(CssValue::Overflow(o)) if !matches!(o, Overflow::Visible | Overflow::Clip)
-                )
-            });
+        let scrolls = |c: &ComputedStyle| {
+            [PropertyId::OverflowX, PropertyId::OverflowY]
+                .iter()
+                .any(|p| {
+                    matches!(
+                        c.get(p),
+                        Some(CssValue::Overflow(o)) if !matches!(o, Overflow::Visible | Overflow::Clip)
+                    )
+                })
+        };
+        // The overflow of `body` goes to the viewport when the root's is visible, and
+        // leaves `body` itself unclipped.
+        let propagated = tag == "body"
+            && self
+                .parent_of(id)
+                .and_then(|root| self.styles.get(root))
+                .is_some_and(|root| !scrolls(root));
+        let clips = scrolls(computed) && !propagated;
         if clips
             || tag == "html"
             || self.float_of(id) != CssFloat::None
@@ -955,6 +970,14 @@ impl<'a> Builder<'a> {
             self.tree.nodes[id_node].lift = self.lift_of(id, computed);
         }
         self.tree.nodes[id_node].sticky = sticky;
+        if let Some(CssValue::CustomValue(k)) = computed.get(&PropertyId::Width) {
+            self.tree.nodes[id_node].fit = match k.as_str() {
+                "max-content" => Some(Fit::Max),
+                "min-content" => Some(Fit::Min),
+                "fit-content" => Some(Fit::Content),
+                _ => None,
+            };
+        }
         if let Some(CssValue::Transform(t)) = computed.get(&PropertyId::Transform) {
             if !t.is_empty() {
                 self.tree.nodes[id_node].transform = Some(t.clone());
@@ -1298,7 +1321,7 @@ impl<'a> Builder<'a> {
             }
             match self.level(c) {
                 Level::Block => {
-                    self.flush(&mut run, &mut out);
+                    self.flush(cont, &mut run, &mut out);
                     if let Some(&n) = self.dom_to_node.get(&c.to_raw()) {
                         out.push(n);
                     }
@@ -1309,15 +1332,29 @@ impl<'a> Builder<'a> {
                 }
             }
         }
-        self.flush(&mut run, &mut out);
+        self.flush(cont, &mut run, &mut out);
         out
     }
 
-    fn flush(&mut self, run: &mut Option<(ifc::Builder, Vec<usize>)>, out: &mut Vec<usize>) {
+    fn flush(
+        &mut self,
+        cont: DomId,
+        run: &mut Option<(ifc::Builder, Vec<usize>)>,
+        out: &mut Vec<usize>,
+    ) {
         let Some((builder, atomics)) = run.take() else {
             return;
         };
-        if let Some(ifc) = builder.finish() {
+        let empty = builder.empty_boxes();
+        let Some(ifc) = builder.finish() else {
+            for dom in empty {
+                self.empty_inline
+                    .entry(dom)
+                    .or_insert((out.last().copied(), cont.to_raw()));
+            }
+            return;
+        };
+        {
             // A block of its own kind: taffy would lay a flex node out as a box that
             // keeps clear of floats, instead of leaving them to the lines.
             let style = Style {
@@ -1410,7 +1447,7 @@ impl<'a> Builder<'a> {
                 match self.tag(id).as_str() {
                     "br" => {
                         if let Some((b, _)) = run.as_mut() {
-                            b.line_break();
+                            b.line_break(Some(id.to_raw()));
                         }
                         return;
                     }
@@ -1469,7 +1506,7 @@ impl<'a> Builder<'a> {
                         b.close_sliced();
                     }
                 }
-                self.flush(run, out);
+                self.flush(cont, run, out);
                 out.push(n);
                 for a in open.iter() {
                     self.block_in_inline.entry(a.to_raw()).or_default().push(n);

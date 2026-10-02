@@ -126,6 +126,7 @@ impl DomState {
             stylist: std::rc::Rc::new(crate::style::Stylist::for_mode(
                 crate::css_cascade::MediaFeatures::default(),
                 crate::layout::default_mode(),
+                false,
             )),
             computed_style_cache: HashMap::new(),
             computed_style_cache_epoch: 0,
@@ -214,7 +215,8 @@ impl DomState {
         }
         // The cascade itself is decided by one `Stylist`, which layout reads; the
         // `cached_rules` above remain for `getComputedStyle`'s text lookup.
-        let mut stylist = crate::style::Stylist::for_mode(features, self.layout_engine.mode());
+        let mut stylist =
+            crate::style::Stylist::for_mode(features, self.layout_engine.mode(), self.dom.quirks());
         for css_text in &self.stylesheets {
             stylist.add_stylesheet(css_text, crate::css_cascade::Origin::Author);
         }
