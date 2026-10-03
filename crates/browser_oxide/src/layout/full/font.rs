@@ -160,7 +160,12 @@ pub fn line_height_px(
     ctx: &ResolveContext,
 ) -> f32 {
     let raw = match c.get(&PropertyId::LineHeight) {
-        Some(CssValue::LineHeight(LineHeight::Number(n))) => *n as f32 * size,
+        // A multiple of the font size: the size is first kept in 1/64 device px (rounded), and
+        // the product is cut down to the same unit.
+        Some(CssValue::LineHeight(LineHeight::Number(n))) => {
+            let device = (size * metrics.dpr * 64.0).round() / 64.0;
+            return (device * *n as f32 * 64.0).floor() / (64.0 * metrics.dpr);
+        }
         Some(CssValue::LineHeight(LineHeight::Length(l))) => resolve_length(
             l,
             &ResolveContext {

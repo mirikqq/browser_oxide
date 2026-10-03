@@ -164,6 +164,7 @@ fn all_property_ids() -> Vec<PropertyId> {
         PropertyId::ColumnCount,
         PropertyId::ColumnWidth,
         PropertyId::BreakInside,
+        PropertyId::Quotes,
         PropertyId::FontSize,
         PropertyId::FontFamily,
         PropertyId::FontWeight,

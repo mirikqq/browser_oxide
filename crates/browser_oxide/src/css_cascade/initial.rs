@@ -83,9 +83,10 @@ pub fn initial_value(property: &PropertyId) -> CssValue {
         PropertyId::JustifySelf => CssValue::Alignment(AlignmentValue::Normal),
         PropertyId::Gap => CssValue::LengthPercentage(LengthPercentage::Length(Length::Zero)),
         PropertyId::RowGap | PropertyId::ColumnGap => CssValue::CustomValue("normal".to_string()),
-        PropertyId::ColumnCount | PropertyId::ColumnWidth | PropertyId::BreakInside => {
-            CssValue::CustomValue("auto".to_string())
-        }
+        PropertyId::ColumnCount
+        | PropertyId::ColumnWidth
+        | PropertyId::BreakInside
+        | PropertyId::Quotes => CssValue::CustomValue("auto".to_string()),
         PropertyId::FontSize => {
             CssValue::LengthPercentage(LengthPercentage::Length(Length::Px(16.0)))
         }

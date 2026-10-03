@@ -14,6 +14,7 @@ use taffy::util::{MaybeResolve, ResolveOrZero};
 
 use crate::css_values::types::length::{CalcContext, CalcExpr};
 use crate::layout::full::ifc::{self, Frag, Ifc};
+use crate::layout::full::multicol;
 use crate::layout::full::table;
 
 /// What a node is in a table.
@@ -87,6 +88,12 @@ pub struct Node {
     pub order: i32,
     /// A caption with `caption-side: bottom`.
     pub caption_below: bool,
+    /// A container laid out in columns.
+    pub multicol: Option<crate::layout::full::multicol::MultiCol>,
+    /// `break-inside: avoid`: a column may not end inside the box.
+    pub break_avoid: bool,
+    /// The lines of inline content, as `(top, bottom)` in the node's own coordinates.
+    pub lines: Vec<(f32, f32)>,
     /// `position: sticky`: the `top`, `right`, `bottom` and `left` offsets, in px.
     pub sticky: Option<[Option<f32>; 4]>,
     /// Laid out, so that it has rectangles, but not drawn: the contents of a closed
@@ -151,6 +158,9 @@ impl Tree {
             lift: ifc::Lift::default(),
             order: 0,
             caption_below: false,
+            multicol: None,
+            break_avoid: false,
+            lines: Vec::new(),
             transform: None,
             sticky: None,
             paint_hidden: false,
@@ -285,6 +295,94 @@ impl Tree {
             }
         }
         found
+    }
+
+    /// The blocks that clear floats, each with the floats before it in its container.
+    pub fn clearing_blocks(&self) -> Vec<(usize, Vec<usize>)> {
+        let mut found = Vec::new();
+        for n in 0..self.nodes.len() {
+            let node = &self.nodes[n];
+            let Some(parent) = node.parent else {
+                continue;
+            };
+            let container = &self.nodes[parent];
+            if node.style.clear == taffy::Clear::None
+                || node.style.float != taffy::Float::None
+                || container.style.display != Display::Block
+                || container.ifc.is_some()
+            {
+                continue;
+            }
+            let at = container.children.iter().position(|&c| c == n).unwrap_or(0);
+            let floats: Vec<usize> = container.children[..at]
+                .iter()
+                .copied()
+                .filter(|&c| {
+                    let side = self.nodes[c].style.float;
+                    match node.style.clear {
+                        taffy::Clear::Left => side == taffy::Float::Left,
+                        taffy::Clear::Right => side == taffy::Float::Right,
+                        _ => side != taffy::Float::None,
+                    }
+                })
+                .collect();
+            if !floats.is_empty() {
+                found.push((n, floats));
+            }
+        }
+        found
+    }
+
+    /// A block pushed down by a float it clears sits on that float's bottom margin edge: its
+    /// top margin and the margins above it are used up by the clearance. Taffy adds them below
+    /// the float, so for each of `blocks` that it pushed down, its top margin is changed by
+    /// what it is too low (negative, to cancel the margins collapsed above it). Whether any
+    /// changed.
+    pub fn clearance_replaces_margin(&mut self, blocks: &[(usize, Vec<usize>)]) -> bool {
+        let length = taffy::CompactLength::LENGTH_TAG;
+        let mut changed = false;
+        for (n, floats) in blocks {
+            let margin = self.nodes[*n].style.margin.top.into_raw();
+            if margin.tag() != length {
+                continue;
+            }
+            let edge = floats
+                .iter()
+                .map(|&f| {
+                    let l = &self.nodes[f].layout;
+                    l.location.y + l.size.height + l.margin.bottom
+                })
+                .fold(f32::NEG_INFINITY, f32::max);
+            let parent = self.nodes[*n].parent.unwrap_or(0);
+            let siblings = &self.nodes[parent].children;
+            let at = siblings.iter().position(|&c| c == *n).unwrap_or(0);
+            let before = siblings[..at].iter().rev().find(|&&c| {
+                let s = &self.nodes[c].style;
+                s.position == Position::Relative
+                    && s.display != Display::None
+                    && s.float == taffy::Float::None
+            });
+            let natural = match before {
+                Some(&p) => {
+                    let l = &self.nodes[p].layout;
+                    l.location.y + l.size.height + self.margin_below(p).max(margin.value()).max(0.0)
+                }
+                None => margin.value().max(0.0),
+            };
+            if natural > edge - 0.01 {
+                continue;
+            }
+            let off = self.nodes[*n].layout.location.y - edge;
+            if off.abs() > 0.01 {
+                self.nodes[*n].style.margin.top =
+                    LengthPercentageAuto::length(margin.value() - off);
+                changed = true;
+            }
+        }
+        if changed {
+            self.clear_caches();
+        }
+        changed
     }
 
     /// The margin that hangs below the block `n`: its own, collapsed with that of its last
@@ -422,6 +520,9 @@ impl Tree {
             }
             let display = tree.nodes[idx].style.display;
             let has_children = !tree.nodes[idx].children.is_empty();
+            if display == Display::Block && has_children && tree.nodes[idx].multicol.is_some() {
+                return multicol::compute(tree, node_id, inputs, block_ctx);
+            }
             match (display, has_children) {
                 (Display::None, _) => compute_hidden_layout(tree, node_id),
                 (Display::Block, true) => compute_block_layout(tree, node_id, inputs, block_ctx),

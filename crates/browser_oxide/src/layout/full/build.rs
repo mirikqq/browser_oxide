@@ -13,6 +13,7 @@ use taffy::{Dimension, Size, Style};
 
 use super::font::{family_list, line_height_px, FontSpec, Metrics};
 use super::ifc::{self, InlineBox, Lift, Root};
+use super::multicol::MultiCol;
 use super::tree::Fit;
 use super::tree::{GroupKind, Role, TableStyle, Tree, VAlign};
 use super::{apply_calc, grid};
@@ -26,7 +27,7 @@ use crate::css_values::types::display::{
 use crate::css_values::types::length::CalcContext;
 use crate::dom::node::{NodeData, NodeId as DomId};
 use crate::dom::Dom;
-use crate::layout::resolve::ResolveContext;
+use crate::layout::resolve::{resolve_length_percentage, ResolveContext};
 use crate::layout::style_map::computed_to_taffy;
 use crate::style::{Pseudo, StyleTree};
 use crate::text::vfallback::{Lang, Primary};
@@ -150,6 +151,8 @@ pub(super) struct Builder<'a> {
     /// Inline elements with nothing to show, which got no line: the container they
     /// are in and the box before them in its flow.
     pub empty_inline: HashMap<u32, (Option<usize>, u32)>,
+    /// How many quotations are open where the walk is.
+    quote_depth: usize,
     /// Out-of-flow boxes waiting for their containing block; the flag marks
     /// `position: fixed`.
     abs_pending: Vec<(usize, bool)>,
@@ -209,6 +212,7 @@ impl<'a> Builder<'a> {
             dom_to_node: HashMap::new(),
             block_in_inline: HashMap::new(),
             empty_inline: HashMap::new(),
+            quote_depth: 0,
             abs_pending: Vec::new(),
             css_position: HashMap::new(),
             css_display: HashMap::new(),
@@ -502,8 +506,23 @@ impl<'a> Builder<'a> {
                         })
                         .map(|a| a.value.to_string())
                         .unwrap_or_default(),
-                    ContentItem::OpenQuote => "\u{201C}".to_string(),
-                    ContentItem::CloseQuote => "\u{201D}".to_string(),
+                    ContentItem::OpenQuote => {
+                        let pairs = self.quote_pairs(pseudo);
+                        let depth = self.quote_depth;
+                        self.quote_depth += 1;
+                        pairs
+                            .get(depth)
+                            .or(pairs.last())
+                            .map_or(String::new(), |p| p.0.clone())
+                    }
+                    ContentItem::CloseQuote => {
+                        let pairs = self.quote_pairs(pseudo);
+                        self.quote_depth = self.quote_depth.saturating_sub(1);
+                        pairs
+                            .get(self.quote_depth)
+                            .or(pairs.last())
+                            .map_or(String::new(), |p| p.1.clone())
+                    }
                     ContentItem::Url(url) => {
                         return super::image::natural_size(url).map(|(w, h)| Generated::Image(w, h))
                     }
@@ -535,6 +554,58 @@ impl<'a> Builder<'a> {
             })
             .collect();
         self.pseudo_parts.insert(pseudo.to_raw(), parts);
+    }
+
+    /// The pairs of quotation marks that apply to `pseudo`, outermost first.
+    fn quote_pairs(&self, pseudo: DomId) -> Vec<(String, String)> {
+        let text = match self
+            .styles
+            .get(pseudo)
+            .and_then(|c| c.get(&PropertyId::Quotes))
+        {
+            Some(CssValue::CustomValue(t)) => t.trim().to_string(),
+            _ => String::new(),
+        };
+        let mut strings = Vec::new();
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '"' && c != '\'' {
+                continue;
+            }
+            let mut s = String::new();
+            while let Some(d) = chars.next() {
+                match d {
+                    d if d == c => break,
+                    '\\' => {
+                        let mut hex = String::new();
+                        while hex.len() < 6 && chars.peek().is_some_and(char::is_ascii_hexdigit) {
+                            hex.extend(chars.next());
+                        }
+                        if hex.is_empty() {
+                            s.extend(chars.next());
+                        } else {
+                            if chars.peek() == Some(&' ') {
+                                chars.next();
+                            }
+                            s.extend(u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32));
+                        }
+                    }
+                    d => s.push(d),
+                }
+            }
+            strings.push(s);
+        }
+        match text.as_str() {
+            "none" => Vec::new(),
+            "" | "auto" => vec![
+                ("\u{201C}".into(), "\u{201D}".into()),
+                ("\u{2018}".into(), "\u{2019}".into()),
+            ],
+            _ => strings
+                .chunks_exact(2)
+                .map(|p| (p[0].clone(), p[1].clone()))
+                .collect(),
+        }
     }
 
     /// Move the out-of-flow children of `id` to the pending list.
@@ -788,7 +859,9 @@ impl<'a> Builder<'a> {
                 .and_then(|root| self.styles.get(root))
                 .is_some_and(|root| !scrolls(root));
         let clips = scrolls(computed) && !propagated;
+        let multicol = self.multicol_of(computed, font_size, style.display);
         if clips
+            || multicol.is_some()
             || tag == "html"
             || self.float_of(id) != CssFloat::None
             || matches!(position, CssPosition::Absolute | CssPosition::Fixed)
@@ -998,6 +1071,11 @@ impl<'a> Builder<'a> {
                 self.tree.nodes[id_node].transform = Some(t.clone());
             }
         }
+        self.tree.nodes[id_node].multicol = multicol;
+        self.tree.nodes[id_node].break_avoid = matches!(
+            computed.get(&PropertyId::BreakInside),
+            Some(CssValue::CustomValue(v)) if matches!(v.trim(), "avoid" | "avoid-column")
+        );
         if role == Role::Caption {
             self.tree.nodes[id_node].caption_below = matches!(
                 computed.get(&PropertyId::CaptionSide),
@@ -1474,6 +1552,7 @@ impl<'a> Builder<'a> {
                 asc_l,
                 desc_l,
                 quirks: self.dom.quirks(),
+                snap: 1.0 / (64.0 * self.dpr),
             },
             self.os,
         )
@@ -1505,6 +1584,43 @@ impl<'a> Builder<'a> {
                 size_px: font.size_px,
             });
         b.text(text_id.to_raw(), text, &font, white, fallback.as_ref());
+    }
+
+    /// What a block container with `column-count` or `column-width` lays its content out in.
+    fn multicol_of(
+        &self,
+        computed: &ComputedStyle,
+        font_size: f32,
+        display: taffy::Display,
+    ) -> Option<MultiCol> {
+        if display != taffy::Display::Block {
+            return None;
+        }
+        let text = |p: PropertyId| match computed.get(&p) {
+            Some(CssValue::CustomValue(s)) => s.trim().to_ascii_lowercase(),
+            _ => String::new(),
+        };
+        let count = text(PropertyId::ColumnCount)
+            .parse::<usize>()
+            .ok()
+            .filter(|&n| n > 0);
+        let width = text_length(
+            &text(PropertyId::ColumnWidth),
+            font_size,
+            self.ctx.root_font_size,
+        );
+        if count.is_none() && width.is_none() {
+            return None;
+        }
+        let ctx = ResolveContext {
+            font_size,
+            ..*self.ctx
+        };
+        let gap = match computed.get(&PropertyId::ColumnGap) {
+            Some(CssValue::LengthPercentage(lp)) => resolve_length_percentage(lp, &ctx, 0.0),
+            _ => font_size,
+        };
+        Some(MultiCol { count, width, gap })
     }
 
     /// The language class of the text in `id`: that of the nearest `lang` attribute.
@@ -1816,4 +1932,18 @@ impl<'a> Builder<'a> {
             padding_bottom: lp(ts.padding.bottom),
         }
     }
+}
+
+/// A length written as a number with `px`, `em`, `rem` or `pt`, in px.
+fn text_length(text: &str, font_size: f32, root_font_size: f32) -> Option<f32> {
+    let (number, unit) = text.split_at(text.find(|c: char| c.is_ascii_alphabetic())?);
+    let n: f32 = number.trim().parse().ok()?;
+    let px = match unit {
+        "px" => n,
+        "em" => n * font_size,
+        "rem" => n * root_font_size,
+        "pt" => n * 4.0 / 3.0,
+        _ => return None,
+    };
+    (px > 0.0).then_some(px)
 }

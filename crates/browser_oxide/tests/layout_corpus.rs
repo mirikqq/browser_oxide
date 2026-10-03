@@ -22,7 +22,7 @@ const TOLERANCE: f64 = 1.0;
 /// What `Legacy` matches today; it is frozen, so this is an equality.
 const LEGACY_MATCHED: usize = 53;
 /// What `Full` has reached; raise it as the layout improves.
-const FULL_FLOOR: usize = 147;
+const FULL_FLOOR: usize = 149;
 
 const COLLECT: &str = "(() => {\
     const box = (b) => [b.x, b.y, b.width, b.height];\

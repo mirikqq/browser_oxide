@@ -19,6 +19,9 @@ center > * { margin-left: auto; margin-right: auto }
 center > table { text-align: start }
 
 
+q::before { content: open-quote }
+q::after { content: close-quote }
+
 /* Form controls, after Chrome's html.css: inline blocks in the small control font.
    Their own sizes (an input is as wide as its `size`, a button as its label) come
    from the layout builder. */

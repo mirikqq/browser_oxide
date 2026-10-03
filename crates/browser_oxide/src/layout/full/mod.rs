@@ -25,6 +25,7 @@ pub(crate) mod font;
 mod grid;
 pub mod ifc;
 mod image;
+mod multicol;
 mod table;
 pub mod tree;
 
@@ -87,7 +88,15 @@ impl FullLayout {
             };
             layout.tree.compute(root, available);
             let floats = layout.tree.floats_after_block();
+            let clearing = layout.tree.clearing_blocks();
             if layout.tree.float_below_margin(&floats) {
+                layout.tree.compute(root, available);
+            }
+            // Each pass takes one more of the margins above a cleared block away.
+            for _ in 0..3 {
+                if !layout.tree.clearance_replaces_margin(&clearing) {
+                    break;
+                }
                 layout.tree.compute(root, available);
             }
             if !vertical_percent.is_empty() {

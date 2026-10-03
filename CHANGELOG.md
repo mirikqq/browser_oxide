@@ -67,7 +67,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   padding or borders, one per text fragment otherwise. `browser_oxide_shell`
   and the `screenshot` example select it. `tests/layout_corpus` measures both
   layouts against what a real Chrome reports for 44 local pages (149 elements
-  within 1px: legacy 53, full 147); `tests/layout_corpus/snapshot.mjs`
+  within 1px: legacy 53, full 149); `tests/layout_corpus/snapshot.mjs`
   re-records Chrome's numbers.
   Also in `Full`: placement in a grid (`grid-template-areas`, `grid-area`,
   `grid-row`/`-column` and their `-start`/`-end`, `grid-auto-flow`,
@@ -116,6 +116,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   profile's fonts (`text/metrics_table.rs`). The Chrome numbers in
   `tests/layout_corpus` are now recorded at a real `--force-device-scale-factor=2`
   rather than with device-metrics emulation, which rounds in CSS pixels.
+  Also in `Full`: multi-column containers (`column-count`, `column-width`, `columns`,
+  `column-gap`, `break-inside: avoid`): the content is cut into balanced columns between
+  boxes and between lines, as Chrome does, and a box cut in two is the union of its pieces;
+  `q` with the quotation marks of `quotes` (nested ones too); line heights given as a
+  number rounded as Chrome rounds them (the font size to 1/64 device px, then the product
+  down), and widths of text up to the next 1/64 device px; a block that clears a float
+  sitting on its bottom margin edge, with the margins above it used up; a break after a
+  hyphen before a digit (`978-1-7185`).
   Also in `Full`: the vertical metrics of the fonts Chrome falls back to
   (`text/vfallback`, from measurements of Chrome on macOS: which font it takes per
   character, primary font and `lang`, and that font's ascent, descent and line gap),

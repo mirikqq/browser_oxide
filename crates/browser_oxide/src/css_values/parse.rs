@@ -121,6 +121,7 @@ pub fn parse_property(
         | "column-count"
         | "column-width"
         | "break-inside"
+        | "quotes"
         | "page-break-inside"
         | "-webkit-column-break-inside"
         | "border-spacing"

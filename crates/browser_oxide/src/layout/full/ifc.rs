@@ -164,6 +164,8 @@ pub struct Root {
     pub desc_l: f32,
     /// Quirks mode: a line with nothing but images has no strut.
     pub quirks: bool,
+    /// What text widths are rounded up to: 1/64 of a device pixel, in px.
+    pub snap: f32,
 }
 
 #[derive(Debug)]
@@ -495,6 +497,17 @@ fn collapse(raw: &str, white: WhiteSpace, prev_space: &mut bool) -> String {
     out
 }
 
+/// A hyphen after a letter or a digit lets the line break before a digit (`978-1-7185`): the
+/// rules close that break, for the hyphen of a negative number, but Chrome opens it.
+fn hyphen_before_digit(text: &str, at: usize, a: char, b: char) -> bool {
+    a == '-'
+        && b.is_ascii_digit()
+        && text[..at - 1]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric)
+}
+
 fn units_of(text: &str, preserve: bool) -> Vec<Unit> {
     let mut units = Vec::new();
     let mut start = 0;
@@ -511,7 +524,8 @@ fn units_of(text: &str, preserve: bool) -> Vec<Unit> {
             }
             match (before, after) {
                 (Some(a), Some(b)) => {
-                    crate::text::breaks::ascii_break_allowed(a, b).unwrap_or(true)
+                    hyphen_before_digit(text, i, a, b)
+                        || crate::text::breaks::ascii_break_allowed(a, b).unwrap_or(true)
                 }
                 _ => true,
             }
@@ -522,7 +536,9 @@ fn units_of(text: &str, preserve: bool) -> Vec<Unit> {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     for w in chars.windows(2) {
         let (i, b) = (w[1].0, w[1].1);
-        if crate::text::breaks::ascii_break_allowed(w[0].1, b) == Some(true) {
+        if crate::text::breaks::ascii_break_allowed(w[0].1, b) == Some(true)
+            || hyphen_before_digit(text, i, w[0].1, b)
+        {
             cuts.push(i);
         }
     }
@@ -804,9 +820,11 @@ impl Ifc {
             AtomKind::Text { item, unit } => {
                 let t = &self.texts[item];
                 let u = &t.units[unit];
+                // Chrome takes the width of a piece of text up to the next 1/64 px.
+                let snap = |w: f32| ((w / self.root.snap) - 1e-3).ceil() * self.root.snap;
                 (
-                    t.prefix[u.content_end] - t.prefix[u.start],
-                    t.prefix[u.end] - t.prefix[u.content_end],
+                    snap(t.prefix[u.content_end] - t.prefix[u.start]),
+                    snap(t.prefix[u.end] - t.prefix[u.content_end]),
                 )
             }
             AtomKind::Open(b) => (self.boxes[b].left(), 0.0),
@@ -1406,6 +1424,11 @@ fn run(
             );
         }
         tree.nodes[idx].frags = frags;
+        tree.nodes[idx].lines = placed
+            .metrics
+            .iter()
+            .map(|&(top, height, _)| (top, top + height))
+            .collect();
     }
     // A line with no height and no text has no baseline to speak of: an inline-block
     // holding only such lines sits on its bottom edge instead.

@@ -87,6 +87,7 @@ pub enum PropertyId {
     ColumnCount,
     ColumnWidth,
     BreakInside,
+    Quotes,
     FontSize,
     FontFamily,
     FontWeight,
@@ -182,6 +183,7 @@ impl PropertyId {
             "row-gap" => Self::RowGap,
             "column-gap" => Self::ColumnGap,
             "column-count" => Self::ColumnCount,
+            "quotes" => Self::Quotes,
             "column-width" => Self::ColumnWidth,
             "break-inside" | "page-break-inside" | "-webkit-column-break-inside" => {
                 Self::BreakInside
