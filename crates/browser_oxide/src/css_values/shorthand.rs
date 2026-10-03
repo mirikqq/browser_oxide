@@ -82,6 +82,7 @@ pub(crate) fn longhands_of(name: &str) -> Option<Vec<String>> {
         "border-style" => sided("border", "style"),
         "border-color" => sided("border", "color"),
         "gap" => names(&["row-gap", "column-gap"]),
+        "columns" => names(&["column-width", "column-count"]),
         "flex" => names(&["flex-grow", "flex-shrink", "flex-basis"]),
         "flex-flow" => names(&["flex-direction", "flex-wrap"]),
         "overflow" => names(&["overflow-x", "overflow-y"]),
@@ -194,6 +195,7 @@ pub(crate) fn expand(name: &str, value: &[ComponentValue<'_>], important: bool) 
     let p = parts(value);
     Some(match name {
         "gap" => pair(&p, ["row-gap", "column-gap"], important, "gap"),
+        "columns" => columns(&p, important),
         "margin-inline" => pair(&p, ["margin-left", "margin-right"], important, name),
         "margin-block" => pair(&p, ["margin-top", "margin-bottom"], important, name),
         "padding-inline" => pair(&p, ["padding-left", "padding-right"], important, name),
@@ -262,6 +264,35 @@ fn pair(p: &[&ComponentValue<'_>], names: [&str; 2], important: bool, what: &str
     };
     let mut out = longhand(names[0], std::slice::from_ref(a), important)?;
     out.extend(longhand(names[1], std::slice::from_ref(b), important)?);
+    Ok(out)
+}
+
+/// `columns: [ <width> || <count> ]`: a number is the count, anything else the width.
+fn columns(p: &[&ComponentValue<'_>], important: bool) -> Parsed {
+    if p.is_empty() || p.len() > 2 {
+        return Err(bad("columns"));
+    }
+    let (mut width, mut count) = (None, None);
+    for v in p {
+        let is_count =
+            matches!(v, ComponentValue::Token(t) if matches!(t.kind, TokenKind::Number { .. }));
+        if is_count {
+            count = Some(*v);
+        } else if width.is_none() && try_ident(v).is_none_or(|w| !w.eq_ignore_ascii_case("auto")) {
+            width = Some(*v);
+        }
+    }
+    let mut out = Vec::new();
+    for (name, v) in [("column-width", width), ("column-count", count)] {
+        match v {
+            Some(v) => out.extend(longhand(name, std::slice::from_ref(v), important)?),
+            None => out.push(decl(
+                name,
+                CssValue::CustomValue("auto".to_string()),
+                important,
+            )),
+        }
+    }
     Ok(out)
 }
 

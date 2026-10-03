@@ -4,7 +4,7 @@
 //! their narrowest allows when there is not, and in between share the difference
 //! in proportion. `border-collapse: collapse` replaces cell borders by half of the
 //! collapsed line they sit on; `border-spacing` separates the cells otherwise.
-//! Not handled: captions, column elements, `table-layout: fixed`, a baseline
+//! Captions go above or below the grid. Not handled: column elements, `table-layout: fixed`, a baseline
 //! for `vertical-align: baseline`.
 
 use taffy::util::ResolveOrZero;
@@ -154,6 +154,12 @@ pub fn compute(tree: &mut Tree, node_id: NodeId, inputs: LayoutInput) -> LayoutO
         return LayoutOutput::HIDDEN;
     };
     let rows = rows_of(tree, t);
+    let captions: Vec<usize> = tree.nodes[t]
+        .children
+        .iter()
+        .copied()
+        .filter(|&c| tree.nodes[c].role == Role::Caption)
+        .collect();
     let (mut cells, ncols) = place_cells(tree, &rows);
     let nrows = rows.len();
     if ncols == 0 || nrows == 0 {
@@ -251,16 +257,27 @@ pub fn compute(tree: &mut Tree, node_id: NodeId, inputs: LayoutInput) -> LayoutO
     for c in cells.iter().filter(|c| c.cs > 1) {
         let spans = c.col..c.col + c.cs;
         let inner = sx * (c.cs - 1) as f32;
-        for (want, col) in [(c.min, &mut cmin), (c.max, &mut cmax)] {
+        // What a spanning cell wants beyond its columns goes to them in proportion to how
+        // much room each has between its narrowest and widest (for the narrowest), or to
+        // its width (for the widest).
+        let slack: Vec<f32> = spans
+            .clone()
+            .map(|i| (cmax[i] - cmin[i]).max(0.0))
+            .collect();
+        for (want, narrowest) in [(c.min, true), (c.max, false)] {
+            let col = if narrowest { &mut cmin } else { &mut cmax };
             let have: f32 = col[spans.clone()].iter().sum::<f32>() + inner;
             if want > have {
-                // The excess goes to the spanned columns in proportion to what
-                // they already are.
-                let own: f32 = col[spans.clone()].iter().sum();
+                let weights: Vec<f32> = if narrowest && slack.iter().sum::<f32>() > 0.0 {
+                    slack.clone()
+                } else {
+                    col[spans.clone()].to_vec()
+                };
+                let own: f32 = weights.iter().sum();
                 let extra = want - have;
-                for w in &mut col[spans.clone()] {
+                for (w, weight) in col[spans.clone()].iter_mut().zip(weights) {
                     let share = if own > 0.0 {
-                        *w / own
+                        weight / own
                     } else {
                         1.0 / c.cs as f32
                     };
@@ -277,7 +294,7 @@ pub fn compute(tree: &mut Tree, node_id: NodeId, inputs: LayoutInput) -> LayoutO
         match c.want {
             Want::Fixed(w) => {
                 fixed[c.col] = true;
-                cmax[c.col] = cmax[c.col].min(w).max(cmin[c.col]);
+                cmax[c.col] = w.max(cmin[c.col]);
             }
             Want::Percent(p) => percent[c.col] = percent[c.col].max(p),
             Want::Auto => {}
@@ -287,7 +304,22 @@ pub fn compute(tree: &mut Tree, node_id: NodeId, inputs: LayoutInput) -> LayoutO
         cmax[i] = cmax[i].max(cmin[i]);
     }
     let (sum_min, sum_max) = (cmin.iter().sum::<f32>(), cmax.iter().sum::<f32>());
-    let (natural_min, natural_max) = (sum_min + fixed_w, sum_max + fixed_w);
+    // A caption is as wide as the table, which it keeps from being narrower than its own
+    // narrowest.
+    let caption_min = captions
+        .iter()
+        .map(|&c| {
+            let mut inputs = input(
+                RunMode::ComputeSize,
+                Size::NONE,
+                space(AvailableSpace::MinContent),
+            );
+            inputs.sizing_mode = SizingMode::ContentSize;
+            tree_width(tree, NodeId::from(c), inputs)
+        })
+        .fold(0.0f32, f32::max);
+    let natural_min = (sum_min + fixed_w).max(caption_min);
+    let natural_max = (sum_max + fixed_w).max(natural_min);
 
     // The table's own width: what it asked for, or as much as it wants and there
     // is room for.
@@ -409,15 +441,30 @@ pub fn compute(tree: &mut Tree, node_id: NodeId, inputs: LayoutInput) -> LayoutO
             row_h[c.row + c.rs - 1] += c.need - have;
         }
     }
+    let caption_h: Vec<f32> = captions
+        .iter()
+        .map(|&c| tree_height(tree, NodeId::from(c), cell_inputs(width)))
+        .collect();
+    let caption_total: f32 = caption_h.iter().sum();
+    let caption_above: f32 = captions
+        .iter()
+        .zip(&caption_h)
+        .filter(|(&c, _)| !tree.nodes[c].caption_below)
+        .map(|(_, h)| h)
+        .sum();
     let row_y: Vec<f32> = row_h
         .iter()
-        .scan(edge_t, |y, h| {
+        .scan(caption_above + edge_t, |y, h| {
             let at = *y;
             *y += h + sy;
             Some(at)
         })
         .collect();
-    let height = edge_t + edge_b + row_h.iter().sum::<f32>() + sy * nrows.saturating_sub(1) as f32;
+    let height = caption_total
+        + edge_t
+        + edge_b
+        + row_h.iter().sum::<f32>()
+        + sy * nrows.saturating_sub(1) as f32;
     let height = style
         .size
         .height
@@ -426,6 +473,49 @@ pub fn compute(tree: &mut Tree, node_id: NodeId, inputs: LayoutInput) -> LayoutO
     let out = LayoutOutput::from_outer_size(Size { width, height });
     if inputs.run_mode != RunMode::PerformLayout {
         return out;
+    }
+
+    let grid_bottom = height - (caption_total - caption_above);
+    let (mut above_y, mut below_y) = (0.0, grid_bottom);
+    for (&c, &h) in captions.iter().zip(&caption_h) {
+        let caption_y = if tree.nodes[c].caption_below {
+            below_y
+        } else {
+            above_y
+        };
+        let done = tree.compute_child_layout(NodeId::from(c), cell_inputs(width));
+        let style = tree.nodes[c].style.clone();
+        tree.set_unrounded_layout(
+            NodeId::from(c),
+            &Layout {
+                order: 0,
+                location: Point {
+                    x: 0.0,
+                    y: caption_y,
+                },
+                size: Size { width, height: h },
+                content_size: done.content_size,
+                scrollbar_size: Size::ZERO,
+                border: Rect {
+                    left: px(style.border.left),
+                    right: px(style.border.right),
+                    top: px(style.border.top),
+                    bottom: px(style.border.bottom),
+                },
+                padding: Rect {
+                    left: px(style.padding.left),
+                    right: px(style.padding.right),
+                    top: px(style.padding.top),
+                    bottom: px(style.padding.bottom),
+                },
+                margin: Rect::ZERO,
+            },
+        );
+        if tree.nodes[c].caption_below {
+            below_y += h;
+        } else {
+            above_y += h;
+        }
     }
 
     // Placement: rows and groups are boxes of their own, cells sit in rows.

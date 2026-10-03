@@ -116,6 +116,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   profile's fonts (`text/metrics_table.rs`). The Chrome numbers in
   `tests/layout_corpus` are now recorded at a real `--force-device-scale-factor=2`
   rather than with device-metrics emulation, which rounds in CSS pixels.
+  Also in `Full`: the vertical metrics of the fonts Chrome falls back to
+  (`text/vfallback`, from measurements of Chrome on macOS: which font it takes per
+  character, primary font and `lang`, and that font's ascent, descent and line gap),
+  so that a line of `line-height: normal` with Japanese, Thai or Indic text is as
+  tall as in Chrome; CSS tables built from `display` values (anonymous rows and cells
+  around table parts and content, `table-caption` with `caption-side`), floated
+  tables sized by their `width`, a float placed below the bottom margin of the block
+  before it, spanning table cells sharing their minimum by slack, `width` on a cell
+  setting its column, an image or video taking the ratio of its `width` and
+  `height` attributes, and the baseline of a zero-height line that holds text.
   Also in `Full`: `justify-self` on block-level boxes and `width: fit-content` (and
   `max-`/`min-content`), zero-size rectangles for empty inline elements and `<br>`,
   kerning across element boundaries, the viewport taking the `overflow` of `body`,

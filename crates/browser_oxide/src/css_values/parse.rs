@@ -117,6 +117,12 @@ pub fn parse_property(
         "grid-template-columns"
         | "grid-template-rows"
         | "border-collapse"
+        | "caption-side"
+        | "column-count"
+        | "column-width"
+        | "break-inside"
+        | "page-break-inside"
+        | "-webkit-column-break-inside"
         | "border-spacing"
         | "list-style-type"
         | "order"
@@ -137,7 +143,12 @@ pub fn parse_property(
         | "grid-column-end" => CssValue::CustomValue(component_values_to_string(value_trimmed)),
         "align-items" | "align-self" | "align-content" | "justify-content" | "justify-items"
         | "justify-self" => parse_alignment(value_trimmed)?,
-        "row-gap" | "column-gap" => parse_length_percentage(value_trimmed)?,
+        "row-gap" | "column-gap" => match value_trimmed {
+            [one] if try_ident(one).is_some_and(|w| w.eq_ignore_ascii_case("normal")) => {
+                CssValue::CustomValue("normal".to_string())
+            }
+            _ => parse_length_percentage(value_trimmed)?,
+        },
         "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => {
             parse_color(value_trimmed)?
         }

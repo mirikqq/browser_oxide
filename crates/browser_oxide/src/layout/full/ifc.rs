@@ -21,6 +21,7 @@ use taffy::{
 use crate::css_values::types::display::{TextAlign, WhiteSpace};
 use crate::layout::full::tree::{resolve_calc, Role, Tree};
 use crate::text::fallback::hermetic_segments;
+use crate::text::vfallback::{extent, Lang, Primary};
 use crate::text::{shaper, ParsedFont};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -53,6 +54,24 @@ pub struct Unit {
     /// End of the word, before any trailing spaces.
     pub content_end: usize,
     pub end: usize,
+    /// How far above and below the baseline the fallback fonts of its characters reach in a
+    /// line of `line-height: normal`.
+    pub used: Option<(f32, f32)>,
+}
+
+/// What decides which fonts Chrome falls back to, for text in a box of `line-height: normal`.
+pub struct Fallback {
+    pub primary: Primary,
+    pub lang: Lang,
+    pub dpr: f32,
+    pub size_px: f32,
+}
+
+impl Fallback {
+    fn reach(&self, text: &str) -> Option<(f32, f32)> {
+        extent(text, self.primary, self.lang, self.size_px * self.dpr)
+            .map(|(above, below)| (above / self.dpr, below / self.dpr))
+    }
 }
 
 #[derive(Debug)]
@@ -318,7 +337,14 @@ impl Builder {
         });
     }
 
-    pub fn text(&mut self, dom: u32, raw: &str, parsed: &ParsedFont, white: WhiteSpace) {
+    pub fn text(
+        &mut self,
+        dom: u32,
+        raw: &str,
+        parsed: &ParsedFont,
+        white: WhiteSpace,
+        fallback: Option<&Fallback>,
+    ) {
         let text = collapse(raw, white, &mut self.prev_space);
         if text.is_empty() {
             return;
@@ -349,7 +375,12 @@ impl Builder {
             WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::BreakSpaces
         );
         let wraps = !matches!(white, WhiteSpace::Nowrap | WhiteSpace::Pre);
-        let units = units_of(&text, preserve);
+        let mut units = units_of(&text, preserve);
+        if let Some(fallback) = fallback {
+            for u in &mut units {
+                u.used = fallback.reach(&text[u.start..u.end]);
+            }
+        }
         let item = self.texts.len();
         let count = units.len();
         for (i, u) in units.iter().enumerate() {
@@ -514,6 +545,7 @@ fn units_of(text: &str, preserve: bool) -> Vec<Unit> {
             start,
             content_end: start + content.len(),
             end,
+            used: None,
         });
         start = end;
     }
@@ -960,6 +992,13 @@ fn place(
                     open.retain(|&x| x != b);
                 }
                 AtomKind::Text { .. } | AtomKind::Break => {
+                    if let AtomKind::Text { item, unit } = ifc.atoms[i].kind {
+                        if let Some((above, below)) = ifc.texts[item].units[unit].used {
+                            let off = open.last().map_or(0.0, |&p| cum[p]);
+                            asc = asc.max(above + off);
+                            desc = desc.max(below - off);
+                        }
+                    }
                     let is_break = matches!(ifc.atoms[i].kind, AtomKind::Break);
                     root_text |= open.is_empty() && !is_break;
                     root_break |= open.is_empty() && is_break;
@@ -1368,12 +1407,17 @@ fn run(
         }
         tree.nodes[idx].frags = frags;
     }
-    // A line with no height has no baseline to speak of: an inline-block holding
-    // only such lines sits on its bottom edge instead.
+    // A line with no height and no text has no baseline to speak of: an inline-block
+    // holding only such lines sits on its bottom edge instead.
+    let has_text = placed.lines.last().is_some_and(|line| {
+        line.atoms
+            .clone()
+            .any(|i| matches!(ifc.atoms[i].kind, AtomKind::Text { .. }))
+    });
     tree.nodes[idx].baseline = placed
         .metrics
         .last()
-        .filter(|&&(_, height, _)| height > 0.0)
+        .filter(|&&(_, height, _)| height > 0.0 || has_text)
         .map(|&(top, _, asc)| top + asc);
     let first_baseline = placed.metrics.first().map(|&(_, _, asc)| asc);
     LayoutOutput::from_sizes_and_baselines(

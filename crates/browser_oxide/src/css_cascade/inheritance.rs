@@ -14,6 +14,7 @@ pub fn is_inherited(property: &PropertyId) -> bool {
             | PropertyId::WhiteSpace
             | PropertyId::Visibility
             | PropertyId::BorderCollapse
+            | PropertyId::CaptionSide
             | PropertyId::BorderSpacing
             | PropertyId::ListStyleType
             | PropertyId::Custom(_)

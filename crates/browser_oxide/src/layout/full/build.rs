@@ -17,7 +17,7 @@ use super::tree::Fit;
 use super::tree::{GroupKind, Role, TableStyle, Tree, VAlign};
 use super::{apply_calc, grid};
 use crate::css_cascade::ComputedStyle;
-use crate::css_values::property::{CssValue, PropertyId};
+use crate::css_values::property::{CssValue, LineHeight, PropertyId};
 use crate::css_values::types::content::ContentItem;
 use crate::css_values::types::display::{
     Clear as CssClear, Display as CssDisplay, Float as CssFloat, Overflow, Position as CssPosition,
@@ -29,6 +29,7 @@ use crate::dom::Dom;
 use crate::layout::resolve::ResolveContext;
 use crate::layout::style_map::computed_to_taffy;
 use crate::style::{Pseudo, StyleTree};
+use crate::text::vfallback::{Lang, Primary};
 use crate::text::ParsedFont;
 
 /// Step limit for the DOM walk: a cycle in the arena panics with a clear message
@@ -620,16 +621,16 @@ impl<'a> Builder<'a> {
             CssDisplay::TableRowGroup => Role::Group(GroupKind::Body),
             CssDisplay::TableRow => Role::Row,
             CssDisplay::TableCell => Role::Cell,
-            // Columns are not boxes; captions are not laid out yet.
-            CssDisplay::TableColumn | CssDisplay::TableColumnGroup | CssDisplay::TableCaption => {
-                return None
-            }
+            CssDisplay::TableCaption => Role::Caption,
+            // Columns are not boxes.
+            CssDisplay::TableColumn | CssDisplay::TableColumnGroup => return None,
             _ => Role::None,
         };
         let mut children = if replaced {
             Vec::new()
         } else if matches!(role, Role::Table | Role::Group(_) | Role::Row) {
-            self.table_children(id)
+            let parts = self.assemble(id);
+            self.wrap_table_parts(role, parts)
         } else {
             self.assemble(id)
         };
@@ -963,6 +964,20 @@ impl<'a> Builder<'a> {
                 }
             }
         }
+        // An image or a video takes the ratio of its `width` and `height` attributes, so that one
+        // of the two set by style gives the other, before there is anything to load.
+        if matches!(&*tag, "img" | "video") && style.aspect_ratio.is_none() {
+            let number = |name: &str| {
+                attrs
+                    .iter()
+                    .find(|a| a.name.local.eq_ignore_ascii_case(name))
+                    .and_then(|a| a.value.trim().trim_end_matches("px").parse::<f32>().ok())
+                    .filter(|n| *n > 0.0)
+            };
+            if let (Some(w), Some(h)) = (number("width"), number("height")) {
+                style.aspect_ratio = Some(w / h);
+            }
+        }
         let id_node = self.tree.add(style, children);
         self.tree.nodes[id_node].role = role;
         self.tree.nodes[id_node].control_baseline = control_baseline;
@@ -982,6 +997,12 @@ impl<'a> Builder<'a> {
             if !t.is_empty() {
                 self.tree.nodes[id_node].transform = Some(t.clone());
             }
+        }
+        if role == Role::Caption {
+            self.tree.nodes[id_node].caption_below = matches!(
+                computed.get(&PropertyId::CaptionSide),
+                Some(CssValue::CustomValue(side)) if side.trim() == "bottom"
+            );
         }
         if let Some(CssValue::CustomValue(o)) = computed.get(&PropertyId::Order) {
             self.tree.nodes[id_node].order = o.trim().parse().unwrap_or(0);
@@ -1013,14 +1034,62 @@ impl<'a> Builder<'a> {
         Some(id_node)
     }
 
-    /// The children of a table, row group or row that are table parts.
-    fn table_children(&self, id: DomId) -> Vec<usize> {
-        self.dom
-            .children(id)
-            .into_iter()
-            .filter_map(|c| self.dom_to_node.get(&c.to_raw()).copied())
-            .filter(|&n| self.tree.nodes[n].role != Role::None)
-            .collect()
+    /// The children of a table, row group or row, with what is not a part of a table in
+    /// them wrapped in anonymous boxes (CSS 2.1 §17.2.1): cells without a row get a row,
+    /// anything else a row and a cell, and a row's other children a cell. Runs of such
+    /// children share one box.
+    fn wrap_table_parts(&mut self, role: Role, parts: Vec<usize>) -> Vec<usize> {
+        let fits = |r: Role| match role {
+            Role::Table => matches!(r, Role::Row | Role::Group(_) | Role::Caption),
+            Role::Group(_) => r == Role::Row,
+            _ => r == Role::Cell,
+        };
+        let anonymous = |tree: &mut Tree, role: Role, kids: Vec<usize>| {
+            let style = Style {
+                display: taffy::Display::Block,
+                ..Default::default()
+            };
+            let n = tree.add(style, kids);
+            tree.nodes[n].role = role;
+            n
+        };
+        let mut out = Vec::new();
+        let mut run: Vec<usize> = Vec::new();
+        let flush = |tree: &mut Tree, run: &mut Vec<usize>, out: &mut Vec<usize>| {
+            let kids = std::mem::take(run);
+            if role == Role::Row {
+                if !kids.is_empty() {
+                    out.push(anonymous(tree, Role::Cell, kids));
+                }
+                return;
+            }
+            let mut i = 0;
+            while i < kids.len() {
+                let is_cell = tree.nodes[kids[i]].role == Role::Cell;
+                let end = kids[i..]
+                    .iter()
+                    .position(|&k| (tree.nodes[k].role == Role::Cell) != is_cell)
+                    .map_or(kids.len(), |n| i + n);
+                let group = kids[i..end].to_vec();
+                let cells = if is_cell {
+                    group
+                } else {
+                    vec![anonymous(tree, Role::Cell, group)]
+                };
+                out.push(anonymous(tree, Role::Row, cells));
+                i = end;
+            }
+        };
+        for part in parts {
+            if fits(self.tree.nodes[part].role) {
+                flush(&mut self.tree, &mut run, &mut out);
+                out.push(part);
+            } else {
+                run.push(part);
+            }
+        }
+        flush(&mut self.tree, &mut run, &mut out);
+        out
     }
 
     fn table_style(&self, c: &ComputedStyle) -> TableStyle {
@@ -1419,7 +1488,41 @@ impl<'a> Builder<'a> {
             Some(CssValue::WhiteSpace(w)) => *w,
             _ => WhiteSpace::Normal,
         };
-        b.text(text_id.to_raw(), text, &font, white);
+        // The fonts a line falls back to count towards its height only with `line-height: normal`.
+        let normal = !matches!(
+            c.get(&PropertyId::LineHeight),
+            Some(CssValue::LineHeight(
+                LineHeight::Number(_) | LineHeight::Length(_) | LineHeight::Percentage(_)
+            ))
+        );
+        let fallback = normal
+            .then(|| Primary::of(&font.families, self.os))
+            .flatten()
+            .map(|primary| ifc::Fallback {
+                primary,
+                lang: self.lang_of(parent),
+                dpr: self.dpr,
+                size_px: font.size_px,
+            });
+        b.text(text_id.to_raw(), text, &font, white, fallback.as_ref());
+    }
+
+    /// The language class of the text in `id`: that of the nearest `lang` attribute.
+    fn lang_of(&self, mut id: DomId) -> Lang {
+        loop {
+            let tag = self.dom.get(id).and_then(|n| n.as_element()).and_then(|e| {
+                e.attrs
+                    .iter()
+                    .find(|a| a.name.local.eq_ignore_ascii_case("lang"))
+            });
+            if let Some(a) = tag {
+                return Lang::of(&a.value);
+            }
+            match self.parent_of(id) {
+                Some(p) => id = p,
+                None => return Lang::None,
+            }
+        }
     }
 
     /// Add the inline-level element `id` to the run being built. `open` holds the

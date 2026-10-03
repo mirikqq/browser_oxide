@@ -86,6 +86,10 @@ impl FullLayout {
                 height: AvailableSpace::Definite(viewport.height),
             };
             layout.tree.compute(root, available);
+            let floats = layout.tree.floats_after_block();
+            if layout.tree.float_below_margin(&floats) {
+                layout.tree.compute(root, available);
+            }
             if !vertical_percent.is_empty() {
                 // taffy resolves these against the parent's height; CSS says width.
                 layout.tree.resolve_vertical_percent(&vertical_percent);

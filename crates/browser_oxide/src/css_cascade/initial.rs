@@ -61,6 +61,7 @@ pub fn initial_value(property: &PropertyId) -> CssValue {
             CssValue::CustomValue("none".to_string())
         }
         PropertyId::BorderCollapse => CssValue::CustomValue("separate".to_string()),
+        PropertyId::CaptionSide => CssValue::CustomValue("top".to_string()),
         PropertyId::BorderSpacing => CssValue::CustomValue("0px".to_string()),
         PropertyId::VerticalAlign => CssValue::CustomValue("baseline".to_string()),
         PropertyId::GridTemplateAreas => CssValue::CustomValue("none".to_string()),
@@ -80,8 +81,10 @@ pub fn initial_value(property: &PropertyId) -> CssValue {
         PropertyId::JustifyContent => CssValue::Alignment(AlignmentValue::Normal),
         PropertyId::JustifyItems => CssValue::Alignment(AlignmentValue::Normal),
         PropertyId::JustifySelf => CssValue::Alignment(AlignmentValue::Normal),
-        PropertyId::Gap | PropertyId::RowGap | PropertyId::ColumnGap => {
-            CssValue::LengthPercentage(LengthPercentage::Length(Length::Zero))
+        PropertyId::Gap => CssValue::LengthPercentage(LengthPercentage::Length(Length::Zero)),
+        PropertyId::RowGap | PropertyId::ColumnGap => CssValue::CustomValue("normal".to_string()),
+        PropertyId::ColumnCount | PropertyId::ColumnWidth | PropertyId::BreakInside => {
+            CssValue::CustomValue("auto".to_string())
         }
         PropertyId::FontSize => {
             CssValue::LengthPercentage(LengthPercentage::Length(Length::Px(16.0)))

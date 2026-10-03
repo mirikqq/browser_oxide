@@ -13,6 +13,7 @@ pub mod font_shorthand;
 pub mod metrics_table;
 pub mod raster;
 pub mod shaper;
+pub mod vfallback;
 
 pub use font_database::FontDatabase;
 pub use font_shorthand::ParsedFont;

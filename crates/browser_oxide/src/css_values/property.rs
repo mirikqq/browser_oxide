@@ -61,6 +61,7 @@ pub enum PropertyId {
     GridTemplateColumns,
     GridTemplateRows,
     BorderCollapse,
+    CaptionSide,
     BorderSpacing,
     VerticalAlign,
     GridTemplateAreas,
@@ -83,6 +84,9 @@ pub enum PropertyId {
     Gap,
     RowGap,
     ColumnGap,
+    ColumnCount,
+    ColumnWidth,
+    BreakInside,
     FontSize,
     FontFamily,
     FontWeight,
@@ -154,6 +158,7 @@ impl PropertyId {
             "grid-template-columns" => Self::GridTemplateColumns,
             "grid-template-rows" => Self::GridTemplateRows,
             "border-collapse" => Self::BorderCollapse,
+            "caption-side" => Self::CaptionSide,
             "border-spacing" => Self::BorderSpacing,
             "vertical-align" => Self::VerticalAlign,
             "grid-template-areas" => Self::GridTemplateAreas,
@@ -176,6 +181,11 @@ impl PropertyId {
             "gap" => Self::Gap,
             "row-gap" => Self::RowGap,
             "column-gap" => Self::ColumnGap,
+            "column-count" => Self::ColumnCount,
+            "column-width" => Self::ColumnWidth,
+            "break-inside" | "page-break-inside" | "-webkit-column-break-inside" => {
+                Self::BreakInside
+            }
             "font-size" => Self::FontSize,
             "font-family" => Self::FontFamily,
             "font-weight" => Self::FontWeight,

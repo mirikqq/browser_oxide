@@ -10,7 +10,7 @@ use taffy::{
     LayoutOutput, LayoutPartialTree, RunMode, TraversePartialTree, TraverseTree,
 };
 
-use taffy::util::MaybeResolve;
+use taffy::util::{MaybeResolve, ResolveOrZero};
 
 use crate::css_values::types::length::{CalcContext, CalcExpr};
 use crate::layout::full::ifc::{self, Frag, Ifc};
@@ -26,6 +26,8 @@ pub enum Role {
     Group(GroupKind),
     Row,
     Cell,
+    /// A `display: table-caption` box, above or below the grid of its table.
+    Caption,
     /// An empty box left in the flow where an out-of-flow box would have been.
     Marker,
 }
@@ -83,6 +85,8 @@ pub struct Node {
     pub lift: ifc::Lift,
     /// `order`, which sorts the items of a flex or grid container.
     pub order: i32,
+    /// A caption with `caption-side: bottom`.
+    pub caption_below: bool,
     /// `position: sticky`: the `top`, `right`, `bottom` and `left` offsets, in px.
     pub sticky: Option<[Option<f32>; 4]>,
     /// Laid out, so that it has rectangles, but not drawn: the contents of a closed
@@ -146,6 +150,7 @@ impl Tree {
             control_baseline: None,
             lift: ifc::Lift::default(),
             order: 0,
+            caption_below: false,
             transform: None,
             sticky: None,
             paint_hidden: false,
@@ -250,6 +255,101 @@ impl Tree {
         }
     }
 
+    /// The floats that come right after a block: a float goes below that block's bottom
+    /// margin, and the two margins add up, where taffy starts it at the block's border box.
+    /// With each, the block before it.
+    pub fn floats_after_block(&self) -> Vec<(usize, usize)> {
+        let mut found = Vec::new();
+        for n in 0..self.nodes.len() {
+            let Some(parent) = self.nodes[n].parent else {
+                continue;
+            };
+            let container = &self.nodes[parent];
+            if self.nodes[n].style.float == taffy::Float::None
+                || container.style.display != Display::Block
+                || container.ifc.is_some()
+            {
+                continue;
+            }
+            let Some(at) = container.children.iter().position(|&c| c == n) else {
+                continue;
+            };
+            let before = container.children[..at].iter().rev().find(|&&c| {
+                let s = &self.nodes[c].style;
+                s.position == Position::Relative && s.display != Display::None
+            });
+            if let Some(&before) = before {
+                if self.nodes[before].style.float == taffy::Float::None {
+                    found.push((n, before));
+                }
+            }
+        }
+        found
+    }
+
+    /// The margin that hangs below the block `n`: its own, collapsed with that of its last
+    /// child when nothing keeps the two apart.
+    fn margin_below(&self, n: usize) -> f32 {
+        let node = &self.nodes[n];
+        let length = taffy::CompactLength::LENGTH_TAG;
+        let own = node.style.margin.bottom.into_raw();
+        let own = if own.tag() == length {
+            own.value()
+        } else {
+            0.0
+        };
+        let s = &node.style;
+        let open = node.ifc.is_none()
+            && s.display == Display::Block
+            && s.overflow.x == taffy::Overflow::Visible
+            && s.overflow.y == taffy::Overflow::Visible
+            && s.size.height.is_auto()
+            && s.padding.bottom.into_raw().value() == 0.0
+            && s.border.bottom.into_raw().value() == 0.0;
+        let last = node.children.iter().rev().find(|&&c| {
+            let s = &self.nodes[c].style;
+            s.position == Position::Relative
+                && s.display != Display::None
+                && s.float == taffy::Float::None
+        });
+        match last {
+            Some(&c) if open => {
+                let inner = self.margin_below(c);
+                if own >= 0.0 && inner >= 0.0 {
+                    own.max(inner)
+                } else {
+                    own + inner
+                }
+            }
+            _ => own,
+        }
+    }
+
+    /// Add the margin of the block before to the float's own, for each of `floats` that
+    /// was laid out right under that block (one pushed down by a clearing float was not).
+    /// Whether any changed.
+    pub fn float_below_margin(&mut self, floats: &[(usize, usize)]) -> bool {
+        let length = taffy::CompactLength::LENGTH_TAG;
+        let mut changed = false;
+        for &(n, before) in floats {
+            let own = self.nodes[n].style.margin.top.into_raw();
+            let below = self.margin_below(before);
+            if own.tag() != length || below == 0.0 {
+                continue;
+            }
+            let (f, b) = (&self.nodes[n].layout, &self.nodes[before].layout);
+            let flow = b.location.y + b.size.height;
+            if (f.location.y - f.margin.top - flow).abs() < 0.01 {
+                self.nodes[n].style.margin.top = LengthPercentageAuto::length(own.value() + below);
+                changed = true;
+            }
+        }
+        if changed {
+            self.clear_caches();
+        }
+        changed
+    }
+
     pub fn compute(&mut self, root: usize, available: Size<AvailableSpace>) {
         compute_root_layout(self, NodeId::from(root), available);
     }
@@ -262,6 +362,28 @@ impl Tree {
     ) -> LayoutOutput {
         if inputs.run_mode == RunMode::PerformHiddenLayout {
             return compute_hidden_layout(self, node_id);
+        }
+        // A floated table is sized without being told its width, which then comes from its style.
+        let table = &self.nodes[usize::from(node_id)];
+        if table.role == Role::Table
+            && table.style.float != taffy::Float::None
+            && inputs.known_dimensions.width.is_none()
+        {
+            let style = &table.style;
+            let edges = if style.box_sizing == BoxSizing::ContentBox {
+                let lp = |v: LengthPercentage| v.resolve_or_zero(None, resolve_calc);
+                lp(style.padding.left)
+                    + lp(style.padding.right)
+                    + lp(style.border.left)
+                    + lp(style.border.right)
+            } else {
+                0.0
+            };
+            inputs.known_dimensions.width = style
+                .size
+                .width
+                .maybe_resolve(inputs.parent_size.width, resolve_calc)
+                .map(|w| w + edges);
         }
         if let (Some(fit), Some(room)) = (
             self.nodes[usize::from(node_id)].fit,

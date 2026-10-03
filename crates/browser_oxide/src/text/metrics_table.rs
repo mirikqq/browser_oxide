@@ -469,6 +469,19 @@ fn vertical_alias(key: &str) -> String {
     }
 }
 
+/// The family whose metrics the first of `families` this profile knows takes, else the OS
+/// default (`times`): what `vertical` looks up.
+pub fn primary_key(families: &[String]) -> String {
+    let known = |key: &str| {
+        VERTICAL_FAMILIES.contains(&key) || VERTICAL_EM.iter().any(|(name, ..)| *name == key)
+    };
+    families
+        .iter()
+        .map(|f| vertical_alias(&key_of(f)))
+        .find(|key| known(key))
+        .unwrap_or_else(|| VERTICAL_FAMILIES[0].to_string())
+}
+
 /// Ascent, descent and line gap (device px, whole numbers) of the first family of
 /// `families` this profile has vertical metrics for, else the OS default (`Times`), at a font of
 /// `size_px` device pixels. `None` for an OS without a table.
@@ -476,14 +489,7 @@ pub fn vertical(families: &[String], os_name: &str, size_px: f32) -> Option<(f32
     if os_name != "macOS" {
         return None;
     }
-    let known = |key: &str| {
-        VERTICAL_FAMILIES.contains(&key) || VERTICAL_EM.iter().any(|(name, ..)| *name == key)
-    };
-    let key = families
-        .iter()
-        .map(|f| vertical_alias(&key_of(f)))
-        .find(|key| known(key))
-        .unwrap_or_else(|| VERTICAL_FAMILIES[0].to_string());
+    let key = primary_key(families);
     if let Some((_, ascent, descent, gap)) = VERTICAL_EM.iter().find(|(name, ..)| *name == key) {
         let round = |em: f32| (em * size_px).round();
         return Some((round(*ascent), round(*descent), round(*gap)));
